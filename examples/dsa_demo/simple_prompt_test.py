@@ -36,6 +36,9 @@ MAX_NUM_SEQS = 2
 MAX_MODEL_LEN = 8192
 MAX_NUM_BATCHED_TOKENS = 8192
 ENABLE_CHUNKED_PREFILL = False
+ENABLE_PREFIX_CACHING = False
+PREFIX_CACHE_REPLAY_ROUNDS = 1
+LOGGING_LEVEL = "INFO"
 MAX_TOKENS = 32
 GPU_MEMORY_UTILIZATION = 0.90
 QUANTIZATION = "ascend"
@@ -74,7 +77,7 @@ NATIVE_RUNTIME_ENV_OVERRIDES = {
     "PYTHONHASHSEED": "114514",
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "VLLM_ASCEND_ENABLE_MLAPO": "1",
-    "VLLM_LOGGING_LEVEL": "INFO",
+    "VLLM_LOGGING_LEVEL": LOGGING_LEVEL,
 }
 
 for key, value in NATIVE_RUNTIME_ENV_OVERRIDES.items():
@@ -130,7 +133,7 @@ def build_llm_kwargs() -> dict[str, Any]:
         "max_model_len": MAX_MODEL_LEN,
         "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS,
         "trust_remote_code": True,
-        "enable_prefix_caching": False,
+        "enable_prefix_caching": ENABLE_PREFIX_CACHING,
         "enable_chunked_prefill": ENABLE_CHUNKED_PREFILL,
         "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
         "block_size": 128,
@@ -205,13 +208,17 @@ def main() -> None:
         raise ValueError(f"RUN_MODE must be disabled/cache-init/eager/graph, got {RUN_MODE!r}")
     if len(PROMPTS) > MAX_NUM_SEQS:
         raise ValueError(f"PROMPTS has {len(PROMPTS)} rows but MAX_NUM_SEQS={MAX_NUM_SEQS}")
+    if PREFIX_CACHE_REPLAY_ROUNDS <= 0:
+        raise ValueError("PREFIX_CACHE_REPLAY_ROUNDS must be positive")
 
     kwargs = build_llm_kwargs()
     print(
         "[dsa-smoke] "
         f"mode={RUN_MODE} model={MODEL_PATH!r} prompts={len(PROMPTS)} "
         f"max_model_len={MAX_MODEL_LEN} max_num_seqs={MAX_NUM_SEQS} "
-        f"a5_packed_c8={ENABLE_A5_PACKED_C8_DSA} mtp={ENABLE_MTP}"
+        f"a5_packed_c8={ENABLE_A5_PACKED_C8_DSA} mtp={ENABLE_MTP} "
+        f"prefix_cache={ENABLE_PREFIX_CACHING} "
+        f"replay_rounds={PREFIX_CACHE_REPLAY_ROUNDS}"
     )
     llm = LLM(**kwargs)
 
@@ -240,30 +247,38 @@ def main() -> None:
     try:
         if ENABLE_PROFILE:
             llm.start_profile()
-        outputs = llm.generate(
-            PROMPTS,
-            sampling_params,
-            use_tqdm=False,
-        )
+        output_rounds = [
+            llm.generate(
+                PROMPTS,
+                sampling_params,
+                use_tqdm=False,
+            )
+            for _ in range(PREFIX_CACHE_REPLAY_ROUNDS)
+        ]
     finally:
         if ENABLE_PROFILE:
             llm.stop_profile()
 
     records = []
     print("\nGenerated Outputs:\n" + "-" * 60)
-    for request_index, output in enumerate(outputs):
-        completion = output.outputs[0]
-        record = {
-            "request_index": request_index,
-            "prompt": output.prompt,
-            "token_ids": list(completion.token_ids),
-            "finish_reason": completion.finish_reason,
-            "text": completion.text,
-        }
-        records.append(record)
-        print(f"Req {request_index}: token_ids={record['token_ids']} finish_reason={record['finish_reason']!r}")
-        print(f"Output: {record['text']!r}")
-        print("-" * 60)
+    for round_index, outputs in enumerate(output_rounds):
+        if PREFIX_CACHE_REPLAY_ROUNDS > 1:
+            print(f"Prefix replay round {round_index + 1}:")
+        for request_index, output in enumerate(outputs):
+            completion = output.outputs[0]
+            record = {
+                "request_index": request_index,
+                "prompt": output.prompt,
+                "token_ids": list(completion.token_ids),
+                "finish_reason": completion.finish_reason,
+                "text": completion.text,
+            }
+            if PREFIX_CACHE_REPLAY_ROUNDS > 1:
+                record["round_index"] = round_index
+            records.append(record)
+            print(f"Req {request_index}: token_ids={record['token_ids']} finish_reason={record['finish_reason']!r}")
+            print(f"Output: {record['text']!r}")
+            print("-" * 60)
 
     write_result(
         {

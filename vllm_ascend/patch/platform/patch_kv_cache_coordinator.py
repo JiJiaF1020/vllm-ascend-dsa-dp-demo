@@ -40,6 +40,7 @@ from vllm_ascend.dsa_offload.kv_cache_coordinator import (
 )
 from vllm_ascend.dsa_offload.kv_cache_manager import (
     allocate_dsa_slots,
+    get_dsa_computed_blocks,
 )
 
 USE_MULTI_GROUPS_KV_CACHE = True
@@ -557,7 +558,16 @@ if _kv_cache_manager is not None:
 # replacing one module's cached constructor binding. Non-DSA calls delegate to
 # the exact upstream implementation.
 if _kv_cache_manager is not None:
+    _original_get_computed_blocks = (
+        _kv_cache_manager.KVCacheManager.get_computed_blocks
+    )
     _original_allocate_slots = _kv_cache_manager.KVCacheManager.allocate_slots
+
+    @wraps(_original_get_computed_blocks)
+    def _ascend_get_computed_blocks(self, request):
+        if isinstance(self.coordinator, DSAKVCacheCoordinator):
+            return get_dsa_computed_blocks(self, request)
+        return _original_get_computed_blocks(self, request)
 
     @wraps(_original_allocate_slots)
     def _ascend_allocate_slots(self, *args, **kwargs):
@@ -565,4 +575,7 @@ if _kv_cache_manager is not None:
             return allocate_dsa_slots(self, *args, **kwargs)
         return _original_allocate_slots(self, *args, **kwargs)
 
+    _kv_cache_manager.KVCacheManager.get_computed_blocks = (
+        _ascend_get_computed_blocks
+    )
     _kv_cache_manager.KVCacheManager.allocate_slots = _ascend_allocate_slots

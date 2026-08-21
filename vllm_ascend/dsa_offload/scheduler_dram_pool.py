@@ -13,8 +13,10 @@ durable full-block 前缀增量分配 DRAM block id；worker 只消费 assignmen
 映射。只有未来出现无法由组合表达的介质事件或驱逐语义时，才考虑派生
 ``BlockPool``，避免当前复制或覆盖基线分配算法。
 
-首版只承诺单机 TP，且 prefix cache、preemption、KV connector 仍关闭。
-因此目录暂时使用 request-private 行，不包含 hash/refcount/LRU。
+首版 prefix cache 直接复用 ``BlockPool`` 的 hash/refcount/LRU：查询阶段只
+返回候选块，HBM admission 成功后才 touch 并绑定到请求；worker 完成整块
+Indexer+MLA dump 后才发布 hash。请求结束只释放引用，payload/hash 保留到
+物理块真正被重新分配。preemption 与 KV connector 仍关闭。
 """
 
 from __future__ import annotations
@@ -26,7 +28,13 @@ from pathlib import Path
 import numpy as np
 import psutil
 from vllm.v1.core.block_pool import BlockPool
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
+    KVCacheBlock,
+)
+from vllm.v1.request import Request
+
+_DSA_DRAM_CACHE_GROUP_ID = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,7 +200,7 @@ def calculate_dram_capacity_plan(
 
 
 class DSASchedulerDRAMBlockDirectory:
-    """scheduler 侧请求逻辑块到全局 DRAM block id 的唯一账本。"""
+    """scheduler 侧完整 DRAM bundle 的分配、hash 与请求映射账本。"""
 
     def __init__(
         self,
@@ -200,6 +208,7 @@ class DSASchedulerDRAMBlockDirectory:
         usable_blocks: int,
         max_logical_blocks: int,
         block_size: int,
+        enable_caching: bool = False,
     ) -> None:
         if usable_blocks <= 0:
             raise ValueError("DSA DRAM directory requires positive capacity")
@@ -211,16 +220,24 @@ class DSASchedulerDRAMBlockDirectory:
             raise ValueError("DSA DRAM directory requires a positive block size")
         self.usable_blocks = int(usable_blocks)
         self.max_logical_blocks = int(max_logical_blocks)
+        self.block_size = int(block_size)
+        self.enable_caching = bool(enable_caching)
         # vLLM BlockPool 会自动取出 block 0 作为 null block。传入
         # usable+1 后，真实 free queue 恰好仍有 usable 个有效 block。
         self.block_pool = BlockPool(
             num_gpu_blocks=self.usable_blocks + 1,
-            enable_caching=False,
-            hash_block_size=int(block_size),
+            enable_caching=self.enable_caching,
+            hash_block_size=self.block_size,
         )
         if self.block_pool.null_block.block_id != 0:
             raise RuntimeError("DSA DRAM BlockPool did not reserve block 0")
         self._request_blocks: dict[str, list[KVCacheBlock]] = {}
+        # ready 表示所有 target layer payload 已对 scheduler 可见，并且
+        # [0, ready) 的 block 已经发布 hash（prefix 关闭时只记水位）。
+        self._ready_block_counts: dict[str, int] = {}
+        # worker 只接收增量逻辑表。prefix hit 提交时从 0 开始重新发布，
+        # 后续 decode/prefill 只发送新增长度的后缀。
+        self._worker_published_block_counts: dict[str, int] = {}
 
     @property
     def num_free_blocks(self) -> int:
@@ -241,6 +258,8 @@ class DSASchedulerDRAMBlockDirectory:
                 f"capacity={self.max_logical_blocks}"
             )
         blocks = self._request_blocks.setdefault(request_id, [])
+        self._ready_block_counts.setdefault(request_id, 0)
+        self._worker_published_block_counts.setdefault(request_id, 0)
         old_count = len(blocks)
         if logical_block_count < old_count:
             raise RuntimeError(
@@ -262,6 +281,122 @@ class DSASchedulerDRAMBlockDirectory:
         blocks.extend(allocated)
         return old_count, tuple(block.block_id for block in allocated)
 
+    def find_longest_cache_hit(
+        self,
+        block_hashes: list[BlockHash],
+        max_length: int,
+    ) -> tuple[KVCacheBlock, ...]:
+        """查询完整 bundle 的最长连续 prefix，不在查询阶段增加引用。"""
+
+        if not self.enable_caching or max_length < self.block_size:
+            return ()
+        max_blocks = min(
+            int(max_length) // self.block_size,
+            len(block_hashes),
+            self.max_logical_blocks,
+        )
+        hit_blocks: list[KVCacheBlock] = []
+        for block_hash in block_hashes[:max_blocks]:
+            cached = self.block_pool.get_cached_block(
+                block_hash,
+                [_DSA_DRAM_CACHE_GROUP_ID],
+            )
+            if cached is None:
+                break
+            hit_blocks.append(cached[0])
+        return tuple(hit_blocks)
+
+    def attach_cached_prefix(
+        self,
+        request_id: str,
+        blocks: tuple[KVCacheBlock, ...],
+    ) -> None:
+        """HBM admission 成功后 touch 并绑定查询阶段得到的 prefix。"""
+
+        if request_id in self._request_blocks:
+            raise RuntimeError(
+                "DSA DRAM cached prefix can only be attached to a new "
+                f"request: request_id={request_id!r}"
+            )
+        if len(blocks) > self.max_logical_blocks:
+            raise ValueError(
+                "DSA DRAM cached prefix exceeds logical row capacity: "
+                f"blocks={len(blocks)}, capacity={self.max_logical_blocks}"
+            )
+        if blocks:
+            if not self.enable_caching:
+                raise RuntimeError(
+                    "DSA DRAM cached prefix cannot be attached while "
+                    "prefix caching is disabled"
+                )
+            if any(block.block_hash is None for block in blocks):
+                raise RuntimeError(
+                    "DSA DRAM prefix plan contains a block without a hash"
+                )
+            self.block_pool.touch(blocks)
+        self._request_blocks[request_id] = list(blocks)
+        self._ready_block_counts[request_id] = len(blocks)
+        self._worker_published_block_counts[request_id] = 0
+
+    def mark_ready_prefix(
+        self,
+        request: Request,
+        ready_block_count: int,
+    ) -> None:
+        """在 worker forward 成功后发布新增完整 bundle 的 prefix hash。"""
+
+        request_id = request.request_id
+        blocks = self._request_blocks.get(request_id)
+        if blocks is None:
+            raise RuntimeError(
+                "DSA cannot publish a DRAM prefix before block assignment: "
+                f"request_id={request_id!r}"
+            )
+        ready_block_count = int(ready_block_count)
+        previous = self._ready_block_counts.get(request_id, 0)
+        if not previous <= ready_block_count <= len(blocks):
+            raise RuntimeError(
+                "DSA DRAM ready watermark is invalid: "
+                f"request_id={request_id!r}, previous={previous}, "
+                f"ready={ready_block_count}, assigned={len(blocks)}"
+            )
+        if ready_block_count == previous:
+            return
+        if ready_block_count > len(request.block_hashes):
+            raise RuntimeError(
+                "DSA DRAM ready prefix exceeds available request hashes: "
+                f"request_id={request_id!r}, ready={ready_block_count}, "
+                f"hashes={len(request.block_hashes)}"
+            )
+        if self.enable_caching:
+            self.block_pool.cache_full_blocks(
+                request=request,
+                blocks=blocks,
+                num_cached_blocks=previous,
+                num_full_blocks=ready_block_count,
+                block_size=self.block_size,
+                kv_cache_group_id=_DSA_DRAM_CACHE_GROUP_ID,
+            )
+        self._ready_block_counts[request_id] = ready_block_count
+
+    def take_unpublished_assignment(
+        self,
+        request_id: str,
+    ) -> tuple[int, tuple[int, ...]]:
+        """返回尚未投影给 worker 的连续逻辑表后缀。"""
+
+        blocks = self._request_blocks.get(request_id, ())
+        start = self._worker_published_block_counts.get(request_id, 0)
+        if start > len(blocks):
+            raise RuntimeError(
+                "DSA worker-published DRAM watermark exceeds request table: "
+                f"request_id={request_id!r}, published={start}, "
+                f"assigned={len(blocks)}"
+            )
+        physical_ids = tuple(block.block_id for block in blocks[start:])
+        self._worker_published_block_counts[request_id] = len(blocks)
+        return start, physical_ids
+
     def get_request_blocks(self, request_id: str) -> tuple[int, ...]:
         return tuple(
             block.block_id
@@ -271,7 +406,21 @@ class DSASchedulerDRAMBlockDirectory:
     def free_request(self, request_id: str) -> tuple[int, ...]:
         released = self._request_blocks.pop(request_id, None)
         if not released:
+            self._ready_block_counts.pop(request_id, None)
+            self._worker_published_block_counts.pop(request_id, None)
             return ()
         released_ids = tuple(block.block_id for block in released)
-        self.block_pool.free_blocks(reversed(released))
+        ready_count = self._ready_block_counts.pop(request_id, 0)
+        self._worker_published_block_counts.pop(request_id, None)
+        ready_blocks = released[:ready_count]
+        unready_blocks = released[ready_count:]
+        # 没有有效 hash 的 assignment 不具备缓存价值，放到 free queue
+        # 最前面优先复用；ready prefix 保持基线 tail-first LRU 顺序。
+        if ready_blocks:
+            self.block_pool.free_blocks(reversed(ready_blocks))
+        if unready_blocks:
+            self.block_pool.free_blocks(
+                reversed(unready_blocks),
+                prepend=True,
+            )
         return released_ids

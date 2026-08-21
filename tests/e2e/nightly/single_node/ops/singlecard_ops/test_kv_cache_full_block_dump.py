@@ -8,9 +8,11 @@ import pytest
 import torch
 import torch_npu
 
-from vllm_ascend.utils import enable_custom_op
-
-enable_custom_op()
+from vllm_ascend.utils import (
+    AscendDeviceType,
+    get_ascend_device_type,
+    load_custom_op_library,
+)
 
 _BLOCK_SIZE = 128
 _NOPE_DIM = 512
@@ -21,6 +23,31 @@ _DRAM_ROTATION_SLOTS = 32
 _PCIE_THEORETICAL_GBPS = float(
     os.getenv("DSA_DUMP_PCIE_THEORETICAL_GBPS", "63.0")
 )
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _load_dsa_dump_ops() -> None:
+    """A5 globally disables legacy custom-op selection but DSA still needs its extension."""
+
+    if not load_custom_op_library():
+        pytest.fail("Failed to load vllm_ascend_C for DSA block-copy tests")
+    if not hasattr(
+        torch.ops._C_ascend,
+        "kv_cache_full_block_dump_bytes",
+    ):
+        pytest.fail("kv_cache_full_block_dump_bytes is not registered")
+
+
+def _require_bf16_dump_op() -> None:
+    if get_ascend_device_type() == AscendDeviceType.A5:
+        pytest.skip(
+            "A5 DSA uses packed-C8 plus the generic byte-copy operator"
+        )
+    if not hasattr(torch.ops._C_ascend, "kv_cache_full_block_dump"):
+        pytest.skip(
+            "BF16 paired-plane dump is not built for this device; "
+            "A5 DSA uses packed-C8 plus the generic byte-copy operator"
+        )
 
 
 def _swapped_arena(
@@ -281,6 +308,7 @@ def _measure_case(
 def test_kv_cache_full_block_dump_single_block_swapped() -> None:
     """One production-shaped block must reach both swapped-memory planes."""
 
+    _require_bf16_dump_op()
     dtype = torch.bfloat16
     source_nope, source_rope = _make_sources(1, dtype)
     dram_nope = _swapped_arena((2, _BLOCK_SIZE, _NOPE_DIM), dtype)
@@ -312,6 +340,7 @@ def test_kv_cache_full_block_dump_single_block_swapped() -> None:
 def test_kv_cache_full_block_dump_many_blocks_swapped() -> None:
     """Every row in the 24-block bandwidth shape must reach swapped DRAM."""
 
+    _require_bf16_dump_op()
     block_count = 24
     dtype = torch.bfloat16
     source_nope, source_rope = _make_sources(block_count, dtype)
@@ -399,6 +428,58 @@ def test_kv_cache_full_block_dump_bytes_copies_opaque_plane() -> None:
 
 
 @torch.inference_mode()
+def test_kv_cache_full_block_dump_bytes_restores_from_swapped_memory() -> None:
+    """The generic byte kernel must also support DRAM-to-HBM restore."""
+
+    block_count = 3
+    bytes_per_block = 128 * 4
+    source = (
+        torch.arange(
+            block_count * bytes_per_block,
+            dtype=torch.int32,
+        )
+        .remainder(251)
+        .sub(125)
+        .to(torch.int8)
+        .view(block_count, bytes_per_block)
+        .to("npu")
+    )
+    dram = _swapped_arena(
+        (block_count + 1, bytes_per_block),
+        torch.int8,
+    )
+    hbm_restored = torch.full(
+        (block_count + 1, bytes_per_block),
+        -1,
+        dtype=torch.int8,
+        device="npu",
+    )
+    dump_src = torch.tensor([2, 0], dtype=torch.int32, device="npu")
+    dram_dst = torch.tensor([1, 3], dtype=torch.int32, device="npu")
+    torch.ops._C_ascend.kv_cache_full_block_dump_bytes(
+        source,
+        dram,
+        dump_src,
+        dram_dst,
+    )
+
+    restore_src = torch.tensor([3, 1], dtype=torch.int32, device="npu")
+    hbm_dst = torch.tensor([0, 2], dtype=torch.int32, device="npu")
+    torch.ops._C_ascend.kv_cache_full_block_dump_bytes(
+        dram,
+        hbm_restored,
+        restore_src,
+        hbm_dst,
+    )
+    torch.npu.synchronize()
+
+    torch.testing.assert_close(hbm_restored[0].cpu(), source[0].cpu())
+    torch.testing.assert_close(hbm_restored[2].cpu(), source[2].cpu())
+    assert torch.all(hbm_restored[1] == -1)
+    assert torch.all(hbm_restored[3] == -1)
+
+
+@torch.inference_mode()
 def test_kv_cache_full_block_dump_bandwidth() -> None:
     """Report effective HBM-to-swapped-DRAM payload bandwidth.
 
@@ -409,6 +490,7 @@ def test_kv_cache_full_block_dump_bandwidth() -> None:
     rate and is not a hard performance assertion.
     """
 
+    _require_bf16_dump_op()
     cases = (
         (0, 24),
         (1, 1),

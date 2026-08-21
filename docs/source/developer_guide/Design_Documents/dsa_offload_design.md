@@ -1,11 +1,13 @@
 # DSA 稀疏卸载当前设计
 
-> - 最后更新：2026-08-20
+> - 最后更新：2026-08-21
 > - 目标基线：vLLM v0.23.0 + vLLM-Ascend v0.23.0
 > - 当前完成度：核心控制面、eager 和 FULL decode graph 已完成 910C 初验；
 >   chunked prefill 已完成分段 prefill/首 token 初验，完整 sparse decode
 >   验收待补；A5 packed C8 已完成 GLM-5.1 eager/graph 端到端初验；
 >   GLM-5.2 MTP 已完成 UT、离线 eager/FULL graph 与在线 FULL graph 冒烟
+> - 本地 DRAM complete-bundle prefix cache 第一版已完成代码与 CPU UT，
+>   NPU restore 算子和端到端命中仍待服务器验收
 > - 首要验收模型：GLM-5.1、GLM-5.2；兼容回归模型：DeepSeek-V3.2
 
 ## 1. 文档定位
@@ -56,10 +58,14 @@ DSA 稀疏卸载最终目标是在长上下文 decode 中实现：
   Indexer+MLA forward，其 Cache 作为第三个原生 full-cache group 全量驻留
   HBM，不创建 DSA selection state 或 DRAM arena。框架侧已切换到该结构并
   完成服务器阶段冒烟。
+- scheduler-owned DRAM complete bundle 的 hash-ready、LRU/refcount、
+  请求结束保留、最长连续命中、target 分平面 restore，以及可选 MTP
+  full-HBM EAGLE 公共命中第一版；该能力尚未完成服务器端到端验收。
 
 当前尚未完成：
 
-- prefix cache、prefill/decode mixed、preemption/resume、非 MTP speculative
+- HBM Indexer/dense-MLA 热副本参与 prefix lookup、L3 prefix cache、
+  prefill/decode mixed、preemption/resume、非 MTP speculative
   method、MTP draft 数不等于 3/非 greedy MTP、async scheduling、KV transfer、KV-cache
   metrics/events、GLM-5.2 A5 正式 QA/性能验收和 A5 BF16 算子链。
 
@@ -233,8 +239,8 @@ v0.23 原生显式 chunked prefill，以及
 `scheduler_reserve_full_isl=True`，在首个 chunk 入场前验证完整 prompt 能
 同时容纳于所有启用的 full-context cache group。speculative decode 仅放行 A5 packed-C8
 下的 `method=mtp`、固定 3 个 draft 和 greedy 请求；MTP resident 最低档为
-8192。当前仍显式拒绝 async scheduling、prefix cache、其他 speculative
-method、KV transfer、context/pipeline parallel、
+8192。本地 DRAM complete-bundle prefix cache 已开放配置；当前仍显式拒绝
+async scheduling、其他 speculative method、KV transfer、context/pipeline parallel、
 KV-cache metrics/events 等未建立完整合同的组合。
 
 | 字段 | 默认值 | 当前语义 |
@@ -409,9 +415,10 @@ scheduler→worker 投影真源，避免 worker、eager 和 graph 各自重新�
 
 这些 group 复用同一个基线 `BlockPool` 类型，但不是同一个实例：Indexer、
 resident MLA 和可选 MTP 的物理 block 数及 id 空间彼此独立。当前所有 HBM
-pool 都以 `enable_caching=False` 构造，尤其 resident MLA 的 budget/tail block
-不代表完整上下文块，不能产生 prefix hash。后续 prefix identity 只绑定
-DRAM 中完整的 dense Indexer+MLA bundle。
+target Indexer 与 resident MLA pool 仍以 `enable_caching=False` 构造，尤其
+resident MLA 的 budget/tail block 不代表完整上下文块，不能产生 prefix hash。
+启用 prefix cache 时，DRAM complete-bundle pool 与可选 MTP full-HBM pool
+启用原生 hash/LRU；MTP 继续使用基线 `FullAttentionManager`。
 
 分配规则：
 
@@ -423,9 +430,10 @@ DRAM 中完整的 dense Indexer+MLA bundle。
   必须与预期 `budget + tail_block_count` 容量一致；
 - free 同时清理所有 group manager 和请求 cache state。
 
-当前不支持 prefix hit、external computed tokens 和 delayed allocation；
-固定 MTP3 的三个 lookahead token 已由同一个多 group allocator 处理，其他
-speculative method 仍在配置边界拒绝。
+第一版 prefix hit 的 target 数据只来自 DRAM complete bundle；命中 token
+通过 Request-aware DSA 分配事务处理，不开放通用 KV connector 的 external
+computed tokens 或 delayed allocation。固定 MTP3 的三个 lookahead token
+仍由同一个多 group allocator 处理，其他 speculative method 在配置边界拒绝。
 
 ## 9. 薄 Scheduler
 
@@ -553,9 +561,10 @@ chunked prefill 已复用当前 request ledger 和固定 runtime owner；它没�
 prefill/decode mixed forward。固定 MTP3 的 target 验算复用原生 compact TND
 与 uniform FULL graph，双尾块直接覆盖跨块边界，不降级 Q=1；GLM proposer
 继续复用社区 eager 路径及其独立 BF16 full cache。理想版动态 query 截短仍未实现。
-preemption、prefix cache、mixed
-prefill/decode 和 KV transfer 仍会改变 ledger 或状态恢复合同，应按独立
-能力继续设计。
+本地 DRAM prefix hit 在 prefill 前完成 restore，后续 decode 继续使用同一
+block table 和 graph 元数据；它不把 restore 算子捕获进 decode graph。
+preemption、mixed prefill/decode 和 KV transfer 仍会改变 ledger 或状态恢复
+合同，应按独立能力继续设计。
 
 ### 10.5 固定 MTP3 的双尾块与 proposer cache
 
@@ -614,11 +623,11 @@ MTP target 验算产生的 target 满块在下一 outer step 才成为 durable�
 cache 不参与该 dump。当前实现保持单 stream 顺序；未来若改为异步
 多流，必须增加 event 和逐层可见性协议。
 
-当前 prefix cache 仍关闭，请求结束会直接释放 DRAM directory。未来保留
-finished request 作为 prefix 前，MTP 还必须补一个 terminal flush：若最后一次
-验算新确认的 token 恰好补满 full block，而请求随后立刻 EOS/length finish，
-不会再有下一 outer step 执行 pre-write dump。该尾块不能标记 hash-ready，
-必须先通过显式 flush-only 数据面完成完整 Indexer+MLA dump。
+启用 prefix cache 后，请求结束只释放 DRAM block 引用，已经 ready 的完整
+bundle 保留 hash/LRU。MTP terminal flush 仍未实现：若最后一次验算新确认的
+token 恰好补满 full block，而请求随后立刻 EOS/length finish，不会再有下一
+outer step 执行 pre-write dump。第一版不会把该尾块标记 hash-ready，因此
+保持正确但命中前缀少一块；后续再用显式 flush-only 数据面补齐。
 
 ## 11. Decode 数据面与算子 ABI
 
@@ -840,10 +849,11 @@ request_id -> [logical block 0 -> dram id, logical block 1 -> dram id, ...]
 [resident_pool_storage_rows, ceil(max_model_len / block_size)]
 ```
 
-worker 只校验越界、重复 id 和跨行碰撞，绝不在 dump 热路径补分配。当前
-关闭 prefix cache、preemption 和 KV connector，因此 scheduler 在请求结束
-时归还 physical id，worker 通过基线 `finished_req_ids` 清镜像行；尚未增加
-hash/refcount/LRU。
+worker 只校验越界和同一行内的重复 id，绝不在 dump 热路径补分配。prefix
+命中允许多个 active request row 共享同一个只读 DRAM block；hash/refcount/LRU
+唯一真源位于 scheduler 的原生 `BlockPool`，worker 只维护 active refcount。
+请求结束后 worker 通过基线 `finished_req_ids` 清镜像行；scheduler 只释放
+请求引用，ready block 的 payload/hash 保留到物理块真正被重新分配。
 
 ### 12.2 Dump 计划与执行时序
 
@@ -881,6 +891,52 @@ model output 返回后释放已经 dump 的 resident 满块。未来引入异步
   `src=0, dst=-1`；
 - `dst=-1` 是 dump 算子的唯一空转哨兵，不能和 DRAM ledger 的空映射
   block `0` 混用。
+
+### 12.4 本地 DRAM prefix cache 第一版
+
+EngineCore 继续复用唯一 `Request.block_hashes`；DSA 不构造第二份 token hash
+链。查询阶段只生成零引用 hit plan，不能提前 touch。HBM 三个 component 的
+容量预检全部成功后，才一次提交：
+
+```text
+DRAM target hit -> touch complete bundle
+MTP enabled     -> touch baseline full-HBM hit after EAGLE drop
+target          -> allocate Indexer/MLA HBM destinations
+worker          -> restore Indexer and MLA by independent destination columns
+```
+
+DRAM assignment 不等于 hash-ready。本轮所有 TP worker 在同一 stream 完成
+全部 target layer dump，并成功返回 model output 后，scheduler 才为新增完整块
+发布 hash。未 ready 的 assignment 在请求释放时放到 free queue 前端优先复用；
+ready prefix 按基线 reverse-free 保持 tail-first eviction bias。
+
+当前 phase barrier 会在 ready decode/ENTER step 隐藏 waiting prefill，因此
+dense resident 释放/重分配与新请求 prefix lookup 不会同批交错。更根本的
+安全性来自 scheduler 单线程事务和 `BlockPool.ref_cnt`：查询阶段不修改状态，
+全组件 admission 成功后先 touch 命中块，再允许同物理 pool 分配新块。未来
+开放 mixed batch 或 HBM 热层复用时必须保持该顺序，不能依赖调度遍历顺序。
+
+命中请求通过同一个 `DSAOffloadSchedulerOutput` 获得：增量 DRAM assignment、
+Indexer destination、MLA destination 和 ready watermark。worker 在基线
+`_update_states()` 形成最终 HBM block table 后准备固定 restore buffer，并在
+进入 model forward 前按已注册 target layer 恢复 DRAM payload。所有 copy 与
+后续 forward 位于同一 stream；restore 不进入 attention hook，也不进入 decode
+graph。prefix hit 水位同时初始化 worker durable watermark，避免同一 forward
+把已恢复前缀重复 dump。
+
+MTP proposer 仍全驻留 HBM，不执行 DRAM restore。MTP raw hit 复用基线
+`is_eagle_group` 的“多检查一块、drop 最后一块”逻辑，生成 drafting hidden
+states 所需的有效长度；最终命中是 target DRAM 长度与 MTP 有效长度的公共
+前缀。MTP terminal step 尚未 flush 的新满块不发布，只会让可复用前缀略短。
+
+最终目标不是固定“只查 DRAM”：后续应按每个逻辑块、每个 component 选择
+`HBM > DRAM > L3` 中最热的可用副本，再在 Indexer、MLA、MTP 三个必需
+component 之间取公共前缀。当前接口已把 Indexer/MLA restore 分列，避免锁死
+未来的不等长回载。
+
+当前功能验证阶段使用 INFO 日志 `DSA prefix lookup` 输出逐请求命中；容量
+报告中的 prefix-enabled 状态和 vLLM 原生聚合 hit rate 同时保留。进入性能
+验收后应将逐请求日志降为 DEBUG、采样或移除，避免在线高 QPS 日志放大。
 
 ## 13. 统一 metadata 与图模式
 
@@ -986,8 +1042,9 @@ stateDiagram-v2
 
 1. 基线移除 InputBatch 行；
 2. resident pool 归还 stable row，但不立即清大 tensor；
-3. scheduler DRAM directory 归还该请求的 physical block ids；worker 收到
-   `finished_req_ids` 后清除 stable row 镜像；
+3. scheduler DRAM directory 释放请求引用；启用 prefix 时 ready block 留在
+   hash/LRU 中，未 ready 后缀优先回收；worker 收到 `finished_req_ids` 后
+   清除 stable row 镜像；
 4. 该 resident row 下次 `acquire()` 时只做一次所有层整行清理；
 5. scheduler/core 同时释放所有 HBM group manager 和请求 cache-layout state。
 
@@ -1012,6 +1069,9 @@ condense/reorder 时必须保留该请求的 resident/DRAM 所有权。
 - 不用 `.item()`/`.to("cpu")` 读取 miss、stage 或 row mode；
 - 不逐层创建大 tensor，LIDU 输出由所有层串行复用；
 - DRAM table 版本不变时不重复 H2D；
+- prefix 关闭时 restore 固定 buffer 只保留一个哨兵槽且不调用 prepare；
+  prefix 开启但无命中时只在 `_update_states` 后执行一次空任务判断，不增加
+  逐层 attention 热路径；
 - 无 dump 的 eager step 不调用 dump 算子；
 - graph 使用固定地址 view，不在 replay 前替换 owner；
 - request-id 映射只在 InputBatch 结构变化时做，steady 行序批量刷新。
@@ -1038,18 +1098,18 @@ condense/reorder 时必须保留该请求的 resident/DRAM 所有权。
 | `dsa_offload/contracts.py` | 框架与四个算子共享的静态常量 |
 | `dsa_offload/model_support.py` | 模型能力判断 |
 | `dsa_offload/kv_cache.py` | spec、HBM group、DRAM 容量合同、绑定顺序和报告 |
-| `dsa_offload/kv_cache_coordinator.py` | HBM 多物理 pool 与 scheduler DRAM directory |
-| `dsa_offload/kv_cache_manager.py` | 阶段感知的实际 block 分配 |
+| `dsa_offload/kv_cache_coordinator.py` | HBM 多物理 pool、DRAM/MTP 公共命中与 scheduler DRAM directory |
+| `dsa_offload/kv_cache_manager.py` | 阶段感知分配与 prefix-hit admission/commit 事务 |
 | `dsa_offload/request_cache_layout.py` | 请求 cache 布局 plan/commit |
 | `dsa_offload/scheduler.py` | 薄 phase barrier 与输出后释放 |
 | `dsa_offload/scheduler_output.py` | scheduler→worker 最小列式投影 |
 | `dsa_offload/input_batch.py` | worker 固定容量行状态与 ENTER 整表覆盖 |
 | `dsa_offload/graph_gate.py` | 原生 FULL decode graph 的纯准入策略 |
 | `dsa_offload/resident_pool.py` | stable pool row 与逐层 LIDU `cache_slots` |
-| `dsa_offload/scheduler_dram_pool.py` | 单机容量计划与 scheduler physical-id 目录 |
-| `dsa_offload/worker_dram_store.py` | 固定 payload arena 与 worker 逻辑表镜像 |
-| `dsa_offload/runtime.py` | eager/graph 共用 metadata owner 与逐层上下文 |
-| `dsa_offload/ops.py` | LIDU、KSC、SFA-Offload、full-block dump tensor ABI |
+| `dsa_offload/scheduler_dram_pool.py` | 单机容量计划、DRAM hash/LRU 与 scheduler physical-id 目录 |
+| `dsa_offload/worker_dram_store.py` | 固定 payload arena、共享 active refcount 与 worker 逻辑表镜像 |
+| `dsa_offload/runtime.py` | eager/graph 共用 metadata、preforward restore owner 与逐层上下文 |
+| `dsa_offload/ops.py` | LIDU、KSC、SFA-Offload、双向 byte-block copy tensor ABI |
 | `core/kv_cache_interface.py` | DSA spec/manager registry 注册 |
 | `worker/npu_input_batch.py` | 可选 DSA buffer owner |
 | `worker/model_runner_v1.py` | cache 初始化、行投影、多 group slot mapping 与 runtime 绑定 |
@@ -1085,6 +1145,25 @@ condense/reorder 时必须保留该请求的 resident/DRAM 所有权。
 - DSA+MTP 全量 UT 通过；GLM-5.2 W4A4C8 已通过离线 eager、离线 FULL
   graph 和在线 FULL graph 冒烟。FULL graph 覆盖单请求约 40K，以及
   8K/5K/70K/40K 的 bsz=4 混合长度。
+- scheduler-owned complete DRAM pool 的 Python UT 与新增 byte-dump A5
+  eager/graph 算子 UT 通过；GLM-5.2 容量报告确认 21 个 full Indexer、
+  78 个 resident MLA，完整 bundle 未为 shared Indexer padding；
+- no-MTP 已覆盖 bsz=4 的约 8K/5K/70K/40K eager/FULL graph，以及
+  active=2（约 5K/40K）、capture sizes 仅 1/4 的向上 padding和 eager；
+- MTP3 已覆盖约 8K/5K/70K/40K 的 bsz=4 FULL graph，以及单请求约 40K
+  的在线推理。上述结果作为 scheduler DRAM pool 第一版常见场景门禁。
+
+本地 DRAM prefix cache 第一版的当前证据：
+
+- Windows 隔离环境中，新增 hash-ready/LRU/shared-ref、MTP 公共命中、
+  prefix allocation、restore metadata 和既有 DSA 回归共 171 项通过；
+- Ascend 服务器上的 DSA 全量 Python UT、A2 SFA UT 与 A5 C8 算子 E2E
+  已通过；generic byte-copy 的 HBM→swapped DRAM 和 swapped DRAM→HBM
+  round-trip 实测为 `2 passed, 3 skipped`，A5 跳过项均为不适用的 BF16
+  paired-plane 算子；
+- Python `compileall`、Ruff、`git diff --check` 与在线脚本 `bash -n` 通过；
+- 已新增 swapped DRAM→HBM byte-block round-trip NPU 用例；尚未执行服务器
+  自定义算子和真实模型第二轮同前缀验收，因此不能宣称上板完成。
 
 这些结果证明当前核心控制面、eager 和 graph 主路径可运行。尚需补齐：
 
@@ -1102,6 +1181,8 @@ condense/reorder 时必须保留该请求的 resident/DRAM 所有权。
   bsz=1/bsz>1、ENTER/steady sparse decode 与并发调度回归；
 - DeepSeek-V3.2 强制回归；
 - profiling 性能基线；
+- 本地 DRAM prefix 的 NPU bitwise restore、no-MTP/MTP3 第二轮相同前缀、
+  chunked prefill、eager/FULL graph 和在线连续请求回归；
 - GLM-5.2 W4A4C8 的完整 QA、长稳并发、请求结束/行复用压力与性能回归。
 
 完整测试命令和验收要求维护在 `examples/dsa_demo/README.md`。

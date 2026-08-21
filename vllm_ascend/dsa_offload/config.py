@@ -390,7 +390,6 @@ class DSAOffloadConfig:
                     f"first_shared={first_shared}, first_full={first_full}"
                 )
         scheduler_config = vllm_config.scheduler_config
-        cache_config = vllm_config.cache_config
         parallel_config = vllm_config.parallel_config
         observability_config = vllm_config.observability_config
 
@@ -413,8 +412,6 @@ class DSAOffloadConfig:
                 "so the complete prompt can be admitted into every active "
                 "full-context cache group before its first chunk"
             )
-        if bool(cache_config.enable_prefix_caching):
-            raise ValueError("DSA sparse offload does not yet support prefix caching")
         speculative_config = vllm_config.speculative_config
         mtp_num_speculative_tokens = 0
         mtp_cache_layer_count = 0

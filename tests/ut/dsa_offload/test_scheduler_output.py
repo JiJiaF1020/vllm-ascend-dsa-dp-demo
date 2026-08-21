@@ -11,6 +11,7 @@ from vllm_ascend.dsa_offload.request_cache_layout import (
 )
 from vllm_ascend.dsa_offload.scheduler_output import (
     DSADRAMBlockAssignment,
+    DSADRAMBlockRestore,
     DSAOffloadSchedulerOutput,
     DSARequestCacheLayoutProjection,
 )
@@ -29,6 +30,15 @@ def _projection() -> DSARequestCacheLayoutProjection:
                 request_id="req",
                 logical_block_start=0,
                 physical_block_ids=(9, 10),
+            ),
+        ),
+        dram_ready_block_counts=(2,),
+        dram_block_restores=(
+            DSADRAMBlockRestore(
+                request_id="req",
+                source_dram_block_ids=(9, 10),
+                destination_indexer_block_ids=(19, 20),
+                destination_resident_block_ids=(29, 30),
             ),
         ),
     )
@@ -81,4 +91,14 @@ def test_projection_rejects_dram_assignment_for_unscheduled_request() -> None:
                     physical_block_ids=(1,),
                 ),
             ),
+        )
+
+
+def test_projection_rejects_restore_with_mismatched_plane_lengths() -> None:
+    with pytest.raises(ValueError, match="matching positive length"):
+        DSADRAMBlockRestore(
+            request_id="req",
+            source_dram_block_ids=(1, 2),
+            destination_indexer_block_ids=(3,),
+            destination_resident_block_ids=(4, 5),
         )

@@ -34,6 +34,8 @@ BATCH_SIZE = 4
 MAX_MODEL_LEN = 131072
 MAX_NUM_BATCHED_TOKENS = 131072
 ENABLE_CHUNKED_PREFILL = False
+ENABLE_PREFIX_CACHING = False
+LOGGING_LEVEL = "INFO"
 ENABLE_A5_PACKED_C8_DSA = False
 ENABLE_MTP = False
 MTP_NUM_SPECULATIVE_TOKENS = 3
@@ -61,7 +63,7 @@ NATIVE_RUNTIME_ENV_OVERRIDES = {
     "PYTHONHASHSEED": "114514",
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "VLLM_ASCEND_ENABLE_MLAPO": "1",
-    "VLLM_LOGGING_LEVEL": "INFO",
+    "VLLM_LOGGING_LEVEL": LOGGING_LEVEL,
 }
 
 PROMPT_TEMPLATE = """请基于下面给定的上下文，简洁准确地回答问题。只输出最终答案，不要解释，不要重复题目或上下文。
@@ -251,7 +253,7 @@ def build_llm() -> LLM:
         "max_model_len": MAX_MODEL_LEN,
         "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS,
         "trust_remote_code": True,
-        "enable_prefix_caching": False,
+        "enable_prefix_caching": ENABLE_PREFIX_CACHING,
         "enable_chunked_prefill": ENABLE_CHUNKED_PREFILL,
         "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
         "block_size": 128,

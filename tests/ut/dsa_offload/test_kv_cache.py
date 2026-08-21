@@ -63,13 +63,14 @@ def _make_vllm_config(
     *,
     max_model_len: int = 32768,
     override: int | None = None,
+    enable_prefix_caching: bool = False,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         cache_config=SimpleNamespace(
             num_gpu_blocks_override=override,
             block_size=128,
             hash_block_size=None,
-            enable_prefix_caching=False,
+            enable_prefix_caching=enable_prefix_caching,
         ),
         model_config=SimpleNamespace(max_model_len=max_model_len),
         kv_transfer_config=None,
@@ -296,6 +297,11 @@ def test_current_dsa_groups_resolve_scheduler_and_hash_to_128(
         config,
         vllm_config,
     ) == (128, 128)
+    prefix_config = _make_vllm_config(enable_prefix_caching=True)
+    assert _ascend_resolve_kv_cache_block_sizes(
+        config,
+        prefix_config,
+    ) == (128, 128)
 
 
 def test_engine_core_finalizes_one_shared_dram_capacity_plan(
@@ -513,6 +519,7 @@ def test_block_pool_view_resets_every_physical_pool() -> None:
         def __init__(self, result: bool) -> None:
             self.result = result
             self.reset_calls = 0
+            self.enable_caching = False
 
         def reset_prefix_cache(self) -> bool:
             self.reset_calls += 1
@@ -520,11 +527,16 @@ def test_block_pool_view_resets_every_physical_pool() -> None:
 
     first = _Pool(False)
     second = _Pool(True)
-    view = DSABlockPoolView([first, second])  # type: ignore[list-item]
+    dram = _Pool(True)
+    view = DSABlockPoolView(  # type: ignore[list-item]
+        [first, second],
+        extra_prefix_cache_pools=[dram],
+    )
 
     assert view.reset_prefix_cache() is False
     assert first.reset_calls == 1
     assert second.reset_calls == 1
+    assert dram.reset_calls == 1
 
 
 def test_component_admission_checks_each_physical_pool() -> None:

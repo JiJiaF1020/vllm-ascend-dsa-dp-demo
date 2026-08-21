@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from vllm_ascend.dsa_offload.kv_cache_coordinator import (
     DSAKVCacheCoordinator,
+    DSAPrefixCacheHitPlan,
 )
 from vllm_ascend.dsa_offload.kv_cache_manager import allocate_dsa_slots
 from vllm_ascend.dsa_offload.request_cache_layout import (
@@ -45,6 +46,7 @@ class _SingleTypeManager:
 
     def __init__(self, pool: _Pool) -> None:
         self.block_pool = pool
+        self.enable_caching = False
         self.req_to_blocks = defaultdict(list)
         self.num_cached_block: dict[str, int] = {}
 
@@ -84,6 +86,17 @@ class _SingleTypeManager:
         self.req_to_blocks[request_id].extend(blocks)
         return blocks
 
+    def allocate_new_computed_blocks(
+        self,
+        request_id: str,
+        new_computed_blocks,
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        del num_local_computed_tokens, num_external_computed_tokens
+        self.req_to_blocks[request_id].extend(new_computed_blocks)
+        self.num_cached_block[request_id] = len(new_computed_blocks)
+
     def free(self, request_id: str) -> None:
         blocks = self.req_to_blocks.pop(request_id, [])
         self.block_pool.free_blocks(reversed(blocks))
@@ -98,6 +111,8 @@ class _TopManager:
     ) -> None:
         self.coordinator = coordinator
         self.max_model_len = max_model_len
+        self.enable_caching = False
+        self.log_stats = False
         self.empty_kv_cache_blocks = SimpleNamespace(
             blocks=tuple(
                 () for _ in range(coordinator.num_single_type_manager)
@@ -112,6 +127,14 @@ class _TopManager:
 class _DRAMDirectory:
     def __init__(self) -> None:
         self.freed_request_ids: list[str] = []
+        self.attached: dict[str, tuple[_Block, ...]] = {}
+
+    def attach_cached_prefix(
+        self,
+        request_id: str,
+        blocks: tuple[_Block, ...],
+    ) -> None:
+        self.attached[request_id] = blocks
 
     def free_request(self, request_id: str) -> tuple[int, ...]:
         self.freed_request_ids.append(request_id)
@@ -153,6 +176,8 @@ def _make_manager(
 
     coordinator = object.__new__(DSAKVCacheCoordinator)
     coordinator.max_model_len = 16384
+    coordinator.enable_caching = False
+    coordinator.dram_block_size = 128
     coordinator.num_single_type_manager = len(managers)
     coordinator.group_ids = SimpleNamespace(
         indexer=0,
@@ -165,6 +190,8 @@ def _make_manager(
     coordinator.single_type_managers = tuple(managers)
     coordinator.physical_block_pools = tuple(pools)
     coordinator.dram_directory = _DRAMDirectory()
+    coordinator._pending_prefix_hits = {}
+    coordinator._pending_prefix_restores = {}
     coordinator.request_cache_layout = DSARequestCachePlanner(
         block_size=128,
         sparse_activation_tokens=2048,
@@ -210,6 +237,37 @@ def test_dense_enter_sparse_keeps_indexer_full_and_resident_fixed() -> None:
     assert state.stage == DSARequestCacheStage.SPARSE_DECODE
     assert len(coordinator.indexer_manager.req_to_blocks["req"]) == 25
     assert tuple(block.block_id for block in coordinator.resident_manager.req_to_blocks["req"]) == resident_ids
+
+
+def test_prefix_hit_allocates_target_destinations_and_commits_restore() -> None:
+    manager, coordinator = _make_manager()
+    request = _Request("prefix", 512, 0, 0, 512)
+    dram_blocks = (_Block(9001), _Block(9002))
+    coordinator._pending_prefix_hits[request.request_id] = (
+        DSAPrefixCacheHitPlan(
+            request_id=request.request_id,
+            num_computed_tokens=256,
+            dram_blocks=dram_blocks,  # type: ignore[arg-type]
+        )
+    )
+
+    allocated = allocate_dsa_slots(
+        manager,  # type: ignore[arg-type]
+        request,  # type: ignore[arg-type]
+        256,
+        num_new_computed_tokens=256,
+        new_computed_blocks=manager.empty_kv_cache_blocks,
+    )
+
+    assert allocated is not None
+    assert len(coordinator.indexer_manager.req_to_blocks["prefix"]) == 4
+    assert len(coordinator.resident_manager.req_to_blocks["prefix"]) == 4
+    assert coordinator.dram_directory.attached["prefix"] == dram_blocks
+    restore = coordinator.take_prefix_restore_plan("prefix")
+    assert restore is not None
+    assert restore.source_dram_block_ids == (9001, 9002)
+    assert restore.destination_indexer_block_ids == (1000, 1001)
+    assert restore.destination_resident_block_ids == (2000, 2001)
 
 
 def test_chunked_prefill_grows_both_dense_planes_incrementally() -> None:

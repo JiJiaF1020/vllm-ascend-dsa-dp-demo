@@ -8,7 +8,6 @@ import pytest
 import torch
 
 import vllm_ascend.dsa_offload.runtime as runtime_module
-from vllm_ascend.dsa_offload.worker_dram_store import DSAWorkerDRAMStore
 from vllm_ascend.dsa_offload.input_batch import DSAInputBatchCacheLayout
 from vllm_ascend.dsa_offload.request_cache_layout import (
     DSARequestCacheStage,
@@ -19,9 +18,11 @@ from vllm_ascend.dsa_offload.runtime import (
     DSAOffloadRuntime,
 )
 from vllm_ascend.dsa_offload.scheduler_output import (
+    DSADRAMBlockRestore,
     DSARequestCacheLayoutProjection,
     DSAResidentBlockTableReplacement,
 )
+from vllm_ascend.dsa_offload.worker_dram_store import DSAWorkerDRAMStore
 
 
 class _ResidentBlockTable:
@@ -40,6 +41,7 @@ def _make_runtime(
     max_decode_query_len: int = 1,
     resident_layer_count: int = 2,
     selection_state_count: int = 2,
+    enable_prefix_caching: bool = False,
 ) -> tuple[
     DSAResidentTokenPool,
     DSAOffloadRuntime,
@@ -63,6 +65,7 @@ def _make_runtime(
         pin_memory=False,
         packed_c8=packed_c8,
         max_decode_query_len=max_decode_query_len,
+        enable_prefix_caching=enable_prefix_caching,
     )
     store = DSAWorkerDRAMStore(
         usable_blocks=8,
@@ -127,6 +130,69 @@ def _full_context(
     )
 
 
+def test_prefix_restore_uses_fixed_jobs_and_restores_both_planes(
+    monkeypatch,
+) -> None:
+    resident_pool, runtime, store = _make_runtime(
+        resident_layer_count=1,
+        selection_state_count=1,
+        enable_prefix_caching=True,
+    )
+    assert runtime.restore_src_dram_block_ids.gpu.shape == (4,)
+    pool_index = resident_pool.acquire("req")
+    store.apply_assignment(
+        pool_index=pool_index,
+        logical_block_start=0,
+        physical_block_ids=(6,),
+    )
+    resident_nope = torch.zeros((4, 128, 1, 2), dtype=torch.bfloat16)
+    resident_rope = torch.zeros((4, 128, 1, 1), dtype=torch.bfloat16)
+    indexer = torch.zeros((4, 128, 1, 2), dtype=torch.int8)
+    store.add_layer(
+        layer_id=0,
+        resident_nope_cache=resident_nope,
+        resident_rope_cache=resident_rope,
+        indexer_cache=indexer,
+    )
+    arenas = store.get_layer_arenas(0)
+    assert arenas.nope is not None
+    assert arenas.rope is not None
+    arenas.nope[6].fill_(3)
+    arenas.rope[6].fill_(4)
+    arenas.indexer_dram_bytes[0][6].fill_(5)
+
+    def copy_blocks(
+        *,
+        source_bytes,
+        destination_bytes,
+        src_block_ids,
+        dst_block_ids,
+    ) -> None:
+        destination_bytes[dst_block_ids.long()] = source_bytes[
+            src_block_ids.long()
+        ]
+
+    monkeypatch.setattr(
+        runtime_module,
+        "copy_full_cache_plane_bytes",
+        copy_blocks,
+    )
+    restore = DSADRAMBlockRestore(
+        request_id="req",
+        source_dram_block_ids=(6,),
+        destination_indexer_block_ids=(2,),
+        destination_resident_block_ids=(1,),
+    )
+    runtime.prepare_prefix_restore_jobs(
+        restores=(restore,),
+        state=SimpleNamespace(resident_token_pool=resident_pool),
+    )
+    assert torch.all(resident_nope[1] == 3)
+    assert torch.all(resident_rope[1] == 4)
+    assert torch.all(indexer[2] == 5)
+    assert store.durable_full_block_counts[pool_index] == 1
+
+
 def test_a5_selection_scratch_is_allocated_only_for_packed_c8() -> None:
     _, bf16_runtime, _ = _make_runtime()
     _, c8_runtime, _ = _make_runtime(packed_c8=True)
@@ -136,6 +202,7 @@ def test_a5_selection_scratch_is_allocated_only_for_packed_c8() -> None:
     )
 
     assert bf16_runtime._a5_attention_slots is None
+    assert bf16_runtime.restore_src_dram_block_ids.gpu.shape == (1,)
     assert bf16_runtime._a5_resident_seq_lengths is None
     assert c8_runtime._a5_attention_slots is not None
     assert c8_runtime._a5_attention_slots.shape == (1, 1, 2176)
@@ -930,6 +997,7 @@ def test_graph_execution_view_pads_dump_jobs_with_noop_rows() -> None:
     assert runtime.execution_num_reqs == 4
     assert runtime.dump_launch_count == 4
     assert runtime.dump_src_block_ids.gpu[:4].tolist() == [7, 0, 0, 0]
+    assert runtime.dump_indexer_src_block_ids.gpu[:4].tolist() == [0, 0, 0, 0]
     assert runtime.dump_dst_block_ids.gpu[:4].tolist() == [9, -1, -1, -1]
 
 

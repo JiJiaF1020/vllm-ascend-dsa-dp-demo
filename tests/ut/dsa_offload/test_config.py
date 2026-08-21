@@ -203,7 +203,6 @@ def test_invalid_static_config_is_rejected(
     [
         ({"async_scheduling": None}, "async_scheduling=False"),
         ({"async_scheduling": True}, "async_scheduling=False"),
-        ({"enable_prefix_caching": True}, "prefix caching"),
         (
             {"speculative_config": _mtp_config(method="ngram")},
             "method='mtp'",
@@ -249,6 +248,15 @@ def test_chunked_prefill_modes_are_supported(config_updates) -> None:
     assert config.enabled
 
 
+def test_local_dram_prefix_cache_is_supported() -> None:
+    config = DSAOffloadConfig.from_dict(
+        {"enabled": True},
+        vllm_config=_vllm_config(enable_prefix_caching=True),
+    )
+
+    assert config.enabled
+
+
 def test_compromise_mtp3_contract_is_accepted() -> None:
     config = DSAOffloadConfig.from_dict(
         {
@@ -256,7 +264,10 @@ def test_compromise_mtp3_contract_is_accepted() -> None:
             "sparse_activation_tokens": 8192,
             "resident_budget_tokens": [8192, 10240, 12288],
         },
-        vllm_config=_vllm_config(speculative_config=_mtp_config()),
+        vllm_config=_vllm_config(
+            speculative_config=_mtp_config(),
+            enable_prefix_caching=True,
+        ),
     )
 
     assert config.mtp_enabled

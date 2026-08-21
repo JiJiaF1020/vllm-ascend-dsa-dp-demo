@@ -9,6 +9,7 @@
 * active DRAM block table；
 * 所有层串行复用的 caller-owned LIDU scratch 输出；
 * 本轮满块 dump 的紧凑 src/dst 列。
+* prefix hit 的 DRAM src 与 target Indexer/MLA HBM dst 固定 restore 列。
 
 固定 MTP3 使用两块 parity tail，位置映射化简为 ``position % 256``。
 已确认满块在下一 outer step、当前 target 层写 KV 前 dump；每个 target
@@ -23,11 +24,13 @@ captured-prefix + PAD view，而不是另建一套 graph-only 语义。
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
+from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.utils import CpuGpuBuffer
 
@@ -38,13 +41,13 @@ from vllm_ascend.dsa_offload.contracts import (
     DSA_LIDU_OUTPUT_CAPACITY,
     DSA_ROW_MODE_SPARSE,
 )
-from vllm_ascend.dsa_offload.worker_dram_store import DSAWorkerDRAMStore
 from vllm_ascend.dsa_offload.ops import (
     DSALightningIndexerOutputs,
     DSAOffloadSelectionOutput,
     a5_kvcache_scatter_copy_c8,
     a5_lightning_indexer_decode_update_c8,
     a5_lightning_indexer_decode_update_mtp_c8,
+    copy_full_cache_plane_bytes,
     dump_full_cache_plane_bytes,
     dump_full_kv_cache_blocks,
     dump_full_kv_cache_blocks_c8,
@@ -57,6 +60,7 @@ from vllm_ascend.dsa_offload.request_cache_layout import (
     DSARequestCacheStage,
 )
 from vllm_ascend.dsa_offload.resident_pool import DSAResidentTokenPool
+from vllm_ascend.dsa_offload.worker_dram_store import DSAWorkerDRAMStore
 
 if TYPE_CHECKING:
     from vllm_ascend.dsa_offload.input_batch import (
@@ -81,6 +85,7 @@ class DSAOffloadRuntime:
         pin_memory: bool,
         packed_c8: bool = False,
         max_decode_query_len: int = 1,
+        enable_prefix_caching: bool = False,
     ) -> None:
         self.max_num_reqs = int(max_num_reqs)
         self.max_num_tokens = int(max_num_tokens)
@@ -90,6 +95,7 @@ class DSAOffloadRuntime:
         self.device = torch.device(device)
         self.packed_c8 = bool(packed_c8)
         self.max_decode_query_len = int(max_decode_query_len)
+        self.enable_prefix_caching = bool(enable_prefix_caching)
         if self.max_decode_query_len <= 0:
             raise ValueError("DSA max_decode_query_len must be positive")
         self.resident_token_pool = resident_token_pool
@@ -235,6 +241,44 @@ class DSAOffloadRuntime:
         self._target_durable_full_blocks = np.empty_like(
             self._durable_full_blocks
         )
+        max_restore_jobs = (
+            self.max_num_reqs
+            * cdiv(self.max_model_len, self.block_size)
+            if self.enable_prefix_caching
+            else 1
+        )
+        self.restore_src_dram_block_ids = CpuGpuBuffer(
+            max_restore_jobs,
+            dtype=torch.int32,
+            device=self.device,
+            pin_memory=pin_memory,
+        )
+        self.restore_dst_indexer_block_ids = CpuGpuBuffer(
+            max_restore_jobs,
+            dtype=torch.int32,
+            device=self.device,
+            pin_memory=pin_memory,
+        )
+        self.restore_dst_resident_block_ids = CpuGpuBuffer(
+            max_restore_jobs,
+            dtype=torch.int32,
+            device=self.device,
+            pin_memory=pin_memory,
+        )
+        self.restore_src_dram_block_ids.np.fill(0)
+        self.restore_dst_indexer_block_ids.np.fill(0)
+        self.restore_dst_resident_block_ids.np.fill(0)
+        self.restore_src_dram_block_ids.gpu.zero_()
+        self.restore_dst_indexer_block_ids.gpu.zero_()
+        self.restore_dst_resident_block_ids.gpu.zero_()
+        self._restore_pool_indices = np.empty(
+            self.max_num_reqs,
+            dtype=np.intp,
+        )
+        self._restore_ready_counts = np.empty(
+            self.max_num_reqs,
+            dtype=np.int32,
+        )
 
         self.dram_store: DSAWorkerDRAMStore | None = None
         self.active_num_reqs = 0
@@ -271,6 +315,153 @@ class DSAOffloadRuntime:
                 f"runtime={self.max_logical_blocks}"
             )
         self.dram_store = store
+
+    def prepare_prefix_restore_jobs(
+        self,
+        *,
+        restores: Sequence[object],
+        state: DSAInputBatchCacheLayout,
+    ) -> None:
+        """把冷路径 restore plan 写入固定 buffer，并推进 worker durable 水位。"""
+
+        store = self.dram_store
+        if store is None:
+            raise RuntimeError("DSA prefix restore requires a bound DRAM store")
+        if not restores:
+            return
+        if not self.enable_prefix_caching:
+            raise RuntimeError(
+                "DSA received prefix restore jobs while prefix caching is "
+                "disabled"
+            )
+
+        offset = 0
+        restore_rows = 0
+        capacity = int(self.restore_src_dram_block_ids.np.shape[0])
+        for restore in restores:
+            request_id = restore.request_id
+            pool_index = state.resident_token_pool.get_index(request_id)
+            if pool_index is None:
+                raise RuntimeError(
+                    "DSA prefix restore has no resident pool row: "
+                    f"request_id={request_id!r}"
+                )
+            block_count = len(restore.source_dram_block_ids)
+            if not (
+                block_count
+                == len(restore.destination_indexer_block_ids)
+                == len(restore.destination_resident_block_ids)
+                and block_count > 0
+            ):
+                raise RuntimeError(
+                    "DSA prefix restore contains inconsistent block columns"
+                )
+            end = offset + block_count
+            if end > capacity:
+                raise RuntimeError(
+                    "DSA prefix restore exceeds fixed job capacity: "
+                    f"required={end}, capacity={capacity}"
+                )
+            assigned = store.logical_block_table[
+                pool_index,
+                :block_count,
+            ]
+            self.restore_src_dram_block_ids.np[offset:end] = (
+                restore.source_dram_block_ids
+            )
+            self.restore_dst_indexer_block_ids.np[offset:end] = (
+                restore.destination_indexer_block_ids
+            )
+            self.restore_dst_resident_block_ids.np[offset:end] = (
+                restore.destination_resident_block_ids
+            )
+            if not np.array_equal(
+                assigned,
+                self.restore_src_dram_block_ids.np[offset:end],
+            ):
+                raise RuntimeError(
+                    "DSA prefix restore source disagrees with the worker "
+                    f"DRAM table: request_id={request_id!r}"
+                )
+            self._restore_pool_indices[restore_rows] = int(pool_index)
+            self._restore_ready_counts[restore_rows] = block_count
+            restore_rows += 1
+            offset = end
+
+        self.restore_src_dram_block_ids.gpu[:offset].copy_(
+            self.restore_src_dram_block_ids.cpu[:offset],
+            non_blocking=True,
+        )
+        self.restore_dst_indexer_block_ids.gpu[:offset].copy_(
+            self.restore_dst_indexer_block_ids.cpu[:offset],
+            non_blocking=True,
+        )
+        self.restore_dst_resident_block_ids.gpu[:offset].copy_(
+            self.restore_dst_resident_block_ids.cpu[:offset],
+            non_blocking=True,
+        )
+        store.commit_durable_full_block_counts(
+            pool_indices=self._restore_pool_indices[:restore_rows],
+            full_block_counts=self._restore_ready_counts[:restore_rows],
+        )
+        self._execute_prefix_restore_jobs(offset)
+        logger.info(
+            "DSA prefix restore submitted: requests=%d blocks=%d "
+            "target_layers=%d",
+            restore_rows,
+            offset,
+            self.num_layers,
+        )
+
+    def _execute_prefix_restore_jobs(self, job_count: int) -> None:
+        """在 model forward 前恢复所有 target layer，复用当前 NPU stream。"""
+
+        store = self.dram_store
+        if store is None:
+            raise RuntimeError("DSA prefix restore requires a bound DRAM store")
+        source_ids = self.restore_src_dram_block_ids.gpu[:job_count]
+        resident_destination_ids = (
+            self.restore_dst_resident_block_ids.gpu[:job_count]
+        )
+        indexer_destination_ids = (
+            self.restore_dst_indexer_block_ids.gpu[:job_count]
+        )
+        for layer_id in range(self.num_layers):
+            arenas = store.get_layer_arenas(layer_id)
+            if len(arenas.resident_source_bytes) != len(
+                arenas.resident_dram_bytes
+            ):
+                raise RuntimeError(
+                    "DSA resident HBM/DRAM restore plane count mismatch"
+                )
+            for dram_bytes, resident_bytes in zip(
+                arenas.resident_dram_bytes,
+                arenas.resident_source_bytes,
+                strict=True,
+            ):
+                copy_full_cache_plane_bytes(
+                    source_bytes=dram_bytes,
+                    destination_bytes=resident_bytes,
+                    src_block_ids=source_ids,
+                    dst_block_ids=resident_destination_ids,
+                )
+            if len(arenas.indexer_source_bytes) != len(
+                arenas.indexer_dram_bytes
+            ):
+                raise RuntimeError(
+                    "DSA Indexer HBM/DRAM restore plane count mismatch"
+                )
+            for dram_bytes, indexer_bytes in zip(
+                arenas.indexer_dram_bytes,
+                arenas.indexer_source_bytes,
+                strict=True,
+            ):
+                copy_full_cache_plane_bytes(
+                    source_bytes=dram_bytes,
+                    destination_bytes=indexer_bytes,
+                    src_block_ids=source_ids,
+                    dst_block_ids=indexer_destination_ids,
+                )
 
     def release_pool_index(self, pool_index: int) -> None:
         store = self.dram_store

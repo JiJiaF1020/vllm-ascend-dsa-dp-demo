@@ -11,8 +11,9 @@ admission 时逐 component 检查。
 
 本模块同时持有请求 cache 布局 planner：manager 先生成不可变布局计划，完成
 各 pool 容量检查和物理修改后再 commit；prefill 输出返回后，薄 Scheduler
-也通过这里释放已卸载的 resident 满块。它仍不复制 Scheduler 主循环，
-prefix cache 与 KV connector 由配置合同提前拒绝。固定 MTP3 的 target
+也通过这里释放已卸载的 resident 满块。它仍不复制 Scheduler 主循环。
+本地 prefix cache 只给完整 DRAM bundle 与可选 MTP full-HBM group 建 hash；
+KV connector 仍由配置合同提前拒绝。固定 MTP3 的 target
 验算仍由 resident 双尾块承接 provisional 写入；MTP proposer 自身则使用
 第三个原生 full-cache group，不进入 DSA resident/DRAM 数据面。
 
@@ -26,6 +27,7 @@ worker ``DSAInputBatchCacheLayout`` 共同完成，不能由各 worker 根据长
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
@@ -33,6 +35,7 @@ from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
+    BlockHashListWithBlockSize,
     KVCacheBlock,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
@@ -41,10 +44,8 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     get_manager_for_kv_cache_spec,
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.request import Request
 
-from vllm_ascend.dsa_offload.scheduler_dram_pool import (
-    DSASchedulerDRAMBlockDirectory,
-)
 from vllm_ascend.dsa_offload.kv_cache import (
     DSAKVCacheConfig,
     get_dsa_group_num_blocks,
@@ -54,6 +55,12 @@ from vllm_ascend.dsa_offload.kv_cache import (
 from vllm_ascend.dsa_offload.request_cache_layout import (
     DSARequestCachePlanner,
     DSARequestCacheState,
+)
+from vllm_ascend.dsa_offload.scheduler_dram_pool import (
+    DSASchedulerDRAMBlockDirectory,
+)
+from vllm_ascend.dsa_offload.scheduler_output import (
+    DSADRAMBlockRestore,
 )
 
 
@@ -66,12 +73,23 @@ class DSABlockPoolView:
     聚合 free-block 数做标量判断。
     """
 
-    def __init__(self, block_pools: Sequence[BlockPool]) -> None:
+    def __init__(
+        self,
+        block_pools: Sequence[BlockPool],
+        *,
+        extra_prefix_cache_pools: Sequence[BlockPool] = (),
+    ) -> None:
         if not block_pools:
             raise ValueError("DSA requires at least one physical block pool")
         self.block_pools = tuple(block_pools)
+        self.prefix_cache_pools = (
+            *self.block_pools,
+            *tuple(extra_prefix_cache_pools),
+        )
         self.num_gpu_blocks = sum(pool.num_gpu_blocks for pool in self.block_pools)
-        self.enable_caching = False
+        self.enable_caching = any(
+            pool.enable_caching for pool in self.prefix_cache_pools
+        )
 
     def get_num_free_blocks(self) -> int:
         return sum(pool.get_num_free_blocks() for pool in self.block_pools)
@@ -83,23 +101,35 @@ class DSABlockPoolView:
 
     def reset_prefix_cache(self) -> bool:
         # ``all(generator)`` 会在首个 False 处短路，导致后续物理池没有被
-        # reset。即使首版关闭 prefix cache，也必须保持公共接口的双池原子
-        # 语义，便于异常恢复和后续扩展。
-        results = [pool.reset_prefix_cache() for pool in self.block_pools]
+        # reset。所有 pool 都必须尝试，避免 HBM MTP 与 DRAM bundle 只
+        # 清掉一侧后产生不一致命中。
+        results = [
+            pool.reset_prefix_cache() for pool in self.prefix_cache_pools
+        ]
         return all(results)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
-        # 各物理池的 block id 均从 0 开始。首版禁用 KV connector 和
-        # prefix cache；若未来开放按 block-id 驱逐，接口必须增加 group id，
+        # 各物理池的 block id 均从 0 开始。首版禁用 KV connector 的
+        # 外部按-id 驱逐；若未来开放该接口，必须增加 group/tier id，
         # 不能把同一组裸 block id 无差别广播给各 pool。
         if block_ids:
             raise RuntimeError("DSA split KV-cache eviction requires group-qualified block ids")
 
     def take_events(self) -> list:
         events = []
-        for pool in self.block_pools:
+        for pool in self.prefix_cache_pools:
             events.extend(pool.take_events())
         return events
+
+
+@dataclass(frozen=True, slots=True)
+class DSAPrefixCacheHitPlan:
+    """查询阶段的零引用候选；只有 HBM admission 成功后才能提交。"""
+
+    request_id: str
+    num_computed_tokens: int
+    dram_blocks: tuple[KVCacheBlock, ...]
+    mtp_blocks: tuple[KVCacheBlock, ...] = ()
 
 
 class DSAKVCacheCoordinator(KVCacheCoordinator):
@@ -119,11 +149,6 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
     ) -> None:
-        if enable_caching:
-            raise ValueError("DSA split KV-cache does not yet support prefix caching")
-        # DSA 配置层只会放行固定 MTP3。prefix cache 仍关闭，因此上游
-        # ``use_eagle`` 的 last-block-drop 语义在这里没有可命中的 cache
-        # block；lookahead 的物理容量由 allocate_dsa_slots 显式处理。
         if enable_kv_cache_events:
             raise ValueError(
                 "DSA split KV-cache does not yet support KV-cache events: "
@@ -152,24 +177,30 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
             )
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
-        self.enable_caching = False
+        self.enable_caching = bool(enable_caching)
         self.scheduler_block_size = scheduler_block_size
+        self.hash_block_size = hash_block_size
         self.retention_interval = None
+        self.group_ids = get_dsa_kv_cache_group_ids(kv_cache_config)
         physical_pools = tuple(
             BlockPool(
                 num_gpu_blocks=get_dsa_group_num_blocks(
                     kv_cache_config,
                     group,
                 ),
-                enable_caching=False,
+                enable_caching=(
+                    self.enable_caching
+                    and group_id == self.group_ids.mtp_full
+                ),
                 hash_block_size=hash_block_size,
                 enable_kv_cache_events=enable_kv_cache_events,
                 metrics_collector=metrics_collector,
             )
-            for group in kv_cache_config.kv_cache_groups
+            for group_id, group in enumerate(
+                kv_cache_config.kv_cache_groups
+            )
         )
         self.physical_block_pools = physical_pools
-        self.block_pool = DSABlockPoolView(physical_pools)
 
         self.single_type_managers = tuple(
             get_manager_for_kv_cache_spec(
@@ -177,7 +208,7 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
                 max_num_batched_tokens=max_num_batched_tokens,
                 max_model_len=max_model_len,
                 block_pool=physical_pools[group_id],
-                enable_caching=False,
+                enable_caching=physical_pools[group_id].enable_caching,
                 kv_cache_group_id=group_id,
                 dcp_world_size=dcp_world_size,
                 pcp_world_size=pcp_world_size,
@@ -186,7 +217,6 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
             for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
         )
         self.num_single_type_manager = len(self.single_type_managers)
-        self.group_ids = get_dsa_kv_cache_group_ids(kv_cache_config)
         indexer_block_size = int(
             kv_cache_config.kv_cache_groups[
                 self.group_ids.indexer
@@ -197,11 +227,32 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
         # DRAM bundle 与 Indexer/MLA payload 一一对应，唯一真源是最终
         # Indexer spec 的物理 block size。
         self.dram_block_size = indexer_block_size
+        if self.enable_caching and hash_block_size != indexer_block_size:
+            raise ValueError(
+                "DSA first-version DRAM prefix cache requires hash and "
+                "physical bundle block sizes to match: "
+                f"hash={hash_block_size}, dram={indexer_block_size}"
+            )
         self.dram_directory = DSASchedulerDRAMBlockDirectory(
             usable_blocks=kv_cache_config.dram_capacity.usable_blocks,
             max_logical_blocks=cdiv(max_model_len, indexer_block_size),
             block_size=indexer_block_size,
+            enable_caching=self.enable_caching,
         )
+        self.block_pool = DSABlockPoolView(
+            physical_pools,
+            extra_prefix_cache_pools=(
+                self.dram_directory.block_pool,
+            ),
+        )
+        self._pending_prefix_hits: dict[
+            str,
+            DSAPrefixCacheHitPlan,
+        ] = {}
+        self._pending_prefix_restores: dict[
+            str,
+            DSADRAMBlockRestore,
+        ] = {}
         self.eagle_group_ids = (
             {self.group_ids.mtp_full}
             if self.group_ids.mtp_full is not None
@@ -279,6 +330,171 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
             resident_budget_tokens=dsa_config.resident_budget_tokens,
             sparse_tail_block_count=dsa_config.sparse_tail_block_count,
         )
+
+    def prepare_prefix_cache_hit(
+        self,
+        request: Request,
+        max_cache_hit_length: int,
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+        """构造 DRAM target + MTP HBM 的零引用公共命中候选。"""
+
+        request_id = request.request_id
+        self._pending_prefix_hits.pop(request_id, None)
+        target_blocks = self.dram_directory.find_longest_cache_hit(
+            request.block_hashes,
+            max_cache_hit_length,
+        )
+        target_tokens = len(target_blocks) * self.dram_block_size
+        target_tokens = (
+            target_tokens
+            // self.scheduler_block_size
+            * self.scheduler_block_size
+        )
+        target_blocks = target_blocks[
+            : target_tokens // self.dram_block_size
+        ]
+
+        mtp_blocks: tuple[KVCacheBlock, ...] = ()
+        final_tokens = target_tokens
+        if final_tokens and self.mtp_full_manager is not None:
+            mtp_group_id = self.group_ids.mtp_full
+            assert mtp_group_id is not None
+            mtp_spec = self.kv_cache_config.kv_cache_groups[
+                mtp_group_id
+            ].kv_cache_spec
+            mtp_block_size = int(mtp_spec.block_size)
+            mtp_hashes = (
+                request.block_hashes
+                if mtp_block_size == self.hash_block_size
+                else BlockHashListWithBlockSize(
+                    request.block_hashes,
+                    self.hash_block_size,
+                    mtp_block_size,
+                )
+            )
+            # 与基线 HybridKVCacheCoordinator 一致：EAGLE/MTP 为了在
+            # prefix 边界重建 drafting hidden states，多检查一个块后 drop。
+            mtp_max_length = min(
+                final_tokens + mtp_block_size,
+                int(max_cache_hit_length),
+            )
+            mtp_hit = self.mtp_full_manager.find_longest_cache_hit(
+                block_hashes=mtp_hashes,
+                max_length=mtp_max_length,
+                kv_cache_group_ids=[mtp_group_id],
+                block_pool=self.mtp_full_manager.block_pool,
+                kv_cache_spec=mtp_spec,
+                drop_eagle_block=True,
+                alignment_tokens=self.scheduler_block_size,
+            )[0]
+            mtp_tokens = len(mtp_hit) * mtp_block_size
+            final_tokens = min(final_tokens, mtp_tokens)
+            target_blocks = target_blocks[
+                : final_tokens // self.dram_block_size
+            ]
+            mtp_blocks = tuple(
+                mtp_hit[: final_tokens // mtp_block_size]
+            )
+
+        hbm_hit_blocks: list[list[KVCacheBlock]] = [
+            [] for _ in range(self.num_single_type_manager)
+        ]
+        if self.group_ids.mtp_full is not None:
+            hbm_hit_blocks[self.group_ids.mtp_full] = list(mtp_blocks)
+        if final_tokens:
+            self._pending_prefix_hits[request_id] = (
+                DSAPrefixCacheHitPlan(
+                    request_id=request_id,
+                    num_computed_tokens=final_tokens,
+                    dram_blocks=tuple(target_blocks),
+                    mtp_blocks=mtp_blocks,
+                )
+            )
+        return tuple(hbm_hit_blocks), final_tokens
+
+    def get_pending_prefix_hit(
+        self,
+        request_id: str,
+    ) -> DSAPrefixCacheHitPlan | None:
+        return self._pending_prefix_hits.get(request_id)
+
+    def commit_prefix_cache_hit(
+        self,
+        request_id: str,
+        num_computed_tokens: int,
+    ) -> None:
+        """分物理池 admission 成功后提交 DRAM 引用和 restore 映射。"""
+
+        if num_computed_tokens <= 0:
+            self._pending_prefix_hits.pop(request_id, None)
+            return
+        plan = self._pending_prefix_hits.pop(request_id, None)
+        if plan is None or plan.num_computed_tokens != int(
+            num_computed_tokens
+        ):
+            raise RuntimeError(
+                "DSA prefix hit plan is missing or changed before commit: "
+                f"request_id={request_id!r}, expected={num_computed_tokens}, "
+                f"plan={plan}"
+            )
+        block_count = int(num_computed_tokens) // self.dram_block_size
+        indexer_blocks = self.indexer_manager.req_to_blocks[request_id]
+        resident_blocks = self.resident_manager.req_to_blocks[request_id]
+        if (
+            len(plan.dram_blocks) != block_count
+            or len(indexer_blocks) < block_count
+            or len(resident_blocks) < block_count
+        ):
+            raise RuntimeError(
+                "DSA prefix restore block tables do not cover the common "
+                f"hit: request_id={request_id!r}, hit={block_count}, "
+                f"dram={len(plan.dram_blocks)}, "
+                f"indexer={len(indexer_blocks)}, "
+                f"resident={len(resident_blocks)}"
+            )
+        if self.mtp_full_manager is not None:
+            mtp_blocks = self.mtp_full_manager.req_to_blocks[request_id]
+            if tuple(mtp_blocks[: len(plan.mtp_blocks)]) != plan.mtp_blocks:
+                raise RuntimeError(
+                    "DSA MTP cached-prefix blocks changed before commit"
+                )
+
+        self.dram_directory.attach_cached_prefix(
+            request_id,
+            plan.dram_blocks,
+        )
+        self._pending_prefix_restores[request_id] = DSADRAMBlockRestore(
+            request_id=request_id,
+            source_dram_block_ids=tuple(
+                block.block_id for block in plan.dram_blocks
+            ),
+            destination_indexer_block_ids=tuple(
+                block.block_id for block in indexer_blocks[:block_count]
+            ),
+            destination_resident_block_ids=tuple(
+                block.block_id for block in resident_blocks[:block_count]
+            ),
+        )
+
+    def take_prefix_restore_plan(
+        self,
+        request_id: str,
+    ) -> DSADRAMBlockRestore | None:
+        return self._pending_prefix_restores.pop(request_id, None)
+
+    def cache_blocks(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+    ) -> None:
+        """首版只给原生 MTP full-HBM group 发布本地 prefix hash。"""
+
+        if self.mtp_full_manager is not None:
+            self.mtp_full_manager.cache_blocks(
+                request,
+                num_computed_tokens,
+                retention_interval=self.retention_interval,
+            )
 
     def get_num_blocks_to_allocate_by_group(
         self,
@@ -415,6 +631,22 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
             logical_block_count,
         )
 
+    def take_unpublished_dram_assignment(
+        self,
+        request_id: str,
+    ) -> tuple[int, tuple[int, ...]]:
+        return self.dram_directory.take_unpublished_assignment(request_id)
+
+    def mark_request_dram_ready(
+        self,
+        request: Request,
+        ready_block_count: int,
+    ) -> None:
+        self.dram_directory.mark_ready_prefix(
+            request,
+            ready_block_count,
+        )
+
     def release_prefill_resident_blocks(
         self,
         request_id: str,
@@ -443,6 +675,8 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
         return True
 
     def free(self, request_id: str) -> None:
+        self._pending_prefix_hits.pop(request_id, None)
+        self._pending_prefix_restores.pop(request_id, None)
         super().free(request_id)
         self.dram_directory.free_request(request_id)
         self.request_cache_layout.free(request_id)
@@ -459,7 +693,9 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
         max_cache_hit_length: int,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         del block_hashes, max_cache_hit_length
-        return (
-            tuple([] for _ in range(self.num_single_type_manager)),
-            0,
-        )
+        if self.enable_caching:
+            raise RuntimeError(
+                "DSA prefix lookup requires the Request-aware "
+                "prepare_prefix_cache_hit() path"
+            )
+        return tuple([] for _ in range(self.num_single_type_manager)), 0

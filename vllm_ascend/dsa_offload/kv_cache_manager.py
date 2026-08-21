@@ -11,6 +11,8 @@ component-wise 判断和生命周期分配。这样 scheduler 无论在 patch �
 
 请求阶段由 ``request_cache_layout`` 以 plan/commit 协议统一规划；本文件只把
 规划结果翻译成各 manager 的实际 block 分配、ENTER 收缩和 steady grow。
+本地 prefix hit 仍走同一分配器：查询阶段的 DRAM/MTP 候选只有在所有 HBM
+component admission 成功后才提交，target HBM block 由普通 dense plan 分配。
 MTP3 的 resident 表在 ENTER 时一次排成 ``budget + parity0 + parity1``；
 保留下来的 dense 尾块按 logical-block parity 放入固定列，之后不再换址。
 任何容量不足都必须发生在物理表修改前，不能让失败重试提前推进阶段。
@@ -21,6 +23,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
+from vllm.logger import logger
 from vllm.v1.core.kv_cache_manager import (
     KVCacheBlocks,
     KVCacheManager,
@@ -51,6 +54,8 @@ class DSAResidentMLAKVCacheManager(FullAttentionManager):
 def _require_initial_runtime_contract(
     *,
     manager: KVCacheManager,
+    coordinator: DSAKVCacheCoordinator,
+    request: Request,
     new_computed_blocks: KVCacheBlocks | None,
     num_new_computed_tokens: int,
     num_lookahead_tokens: int,
@@ -68,7 +73,6 @@ def _require_initial_runtime_contract(
         )
 
     unsupported = {
-        "num_new_computed_tokens": num_new_computed_tokens,
         "num_external_computed_tokens": num_external_computed_tokens,
         "delay_cache_blocks": delay_cache_blocks,
         "num_encoder_tokens": num_encoder_tokens,
@@ -82,9 +86,82 @@ def _require_initial_runtime_contract(
         blocks = manager.empty_kv_cache_blocks.blocks
     else:
         blocks = new_computed_blocks.blocks
-    if any(blocks):
-        raise RuntimeError("DSA request cache layout does not yet support prefix-cache hits")
+    prefix_plan = coordinator.get_pending_prefix_hit(request.request_id)
+    expected_prefix_tokens = (
+        prefix_plan.num_computed_tokens if prefix_plan is not None else 0
+    )
+    if int(num_new_computed_tokens) != expected_prefix_tokens:
+        raise RuntimeError(
+            "DSA prefix-hit token count disagrees with its scheduler plan: "
+            f"request_id={request.request_id!r}, "
+            f"allocated={num_new_computed_tokens}, "
+            f"planned={expected_prefix_tokens}"
+        )
+    for group_id, group_blocks in enumerate(blocks):
+        if group_id == coordinator.group_ids.mtp_full:
+            expected_mtp = (
+                prefix_plan.mtp_blocks if prefix_plan is not None else ()
+            )
+            if tuple(group_blocks) != expected_mtp:
+                raise RuntimeError(
+                    "DSA MTP prefix blocks disagree with the pending hit plan"
+                )
+        elif group_blocks:
+            raise RuntimeError(
+                "DSA first-version target prefix hits must come from the "
+                "DRAM bundle, not HBM group blocks"
+            )
     return blocks
+
+
+def get_dsa_computed_blocks(
+    manager: KVCacheManager,
+    request: Request,
+) -> tuple[KVCacheBlocks, int]:
+    """Request-aware DSA lookup：DRAM target 与可选 MTP HBM 求公共前缀。"""
+
+    from vllm_ascend.dsa_offload.kv_cache_coordinator import (
+        DSAKVCacheCoordinator,
+    )
+
+    coordinator = manager.coordinator
+    if not isinstance(coordinator, DSAKVCacheCoordinator):
+        raise RuntimeError(
+            "get_dsa_computed_blocks requires DSAKVCacheCoordinator"
+        )
+    if not manager.enable_caching or request.skip_reading_prefix_cache:
+        return manager.empty_kv_cache_blocks, 0
+
+    max_cache_hit_length = request.num_tokens - 1
+    computed_blocks, num_computed_tokens = (
+        coordinator.prepare_prefix_cache_hit(
+            request,
+            max_cache_hit_length,
+        )
+    )
+    prefix_plan = coordinator.get_pending_prefix_hit(request.request_id)
+    logger.info(
+        "DSA prefix lookup: request_id=%s hit=%s "
+        "effective_tokens=%d dram_blocks=%d mtp_blocks=%d "
+        "request_tokens=%d",
+        request.request_id,
+        bool(num_computed_tokens),
+        num_computed_tokens,
+        len(prefix_plan.dram_blocks) if prefix_plan is not None else 0,
+        len(prefix_plan.mtp_blocks) if prefix_plan is not None else 0,
+        request.num_tokens,
+    )
+    if manager.log_stats:
+        assert manager.prefix_cache_stats is not None
+        manager.prefix_cache_stats.record(
+            num_tokens=request.num_tokens,
+            num_hits=num_computed_tokens,
+            preempted=request.num_preemptions > 0,
+        )
+    return (
+        manager.create_kv_cache_blocks(computed_blocks),
+        num_computed_tokens,
+    )
 
 
 def _make_group_blocks(
@@ -112,22 +189,37 @@ def _allocate_dense_plan(
     request: Request,
     plan: DSARequestCachePlan,
     empty_blocks: tuple[Sequence[KVCacheBlock], ...],
+    num_new_computed_tokens: int,
 ) -> KVCacheBlocks | None:
     requirements = coordinator.get_num_blocks_to_allocate_by_group(
         request_id=request.request_id,
         num_tokens=plan.indexer_tokens_need_slot,
         new_computed_blocks=empty_blocks,
         num_encoder_tokens=0,
-        total_computed_tokens=request.num_computed_tokens,
+        total_computed_tokens=(
+            request.num_computed_tokens + num_new_computed_tokens
+        ),
         num_tokens_main_model=plan.indexer_tokens_need_slot,
     )
     if not coordinator.can_allocate(requirements):
         return None
 
+    if num_new_computed_tokens:
+        coordinator.allocate_new_computed_blocks(
+            request_id=request.request_id,
+            new_computed_blocks=empty_blocks,
+            num_local_computed_tokens=num_new_computed_tokens,
+            num_external_computed_tokens=0,
+        )
+
     new_blocks = coordinator.allocate_new_blocks(
         request.request_id,
         plan.indexer_tokens_need_slot,
         plan.indexer_tokens_need_slot,
+    )
+    coordinator.commit_prefix_cache_hit(
+        request.request_id,
+        num_new_computed_tokens,
     )
     coordinator.request_cache_layout.commit(plan)
     return manager.create_kv_cache_blocks(new_blocks)
@@ -353,6 +445,8 @@ def allocate_dsa_slots(
 
     new_computed_block_list = _require_initial_runtime_contract(
         manager=manager,
+        coordinator=coordinator,
+        request=request,
         new_computed_blocks=new_computed_blocks,
         num_new_computed_tokens=num_new_computed_tokens,
         num_lookahead_tokens=num_lookahead_tokens,
@@ -369,7 +463,9 @@ def allocate_dsa_slots(
             num_tokens=full_num_tokens,
             new_computed_blocks=new_computed_block_list,
             num_encoder_tokens=0,
-            total_computed_tokens=request.num_computed_tokens,
+            total_computed_tokens=(
+                request.num_computed_tokens + num_new_computed_tokens
+            ),
             num_tokens_main_model=full_num_tokens,
             apply_admission_cap=True,
         )
@@ -380,22 +476,36 @@ def allocate_dsa_slots(
         request,
         num_new_tokens=num_new_tokens,
         num_lookahead_tokens=num_lookahead_tokens,
+        num_computed_tokens=(
+            request.num_computed_tokens + num_new_computed_tokens
+        ),
         max_model_len=manager.max_model_len,
     )
     if plan.stage in (
         DSARequestCacheStage.PREFILL,
         DSARequestCacheStage.DENSE_DECODE,
     ):
-        return _allocate_dense_plan(
+        allocated = _allocate_dense_plan(
             manager,
             coordinator,
             request,
             plan,
             new_computed_block_list,
+            num_new_computed_tokens,
         )
-    return _allocate_sparse_plan(
-        manager,
-        coordinator,
-        request,
-        plan,
-    )
+    else:
+        allocated = _allocate_sparse_plan(
+            manager,
+            coordinator,
+            request,
+            plan,
+        )
+    if allocated is not None and manager.enable_caching:
+        num_tokens_to_cache = min(
+            request.num_computed_tokens
+            + num_new_computed_tokens
+            + num_new_tokens,
+            request.num_tokens,
+        )
+        coordinator.cache_blocks(request, num_tokens_to_cache)
+    return allocated

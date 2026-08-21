@@ -128,6 +128,21 @@ def test_chunked_prefill_stays_prefill_until_the_next_decode_step() -> None:
     assert first_decode.stage == DSARequestCacheStage.ENTER_SPARSE_DECODE
 
 
+def test_prefix_hit_is_part_of_the_first_chunk_layout() -> None:
+    planner = _make_planner()
+    request = _Request("req", 5000, 0, 0, 5000)
+
+    chunk = planner.plan(
+        request,
+        num_new_tokens=1024,
+        num_computed_tokens=3072,
+        max_model_len=16384,
+    )
+
+    assert chunk.stage == DSARequestCacheStage.PREFILL
+    assert chunk.indexer_tokens_need_slot == 4096
+
+
 def test_short_prompt_stays_dense_until_exact_sparse_boundary() -> None:
     planner = _make_planner()
     request = _Request("req", 1000, 0, 0, 1000)

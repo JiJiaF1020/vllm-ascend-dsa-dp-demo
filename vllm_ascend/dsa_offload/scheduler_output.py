@@ -13,6 +13,8 @@ vLLM v0.23 的 ``SchedulerOutput`` 对 cached request 只传新增 block IDs，
   request-id→scalar 字典；
 * 只有 ENTER 行携带 resident block IDs 全量快照。
 * DRAM 目录只传本轮新增的连续 assignment 后缀，不重传完整逻辑表。
+* prefix-hit 行额外携带一次性的 Indexer/MLA restore 列；每行 ready 水位
+  只供 scheduler 在 worker 成功返回后发布 DRAM hash。
 
 多进程执行器使用 pickle 传递 scheduler output，因此该类型化子类会随普通
 ``SchedulerOutput`` 一起跨进程恢复。worker 最终仍按自己的 ``InputBatch``
@@ -62,6 +64,38 @@ class DSADRAMBlockAssignment:
 
 
 @dataclass(frozen=True, slots=True)
+class DSADRAMBlockRestore:
+    """一个 prefix-hit 请求的 target DRAM->HBM 分平面恢复任务。"""
+
+    request_id: str
+    source_dram_block_ids: tuple[int, ...]
+    destination_indexer_block_ids: tuple[int, ...]
+    destination_resident_block_ids: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        lengths = (
+            len(self.source_dram_block_ids),
+            len(self.destination_indexer_block_ids),
+            len(self.destination_resident_block_ids),
+        )
+        if not lengths[0] or len(set(lengths)) != 1:
+            raise ValueError(
+                "DSA DRAM restore planes must have one matching positive "
+                f"length, got {lengths}"
+            )
+        if any(
+            block_id <= 0
+            for block_ids in (
+                self.source_dram_block_ids,
+                self.destination_indexer_block_ids,
+                self.destination_resident_block_ids,
+            )
+            for block_id in block_ids
+        ):
+            raise ValueError("DSA DRAM restore block IDs must be positive")
+
+
+@dataclass(frozen=True, slots=True)
 class DSARequestCacheLayoutProjection:
     """一次 model-forward 中 scheduled request 的 cache 布局列。"""
 
@@ -75,6 +109,8 @@ class DSARequestCacheLayoutProjection:
         ...,
     ]
     dram_block_assignments: tuple[DSADRAMBlockAssignment, ...] = ()
+    dram_ready_block_counts: tuple[int, ...] = ()
+    dram_block_restores: tuple[DSADRAMBlockRestore, ...] = ()
 
     def __post_init__(self) -> None:
         row_count = len(self.request_ids)
@@ -89,6 +125,16 @@ class DSARequestCacheLayoutProjection:
                 "DSA cache-layout projection columns have different lengths: "
                 f"request_ids={row_count}, columns={column_lengths}"
             )
+        if self.dram_ready_block_counts and len(
+            self.dram_ready_block_counts
+        ) != row_count:
+            raise ValueError(
+                "DSA DRAM ready column has a different length: "
+                f"request_ids={row_count}, "
+                f"ready={len(self.dram_ready_block_counts)}"
+            )
+        if any(count < 0 for count in self.dram_ready_block_counts):
+            raise ValueError("DSA DRAM ready block counts must be non-negative")
         enter_rows = sum(stage == int(DSARequestCacheStage.ENTER_SPARSE_DECODE) for stage in self.stages)
         if len(self.resident_block_table_replacements) != enter_rows:
             raise ValueError(
@@ -110,6 +156,19 @@ class DSARequestCacheLayoutProjection:
                     f"request {assignment.request_id!r}"
                 )
             assignment_request_ids.add(assignment.request_id)
+        restore_request_ids: set[str] = set()
+        for restore in self.dram_block_restores:
+            if restore.request_id not in scheduled_request_ids:
+                raise ValueError(
+                    "DSA DRAM restore belongs to an unscheduled request: "
+                    f"request_id={restore.request_id!r}"
+                )
+            if restore.request_id in restore_request_ids:
+                raise ValueError(
+                    "DSA projection contains duplicate DRAM restores for "
+                    f"request {restore.request_id!r}"
+                )
+            restore_request_ids.add(restore.request_id)
 
     @property
     def num_rows(self) -> int:

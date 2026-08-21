@@ -549,6 +549,7 @@ def finalize_dsa_dram_capacity(
         "  Per-rank reserved bytes   : %s bytes (%s GiB, includes block 0)\n"
         "  Total planned host bytes  : %s bytes (%s GiB)\n"
         "  Capacity downsized        : %s\n"
+        "  Prefix cache              : %s\n"
         "=================================================================",
         f"{plan.host_available_bytes:,}",
         format_gib(plan.host_available_bytes),
@@ -565,6 +566,11 @@ def finalize_dsa_dram_capacity(
         f"{plan.total_reserved_bytes:,}",
         format_gib(plan.total_reserved_bytes),
         plan.was_downsized,
+        (
+            "enabled (complete Indexer+MLA bundle)"
+            if vllm_config.cache_config.enable_prefix_caching
+            else "disabled"
+        ),
     )
     return plan
 

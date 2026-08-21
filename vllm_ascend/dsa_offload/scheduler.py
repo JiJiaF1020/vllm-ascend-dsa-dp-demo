@@ -8,6 +8,8 @@ budget、请求队列、KV block 分配和输出更新；DSA 子类只补充当�
 
 * prefill 与 decode 暂不进入同一个 model forward；
 * prefill 数据面完成后，scheduler 才能释放已卸载的 resident 满块；
+* 本地 DRAM prefix 只在 worker 成功返回后发布 hash，并在新请求 admission
+  成功后下发 target restore；
 * preemption/resume 尚未建立 DRAM ledger 恢复协议，发生时显式失败。
 
 阶段与 budget 的语义真源位于 ``request_cache_layout``，HBM block table 与
@@ -37,6 +39,7 @@ from vllm_ascend.dsa_offload.request_cache_layout import (
 )
 from vllm_ascend.dsa_offload.scheduler_output import (
     DSADRAMBlockAssignment,
+    DSADRAMBlockRestore,
     DSAOffloadSchedulerOutput,
     DSARequestCacheLayoutProjection,
     DSAResidentBlockTableReplacement,
@@ -204,8 +207,14 @@ class DSAOffloadScheduler(Scheduler):
         target_budgets = [0] * row_count
         sparse_budgets = [0] * row_count
         resident_valid_tokens = [-1] * row_count
+        dram_ready_block_counts = (
+            [0] * row_count
+            if self.dsa_coordinator.enable_caching
+            else []
+        )
         resident_replacements: list[DSAResidentBlockTableReplacement] = []
         dram_assignments: list[DSADRAMBlockAssignment] = []
+        dram_restores: list[DSADRAMBlockRestore] = []
 
         for row, request_id in enumerate(request_ids):
             state = self.dsa_coordinator.get_request_cache_state(request_id)
@@ -251,10 +260,15 @@ class DSAOffloadScheduler(Scheduler):
                 durable_tokens
                 // self.dsa_coordinator.dram_block_size
             )
+            if dram_ready_block_counts:
+                dram_ready_block_counts[row] = durable_full_blocks
+            self.dsa_coordinator.ensure_request_dram_blocks(
+                request_id,
+                durable_full_blocks,
+            )
             logical_start, physical_ids = (
-                self.dsa_coordinator.ensure_request_dram_blocks(
-                    request_id,
-                    durable_full_blocks,
+                self.dsa_coordinator.take_unpublished_dram_assignment(
+                    request_id
                 )
             )
             if physical_ids:
@@ -265,6 +279,13 @@ class DSAOffloadScheduler(Scheduler):
                         physical_block_ids=physical_ids,
                     )
                 )
+            restore = (
+                self.dsa_coordinator.take_prefix_restore_plan(request_id)
+                if self.dsa_coordinator.enable_caching
+                else None
+            )
+            if restore is not None:
+                dram_restores.append(restore)
 
             if state.stage == DSARequestCacheStage.ENTER_SPARSE_DECODE:
                 resident_blocks = self.dsa_coordinator.resident_manager.req_to_blocks.get(request_id)
@@ -287,6 +308,8 @@ class DSAOffloadScheduler(Scheduler):
             resident_valid_tokens=tuple(resident_valid_tokens),
             resident_block_table_replacements=tuple(resident_replacements),
             dram_block_assignments=tuple(dram_assignments),
+            dram_ready_block_counts=tuple(dram_ready_block_counts),
+            dram_block_restores=tuple(dram_restores),
         )
 
     def _attach_dsa_cache_layout(
@@ -341,6 +364,38 @@ class DSAOffloadScheduler(Scheduler):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        # 此调用只会发生在所有 worker 成功返回以后。必须在 super() 可能
+        # finish/free 请求之前发布完整 DRAM bundle 的 hash。
+        if self.dsa_coordinator.enable_caching:
+            if not isinstance(scheduler_output, DSAOffloadSchedulerOutput):
+                raise RuntimeError(
+                    "DSA prefix-ready update requires "
+                    "DSAOffloadSchedulerOutput"
+                )
+            projection = scheduler_output.dsa_cache_layout
+            if projection is None or len(
+                projection.dram_ready_block_counts
+            ) != len(projection.request_ids):
+                raise RuntimeError(
+                    "DSA prefix-ready update is missing its per-request "
+                    "watermark column"
+                )
+            for request_id, ready_count in zip(
+                projection.request_ids,
+                projection.dram_ready_block_counts,
+                strict=True,
+            ):
+                request = self.requests.get(request_id)
+                if request is None:
+                    raise RuntimeError(
+                        "DSA request disappeared before DRAM hash publish: "
+                        f"request_id={request_id!r}"
+                    )
+                self.dsa_coordinator.mark_request_dram_ready(
+                    request,
+                    ready_count,
+                )
+
         outputs = super().update_from_output(
             scheduler_output,
             model_runner_output,

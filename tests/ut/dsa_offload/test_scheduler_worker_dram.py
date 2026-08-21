@@ -4,6 +4,7 @@
 import numpy as np
 import pytest
 import torch
+from vllm.v1.core.kv_cache_utils import BlockHash
 
 from vllm_ascend.dsa_offload.scheduler_dram_pool import (
     DSASchedulerDRAMBlockDirectory,
@@ -99,6 +100,8 @@ def test_layer_arenas_follow_resident_cache_block_shapes() -> None:
     assert arenas.rope.shape == (9, 128, 1, 64)
     assert torch.count_nonzero(arenas.nope[0]).item() == 0
     assert torch.count_nonzero(arenas.rope[0]).item() == 0
+    assert arenas.resident_source_bytes[0].data_ptr() == resident_nope.data_ptr()
+    assert arenas.resident_source_bytes[1].data_ptr() == resident_rope.data_ptr()
 
 
 def test_packed_c8_layer_uses_an_opaque_byte_arena() -> None:
@@ -117,6 +120,7 @@ def test_packed_c8_layer_uses_an_opaque_byte_arena() -> None:
     assert arenas.packed.shape == (9, 128, 1, 656)
     assert arenas.packed.dtype == torch.int8
     assert torch.count_nonzero(arenas.packed[0]).item() == 0
+    assert arenas.resident_source_bytes[0].data_ptr() == resident_packed.data_ptr()
 
 
 def test_complete_layer_adds_indexer_byte_arenas_without_copy() -> None:
@@ -222,3 +226,109 @@ def test_worker_mirror_applies_scheduler_assignment_and_clears_row() -> None:
     assert np.count_nonzero(store.logical_block_table[0]) == 0
     assert store.durable_full_block_counts[0] == 0
     assert store.logical_block_table[1, 0] != 0
+
+
+def test_scheduler_dram_prefix_is_published_only_after_ready() -> None:
+    directory = DSASchedulerDRAMBlockDirectory(
+        usable_blocks=8,
+        max_logical_blocks=6,
+        block_size=128,
+        enable_caching=True,
+    )
+    hashes = [BlockHash(f"hash-{i}".encode()) for i in range(3)]
+    request = type(
+        "RequestStub",
+        (),
+        {"request_id": "req-0", "block_hashes": hashes},
+    )()
+    _, assigned = directory.ensure_request_blocks("req-0", 3)
+
+    assert directory.find_longest_cache_hit(hashes, 3 * 128) == ()
+    directory.mark_ready_prefix(request, 2)
+    assert tuple(
+        block.block_id
+        for block in directory.find_longest_cache_hit(
+            hashes,
+            3 * 128,
+        )
+    ) == assigned[:2]
+
+    directory.free_request("req-0")
+    cached = directory.find_longest_cache_hit(hashes, 3 * 128)
+    assert tuple(block.block_id for block in cached) == assigned[:2]
+    assert all(block.ref_cnt == 0 for block in cached)
+
+
+def test_scheduler_dram_cached_prefix_is_shared_after_commit() -> None:
+    directory = DSASchedulerDRAMBlockDirectory(
+        usable_blocks=8,
+        max_logical_blocks=6,
+        block_size=128,
+        enable_caching=True,
+    )
+    hashes = [BlockHash(f"hash-{i}".encode()) for i in range(2)]
+    request = type(
+        "RequestStub",
+        (),
+        {"request_id": "source", "block_hashes": hashes},
+    )()
+    directory.ensure_request_blocks("source", 2)
+    directory.mark_ready_prefix(request, 2)
+    directory.free_request("source")
+    hit = directory.find_longest_cache_hit(hashes, 2 * 128)
+
+    # Lookup is side-effect free; attach is the admission commit boundary.
+    assert all(block.ref_cnt == 0 for block in hit)
+    directory.attach_cached_prefix("consumer", hit)
+    assert all(block.ref_cnt == 1 for block in hit)
+    start, assignment = directory.take_unpublished_assignment("consumer")
+    assert start == 0
+    assert assignment == tuple(block.block_id for block in hit)
+    assert directory.take_unpublished_assignment("consumer") == (2, ())
+
+    directory.free_request("consumer")
+    assert all(block.ref_cnt == 0 for block in hit)
+
+
+def test_scheduler_dram_lru_evicts_request_tail_before_prefix() -> None:
+    directory = DSASchedulerDRAMBlockDirectory(
+        usable_blocks=3,
+        max_logical_blocks=3,
+        block_size=128,
+        enable_caching=True,
+    )
+    hashes = [BlockHash(f"hash-{i}".encode()) for i in range(3)]
+    request = type(
+        "RequestStub",
+        (),
+        {"request_id": "req", "block_hashes": hashes},
+    )()
+    directory.ensure_request_blocks("req", 3)
+    directory.mark_ready_prefix(request, 3)
+    directory.free_request("req")
+
+    # All blocks share one release time; reverse free puts the logical tail
+    # at the eviction front, preserving the longest useful prefix.
+    directory.block_pool.get_new_blocks(1)
+    assert len(directory.find_longest_cache_hit(hashes, 3 * 128)) == 2
+
+
+def test_worker_mirror_allows_shared_prefix_block_ids() -> None:
+    store = _make_store()
+    store.apply_assignment(
+        pool_index=0,
+        logical_block_start=0,
+        physical_block_ids=(6, 7),
+    )
+    store.apply_assignment(
+        pool_index=1,
+        logical_block_start=0,
+        physical_block_ids=(6, 7),
+    )
+    assert store._block_active_refcounts[6:8].tolist() == [2, 2]
+
+    store.release_pool_index(0)
+    assert store._block_active_refcounts[6:8].tolist() == [1, 1]
+    assert store.logical_block_table[1, :2].tolist() == [6, 7]
+    store.release_pool_index(1)
+    assert store._block_active_refcounts[6:8].tolist() == [0, 0]

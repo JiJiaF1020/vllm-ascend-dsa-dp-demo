@@ -21,8 +21,9 @@
 - 当前 checkout 的自定义算子已经完整编译并重新安装；
 - Ascend 910C 首版使用 PP=1、DCP=1、PCP=1；
 - `block_size=128`；
-- 关闭 async scheduling、prefix cache、KV transfer 和 KV-cache
-  metrics/events；如启用 speculative decoding，只允许 A5 packed-C8
+- 关闭 async scheduling、KV transfer 和 KV-cache metrics/events；本地
+  DRAM prefix cache 可通过脚本中的 `ENABLE_PREFIX_CACHING` 单独开启；
+  如启用 speculative decoding，只允许 A5 packed-C8
   下固定 MTP3 与 greedy sampling；
 - 正式精度和性能测试关闭 DSA trace points。
 
@@ -61,6 +62,9 @@ MAX_NUM_SEQS = 2
 MAX_MODEL_LEN = 8192
 MAX_NUM_BATCHED_TOKENS = 8192
 ENABLE_CHUNKED_PREFILL = False
+ENABLE_PREFIX_CACHING = False  # 第二次相同前缀请求验证本地 DRAM 命中
+PREFIX_CACHE_REPLAY_ROUNDS = 1  # prefix 验收时与上项一起改为 2
+LOGGING_LEVEL = "INFO"
 ENABLE_A5_PACKED_C8_DSA = False  # A5 W4A4C8 设 True；A3 W4A8 保持 False
 ENABLE_MTP = False  # A5 C8 上设 True 后固定启用 3 个 draft token
 RESULT_JSON = None  # 需要保存对照 token IDs 时填写路径
@@ -80,6 +84,13 @@ python examples/dsa_demo/simple_prompt_test.py
   各 worker 完整 Indexer+MLA arena 初始化；
 - `eager`：执行 DSA LIDU/KSC/SFA-Offload 和满块 dump；
 - `graph`：执行 `VLLM_COMPILE + FULL_DECODE_ONLY`。
+
+Prefix cache 验收必须在同一个 `LLM`/在线服务进程中先完成一次请求，再发送
+第二次相同前缀请求；把相同 prompt 同时放进同一个首次 batch 不能证明命中，
+因为第一份 bundle 在该 batch 的 model output 返回前尚未 hash-ready。
+当前 INFO 模式会为每个新请求打印一次 `DSA prefix lookup`，包含有效命中
+token 数、DRAM blocks 和 MTP blocks；待功能稳定并进入性能验收后，再评估
+降为 DEBUG 或改成采样日志。vLLM 原生聚合 prefix hit rate 仍会保留。
 
 `cache-init` 不执行 `generate()`，因此不能证明数据面算子已经运行。结果 JSON
 也不捕获 engine-core 子进程日志；容量报告是否出现且只出现一次，必须在
@@ -230,6 +241,7 @@ python examples/dsa_demo/eval_dataset_acc_score.py \
 MODEL_PATH="/path/to/GLM-5.1-or-5.2-w4a4c8"
 SERVED_MODEL_NAME="glm-5.2-dsa"
 ENABLE_A5_PACKED_C8_DSA="true"
+ENABLE_PREFIX_CACHING="true"  # 需要验证本地 DRAM prefix 时开启
 SAFETENSORS_LOAD_STRATEGY="prefetch"
 ```
 
@@ -272,9 +284,9 @@ python examples/dsa_demo/stream_chat_client.py
 客户端会保留并在下一轮重新发送完整消息历史。设置
 `LONG_CONTEXT_FILE="/path/to/long_context.txt"` 可以把长文本加入 system
 消息；只有实际 token 长度超过 `sparse_activation_tokens`，才能验证
-ENTER/SPARSE 路径，而不是只验证在线 API 和 DENSE 路径。由于 DSA 当前关闭
-prefix cache，多轮长上下文测试每次都会重新 prefill 完整历史，这是当前
-合同内的预期行为。
+ENTER/SPARSE 路径，而不是只验证在线 API 和 DENSE 路径。默认
+`ENABLE_PREFIX_CACHING=false` 时，多轮长上下文测试每次都会重新 prefill
+完整历史；设为 `true` 后，可用相同前缀的第二轮请求验证本地 DRAM 命中。
 
 若要复现离线 `llm.generate()` 的原始小说续写，而不是让 chat template
 把小说包装成一轮对话，可在 `stream_chat_client.py` 的用户配置区设置：
@@ -387,7 +399,8 @@ LV-Eval 或 CLongEval 官方排行榜分数。正式精度对比应保持相同�
 
 - prefill/decode mixed batch（chunked prefill 本身已支持）；
 - async scheduling；
-- prefix cache；
+- HBM Indexer/dense-MLA 热副本协同命中与 L3 prefix cache；本地 DRAM
+  complete-bundle 第一版仍待 NPU 端到端验收；
 - preemption/resume；
 - 非 MTP speculative method、MTP draft 数不等于 3、非 greedy MTP；
 - KV transfer connector；

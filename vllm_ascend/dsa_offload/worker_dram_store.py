@@ -11,9 +11,10 @@
 只会影响 target 的 HBM 双尾块；只有下一 outer step 看到 scheduler 已确认
 长度后，target durable full-block 水位才会推进并规划对应 dump。
 
-首版明确关闭 prefix cache、preemption 和 KV connector，因此不同请求不会
-共享 DRAM block，也不需要 hash/refcount 体系。block 0 保留为空映射，有效
-物理 block id 从 1 开始；初始化后 arena 地址和容量均不可变化。
+prefix cache 的 hash/refcount 真源仍在 scheduler；worker 镜像允许多个 active
+请求行指向同一个只读 DRAM block，只维护用于校验 assignment/release 对称性的
+active refcount。block 0 保留为空映射，有效物理 block id 从 1 开始；初始化后
+arena 地址和容量均不可变化。
 """
 
 from __future__ import annotations
@@ -43,6 +44,8 @@ class DSALayerDRAMArenas:
     nope: torch.Tensor | None = None
     rope: torch.Tensor | None = None
     packed: torch.Tensor | None = None
+    resident_source_bytes: tuple[torch.Tensor, ...] = ()
+    resident_dram_bytes: tuple[torch.Tensor, ...] = ()
     indexer_source_bytes: tuple[torch.Tensor, ...] = ()
     indexer_dram_bytes: tuple[torch.Tensor, ...] = ()
 
@@ -112,11 +115,10 @@ class DSAWorkerDRAMStore:
             DSA_DRAM_NULL_BLOCK_ID,
             dtype=np.int32,
         )
-        # worker 不再分配 block id。该 owner 表只用于验证 scheduler 下发
-        # 的 request-private assignment 没有越界或跨请求碰撞。
-        self._block_owners = np.full(
+        # worker 不分配 block id。prefix hit 允许多个 active row 共享同一
+        # 物理块，因此这里只验证引用增减，不再记录唯一 owner。
+        self._block_active_refcounts = np.zeros(
             self.arena_capacity,
-            -1,
             dtype=np.int32,
         )
         # 每个 resident-pool 行已经持久化到 DRAM 的连续完整块前缀。
@@ -182,6 +184,26 @@ class DSAWorkerDRAMStore:
         self._layer_arenas[layer_id] = DSALayerDRAMArenas(
             nope=nope,
             rope=rope,
+            resident_source_bytes=(
+                cache_block_byte_view(
+                    resident_nope_cache,
+                    name=f"resident_nope_cache[layer={layer_id}]",
+                ),
+                cache_block_byte_view(
+                    resident_rope_cache,
+                    name=f"resident_rope_cache[layer={layer_id}]",
+                ),
+            ),
+            resident_dram_bytes=(
+                cache_block_byte_view(
+                    nope,
+                    name=f"resident_nope_dram[layer={layer_id}]",
+                ),
+                cache_block_byte_view(
+                    rope,
+                    name=f"resident_rope_dram[layer={layer_id}]",
+                ),
+            ),
             **self._create_indexer_byte_arenas(
                 layer_id=layer_id,
                 indexer_planes=(indexer_cache,)
@@ -243,6 +265,18 @@ class DSAWorkerDRAMStore:
         packed[DSA_DRAM_NULL_BLOCK_ID].zero_()
         self._layer_arenas[layer_id] = DSALayerDRAMArenas(
             packed=packed,
+            resident_source_bytes=(
+                cache_block_byte_view(
+                    resident_packed_cache,
+                    name=f"resident_packed_cache[layer={layer_id}]",
+                ),
+            ),
+            resident_dram_bytes=(
+                cache_block_byte_view(
+                    packed,
+                    name=f"resident_packed_dram[layer={layer_id}]",
+                ),
+            ),
             **self._create_indexer_byte_arenas(
                 layer_id=layer_id,
                 indexer_planes=indexer_cache or (),
@@ -369,18 +403,8 @@ class DSAWorkerDRAMStore:
                 "DSA worker received a conflicting DRAM assignment for "
                 f"pool row {pool_index}"
             )
-        owners = self._block_owners[physical]
-        conflicting = owners != -1
-        if np.any(conflicting):
-            block_id = int(physical[np.flatnonzero(conflicting)[0]])
-            raise RuntimeError(
-                "DSA scheduler reused a live DRAM block across logical rows: "
-                f"block_id={block_id}, old_pool_row="
-                f"{int(self._block_owners[block_id])}, "
-                f"new_pool_row={pool_index}"
-            )
         destination[:] = physical
-        self._block_owners[physical] = pool_index
+        self._block_active_refcounts[physical] += 1
         self.table_version += 1
 
     def resolve_blocks(
@@ -436,7 +460,14 @@ class DSAWorkerDRAMStore:
             self.durable_full_block_counts[pool_index] = 0
             return
         released = np.unique(released)
-        self._block_owners[released] = -1
+        previous = self._block_active_refcounts[released]
+        if np.any(previous <= 0):
+            block_id = int(released[np.flatnonzero(previous <= 0)[0]])
+            raise RuntimeError(
+                "DSA worker DRAM active refcount underflow: "
+                f"block_id={block_id}"
+            )
+        self._block_active_refcounts[released] -= 1
         row.fill(DSA_DRAM_NULL_BLOCK_ID)
         self.durable_full_block_counts[pool_index] = 0
         self.table_version += 1

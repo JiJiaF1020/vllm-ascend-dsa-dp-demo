@@ -151,9 +151,22 @@ class DSARequestCachePlanner:
         *,
         num_new_tokens: int,
         num_lookahead_tokens: int = 0,
+        num_computed_tokens: int | None = None,
         max_model_len: int,
     ) -> DSARequestCachePlan:
         """生成本轮布局候选，不修改跨 step 状态。"""
+
+        computed_tokens = (
+            int(request.num_computed_tokens)
+            if num_computed_tokens is None
+            else int(num_computed_tokens)
+        )
+        if computed_tokens < int(request.num_computed_tokens):
+            raise ValueError(
+                "DSA planned computed prefix cannot move backwards: "
+                f"request={request.num_computed_tokens}, "
+                f"planned={computed_tokens}"
+            )
 
         previous_state = self._states.get(request.request_id)
         if previous_state is None:
@@ -164,7 +177,7 @@ class DSARequestCachePlanner:
             target_budget = previous_state.target_resident_budget_tokens
 
         indexer_tokens_need_slot = min(
-            int(request.num_computed_tokens)
+            computed_tokens
             + int(num_new_tokens)
             + int(num_lookahead_tokens),
             int(max_model_len),
@@ -179,8 +192,7 @@ class DSARequestCachePlanner:
         # DENSE/ENTER。这样中间 chunk 不会误触发 resident 收缩。
         dense_stage = (
             DSARequestCacheStage.PREFILL
-            if int(request.num_computed_tokens)
-            < int(request.num_prompt_tokens)
+            if computed_tokens < int(request.num_prompt_tokens)
             else DSARequestCacheStage.DENSE_DECODE
         )
 
@@ -188,7 +200,7 @@ class DSARequestCachePlanner:
         resident_valid_tokens = -1
         next_stage = dense_stage
 
-        decode_ready = int(request.num_output_tokens) > 0 and int(request.num_computed_tokens) >= int(
+        decode_ready = int(request.num_output_tokens) > 0 and computed_tokens >= int(
             request.num_prompt_tokens
         )
         if decode_ready and logical_context_tokens > self.sparse_activation_tokens:
@@ -213,7 +225,7 @@ class DSARequestCachePlanner:
 
         preserve_resident_tail_block = (
             next_stage == DSARequestCacheStage.ENTER_SPARSE_DECODE
-            and int(request.num_computed_tokens) % self.block_size != 0
+            and computed_tokens % self.block_size != 0
         )
         return DSARequestCachePlan(
             request_id=request.request_id,

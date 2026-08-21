@@ -32,6 +32,8 @@ MAX_MODEL_LEN="131072"
 MAX_NUM_BATCHED_TOKENS="16384"
 GPU_MEMORY_UTILIZATION="0.90"
 ENABLE_CHUNKED_PREFILL="true"
+ENABLE_PREFIX_CACHING="false"
+LOGGING_LEVEL="INFO"
 
 DSA_SPARSE_ACTIVATION_TOKENS="6144"
 DSA_INDEXER_MLA_BLOCK_RATIO="3"
@@ -45,7 +47,7 @@ export OMP_PROC_BIND="false"
 export PYTHONHASHSEED="114514"
 export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
 export VLLM_ASCEND_ENABLE_MLAPO="1"
-export VLLM_LOGGING_LEVEL="INFO"
+export VLLM_LOGGING_LEVEL="${LOGGING_LEVEL}"
 
 case "${RUN_MODE}" in
     eager)
@@ -120,6 +122,19 @@ else
     )
 fi
 
+case "${ENABLE_PREFIX_CACHING}" in
+    true)
+        PREFIX_CACHE_ARGS=(--enable-prefix-caching)
+        ;;
+    false)
+        PREFIX_CACHE_ARGS=(--no-enable-prefix-caching)
+        ;;
+    *)
+        echo "ENABLE_PREFIX_CACHING must be true or false, got: ${ENABLE_PREFIX_CACHING}" >&2
+        exit 2
+        ;;
+esac
+
 ADDITIONAL_CONFIG="$(
     cat <<JSON
 {${A5_PACKED_CONFIG_FIELDS}"dsa_sparse_config":{"enabled":true,"split_indexer_cache":true,"indexer_mla_block_ratio":${DSA_INDEXER_MLA_BLOCK_RATIO},"sparse_activation_tokens":${DSA_SPARSE_ACTIVATION_TOKENS},"prompt_budget_thresholds":[32768,65536],"resident_budget_tokens":${DSA_RESIDENT_BUDGET_TOKENS},"max_active_reqs":${DSA_MAX_ACTIVE_REQS},"hot_cpu_block_multiple":${DSA_HOT_CPU_BLOCK_MULTIPLE},"enable_row_mode_decode_graph":${ENABLE_DSA_GRAPH},"trace_points":{"enabled":false,"points":["first_sample"],"ranks":[0]}}}
@@ -146,7 +161,7 @@ exec vllm serve "${MODEL_PATH}" \
     --max-model-len "${MAX_MODEL_LEN}" \
     --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
     --trust-remote-code \
-    --no-enable-prefix-caching \
+    "${PREFIX_CACHE_ARGS[@]}" \
     --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
     --block-size 128 \
     --no-async-scheduling \

@@ -443,6 +443,9 @@ class NPUModelRunner(GPUModelRunner):
                 pin_memory=self.pin_memory,
                 packed_c8=self.dsa_offload_packed_c8,
                 max_decode_query_len=self.uniform_decode_query_len,
+                enable_prefix_caching=bool(
+                    vllm_config.cache_config.enable_prefix_caching
+                ),
             )
             if self.dsa_resident_token_pool is not None
             else None
@@ -1057,6 +1060,12 @@ class NPUModelRunner(GPUModelRunner):
                 "DSA is enabled but NPUInputBatch has no cache-layout owner"
             )
         if scheduler_output.total_num_scheduled_tokens == 0:
+            runtime = self.dsa_offload_runtime
+            if runtime is not None and runtime.enable_prefix_caching:
+                runtime.prepare_prefix_restore_jobs(
+                    restores=(),
+                    state=state,
+                )
             state.clear(input_batch=self.input_batch)
             return
         if not isinstance(scheduler_output, DSAOffloadSchedulerOutput):
@@ -1082,7 +1091,10 @@ class NPUModelRunner(GPUModelRunner):
             projection=projection,
             resident_group_id=group_ids.resident_mla,
         )
-        if projection.dram_block_assignments:
+        if (
+            projection.dram_block_assignments
+            or projection.dram_block_restores
+        ):
             store = self.dsa_worker_dram_store
             if store is None:
                 raise RuntimeError(
@@ -1090,10 +1102,19 @@ class NPUModelRunner(GPUModelRunner):
                 )
             # resident pool 行在上面的统一 InputBatch refresh 中完成 acquire。
             # assignment 只携带新增长度的后缀，steady decode 通常为空。
-            apply_dsa_dram_assignments(
+            if projection.dram_block_assignments:
+                apply_dsa_dram_assignments(
+                    state=state,
+                    projection=projection,
+                    store=store,
+                )
+        runtime = self.dsa_offload_runtime
+        if runtime is None:
+            raise RuntimeError("DSA offload runtime is not initialized")
+        if runtime.enable_prefix_caching:
+            runtime.prepare_prefix_restore_jobs(
+                restores=projection.dram_block_restores,
                 state=state,
-                projection=projection,
-                store=store,
             )
 
     def _update_states_after_model_execute(

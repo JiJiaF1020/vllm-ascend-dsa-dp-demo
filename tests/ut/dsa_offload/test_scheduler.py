@@ -24,6 +24,8 @@ from vllm_ascend.dsa_offload.scheduler import (
 )
 from vllm_ascend.dsa_offload.scheduler_output import (
     DSADRAMBlockAssignment,
+    DSAOffloadSchedulerOutput,
+    DSARequestCacheLayoutProjection,
     DSAResidentBlockTableReplacement,
 )
 
@@ -260,6 +262,7 @@ def test_final_prefill_chunk_releases_resident_blocks_after_output(
     scheduler.block_size = 128
     release_calls: list[tuple[str, bool]] = []
     scheduler.dsa_coordinator = SimpleNamespace(
+        enable_caching=False,
         request_cache_layout=SimpleNamespace(
             should_release_resident_after_prefill=lambda req: (
                 req.num_computed_tokens >= req.num_prompt_tokens
@@ -284,6 +287,47 @@ def test_final_prefill_chunk_releases_resident_blocks_after_output(
     request.num_computed_tokens = request.num_prompt_tokens
     assert scheduler.update_from_output(output, object()) is parent_result
     assert release_calls == [(request.request_id, True)]
+
+
+def test_dram_hash_is_published_before_parent_can_free_request(
+    monkeypatch,
+) -> None:
+    scheduler = _make_scheduler()
+    request = _Request("req", 256, 256, 0, 256)
+    scheduler.requests = {request.request_id: request}
+    calls: list[tuple[str, int]] = []
+    scheduler.dsa_coordinator = SimpleNamespace(
+        enable_caching=True,
+        mark_request_dram_ready=lambda req, count: calls.append(
+            (req.request_id, count)
+        ),
+        request_cache_layout=SimpleNamespace(
+            should_release_resident_after_prefill=lambda req: False
+        ),
+    )
+    base = SchedulerOutput.make_empty()
+    base.num_scheduled_tokens = {request.request_id: 1}
+    base.total_num_scheduled_tokens = 1
+    output = DSAOffloadSchedulerOutput.from_base(
+        base,
+        dsa_cache_layout=DSARequestCacheLayoutProjection(
+            request_ids=(request.request_id,),
+            stages=(int(DSARequestCacheStage.PREFILL),),
+            target_resident_budget_tokens=(2048,),
+            sparse_budget_tokens=(0,),
+            resident_valid_tokens=(-1,),
+            resident_block_table_replacements=(),
+            dram_ready_block_counts=(2,),
+        ),
+    )
+
+    def parent_update(self, scheduler_output, model_runner_output):
+        assert calls == [(request.request_id, 2)]
+        return {0: object()}
+
+    monkeypatch.setattr(Scheduler, "update_from_output", parent_update)
+
+    scheduler.update_from_output(output, object())
 
 
 def test_projection_carries_enter_resident_table_and_scalar_state() -> None:
@@ -314,22 +358,25 @@ def test_projection_carries_enter_resident_table_and_scalar_state() -> None:
         "enter": _Request("enter", 4096, 4097, 1, 4097),
     }
     durable_counts: dict[str, int] = {}
+    unpublished = {
+        "dense": (0, (701, 702)),
+        "enter": (2, (703,)),
+    }
 
     def ensure_dram_blocks(
         request_id: str,
         logical_block_count: int,
     ) -> tuple[int, tuple[int, ...]]:
         durable_counts[request_id] = logical_block_count
-        return (
-            (0, (701, 702))
-            if request_id == "dense"
-            else (2, (703,))
-        )
+        return logical_block_count, ()
 
     scheduler.dsa_coordinator = SimpleNamespace(
+        enable_caching=True,
         dram_block_size=128,
         get_request_cache_state=states.get,
         ensure_request_dram_blocks=ensure_dram_blocks,
+        take_unpublished_dram_assignment=unpublished.pop,
+        take_prefix_restore_plan=lambda request_id: None,
         resident_manager=SimpleNamespace(
             req_to_blocks={
                 "enter": [
@@ -367,6 +414,7 @@ def test_projection_carries_enter_resident_table_and_scalar_state() -> None:
         ),
     )
     assert durable_counts == {"dense": 16, "enter": 32}
+    assert projection.dram_ready_block_counts == (16, 32)
     assert projection.num_enter_rows == 1
 
 
@@ -383,6 +431,7 @@ def test_mtp_decode_dram_assignment_excludes_provisional_tokens() -> None:
     output.total_num_scheduled_tokens = 4
     observed: list[int] = []
     scheduler.dsa_coordinator = SimpleNamespace(
+        enable_caching=False,
         dram_block_size=128,
         get_request_cache_state=lambda request_id: SimpleNamespace(
             stage=DSARequestCacheStage.SPARSE_DECODE,
@@ -395,6 +444,8 @@ def test_mtp_decode_dram_assignment_excludes_provisional_tokens() -> None:
                 observed.append(logical_block_count) or (0, ())
             )
         ),
+        take_unpublished_dram_assignment=lambda request_id: (0, ()),
+        take_prefix_restore_plan=lambda request_id: None,
         resident_manager=SimpleNamespace(req_to_blocks={}),
     )
 
@@ -417,6 +468,7 @@ def test_mtp_prefill_dram_assignment_includes_current_chunk() -> None:
     output.total_num_scheduled_tokens = 129
     observed: list[int] = []
     scheduler.dsa_coordinator = SimpleNamespace(
+        enable_caching=False,
         dram_block_size=128,
         get_request_cache_state=lambda request_id: SimpleNamespace(
             stage=DSARequestCacheStage.PREFILL,
@@ -429,6 +481,8 @@ def test_mtp_prefill_dram_assignment_includes_current_chunk() -> None:
                 observed.append(logical_block_count) or (0, ())
             )
         ),
+        take_unpublished_dram_assignment=lambda request_id: (0, ()),
+        take_prefix_restore_plan=lambda request_id: None,
         resident_manager=SimpleNamespace(req_to_blocks={}),
     )
 

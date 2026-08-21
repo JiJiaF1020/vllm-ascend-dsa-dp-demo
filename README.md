@@ -98,6 +98,11 @@ llm = LLM(
 )
 ```
 
+本地 DRAM complete-bundle prefix cache 第一版可将
+`enable_prefix_caching` 设为 `True`。命中只复用 hash-ready 的完整块；可选
+MTP3 还会与原生 full-HBM MTP cache 的 EAGLE 有效命中取公共前缀。当前该
+开关已完成 CPU UT，正式使用前仍需完成 NPU restore 与端到端重复前缀验收。
+
 图模式需要同时设置：
 
 ```python
@@ -178,7 +183,8 @@ MTP3 下 B 个请求对应 `4 * B` 个 target query token。SPARSE resident 固�
 
 - prefill/decode mixed batch；
 - async scheduling；
-- prefix cache；
+- HBM Indexer/dense-MLA 热副本协同命中与 L3 prefix cache；本地 DRAM
+  complete-bundle prefix 第一版已实现，仍待 NPU 端到端验收；
 - preemption/resume；
 - 非 MTP speculative method、MTP draft 数不等于 3、非 greedy MTP；
 - 外部 KV transfer connector；

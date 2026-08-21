@@ -379,6 +379,25 @@ def cache_block_byte_view(
     return byte_view
 
 
+def copy_full_cache_plane_bytes(
+    *,
+    source_bytes: torch.Tensor,
+    destination_bytes: torch.Tensor,
+    src_block_ids: torch.Tensor,
+    dst_block_ids: torch.Tensor,
+) -> None:
+    """按 block id 复制 opaque plane；源/目的可分别位于 HBM/DRAM。"""
+
+    if src_block_ids.numel() == 0:
+        return
+    torch.ops._C_ascend.kv_cache_full_block_dump_bytes(
+        source_bytes,
+        destination_bytes,
+        src_block_ids,
+        dst_block_ids,
+    )
+
+
 def dump_full_cache_plane_bytes(
     *,
     source_bytes: torch.Tensor,
@@ -386,15 +405,13 @@ def dump_full_cache_plane_bytes(
     src_block_ids: torch.Tensor,
     dst_block_ids: torch.Tensor,
 ) -> None:
-    """复制一个 opaque cache plane；``dst=-1`` 沿用图空转语义。"""
+    """HBM->DRAM 兼容包装；``dst=-1`` 沿用图空转语义。"""
 
-    if src_block_ids.numel() == 0:
-        return
-    torch.ops._C_ascend.kv_cache_full_block_dump_bytes(
-        source_bytes,
-        dram_bytes,
-        src_block_ids,
-        dst_block_ids,
+    copy_full_cache_plane_bytes(
+        source_bytes=source_bytes,
+        destination_bytes=dram_bytes,
+        src_block_ids=src_block_ids,
+        dst_block_ids=dst_block_ids,
     )
 
 
