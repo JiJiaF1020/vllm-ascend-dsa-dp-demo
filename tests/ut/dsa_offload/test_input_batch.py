@@ -5,9 +5,11 @@ from types import SimpleNamespace
 
 import torch
 
+from vllm_ascend.dsa_offload.worker_dram_store import DSAWorkerDRAMStore
 from vllm_ascend.dsa_offload.input_batch import (
     DSAInputBatchCacheLayout,
     apply_dsa_cache_layout_projection,
+    apply_dsa_dram_assignments,
     normalize_dsa_enter_updates_before_base,
 )
 from vllm_ascend.dsa_offload.request_cache_layout import (
@@ -15,6 +17,7 @@ from vllm_ascend.dsa_offload.request_cache_layout import (
 )
 from vllm_ascend.dsa_offload.resident_pool import DSAResidentTokenPool
 from vllm_ascend.dsa_offload.scheduler_output import (
+    DSADRAMBlockAssignment,
     DSARequestCacheLayoutProjection,
     DSAResidentBlockTableReplacement,
 )
@@ -98,6 +101,48 @@ def test_pad_rows_keep_a_legal_quant_li_candidate_length() -> None:
 
     assert state.candidate_lens_cpu.tolist() == [2048] * 4
     assert state.candidate_lens.tolist() == [2048] * 4
+
+
+def test_scheduler_dram_assignment_uses_the_stable_resident_pool_row() -> None:
+    state = _make_state()
+    input_batch = _InputBatch(("dense",))
+    projection = DSARequestCacheLayoutProjection(
+        request_ids=("dense",),
+        stages=(int(DSARequestCacheStage.DENSE_DECODE),),
+        target_resident_budget_tokens=(2048,),
+        sparse_budget_tokens=(0,),
+        resident_valid_tokens=(-1,),
+        resident_block_table_replacements=(),
+        dram_block_assignments=(
+            DSADRAMBlockAssignment(
+                request_id="dense",
+                logical_block_start=0,
+                physical_block_ids=(7, 8),
+            ),
+        ),
+    )
+    state.refresh(input_batch=input_batch, projection=projection)
+    store = DSAWorkerDRAMStore(
+        usable_blocks=8,
+        storage_rows=state.resident_token_pool.storage_rows,
+        max_logical_blocks=64,
+        device=torch.device("cpu"),
+        arena_factory=lambda shape, dtype, capacity, device: torch.empty(
+            (capacity, *shape),
+            dtype=dtype,
+            device=device,
+        ),
+    )
+
+    apply_dsa_dram_assignments(
+        state=state,
+        projection=projection,
+        store=store,
+    )
+
+    pool_index = state.resident_token_pool.get_index("dense")
+    assert pool_index is not None
+    assert store.logical_block_table[pool_index, :2].tolist() == [7, 8]
 
 
 def _make_enter_projection() -> DSARequestCacheLayoutProjection:

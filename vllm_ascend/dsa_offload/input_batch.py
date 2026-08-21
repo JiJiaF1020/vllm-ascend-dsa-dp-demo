@@ -26,7 +26,7 @@ request-id 映射并同步稳定 resident-pool 行。
 
 需要特别区分两种生命周期：vLLM 会把“本轮未调度”的请求临时移出
 persistent ``InputBatch``，但请求本身仍在运行。resident pool 行和 DRAM
-ledger 属于完整请求生命周期，只能在 ``finished_req_ids`` 到达时释放，不能
+worker 镜像属于完整请求生命周期，只能在 ``finished_req_ids`` 到达时释放，不能
 跟随 InputBatch 的临时成员变化回收。
 """
 
@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import CachedRequestData
     from vllm.v1.worker.gpu_model_runner import CachedRequestState
 
+    from vllm_ascend.dsa_offload.worker_dram_store import DSAWorkerDRAMStore
     from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
 
@@ -192,12 +193,12 @@ class DSAInputBatchCacheLayout:
         self,
         callback: Callable[[int], None],
     ) -> None:
-        """绑定 DRAM ledger 的稳定 pool-row 释放入口。"""
+        """绑定 DRAM worker 镜像的稳定 pool-row 释放入口。"""
 
         self._pool_release_callback = callback
 
     def release_request(self, request_id: str) -> None:
-        """在请求真正结束时释放 resident 行及其 DRAM ledger。"""
+        """在请求真正结束时释放 resident 行并清除 DRAM worker 镜像。"""
 
         released_index = self.resident_token_pool.release(request_id)
         if released_index is not None and self._pool_release_callback is not None:
@@ -552,4 +553,28 @@ def apply_dsa_cache_layout_projection(
         input_batch.block_table[resident_group_id].add_row(
             resident_block_ids,
             row,
+        )
+
+
+def apply_dsa_dram_assignments(
+    *,
+    state: DSAInputBatchCacheLayout,
+    projection: DSARequestCacheLayoutProjection,
+    store: DSAWorkerDRAMStore,
+) -> None:
+    """把 scheduler 新增 DRAM assignment 投影到 stable worker pool 行。"""
+
+    for assignment in projection.dram_block_assignments:
+        pool_index = state.resident_token_pool.get_index(
+            assignment.request_id
+        )
+        if pool_index is None:
+            raise RuntimeError(
+                "DSA DRAM assignment has no resident pool row: "
+                f"request_id={assignment.request_id!r}"
+            )
+        store.apply_assignment(
+            pool_index=pool_index,
+            logical_block_start=assignment.logical_block_start,
+            physical_block_ids=assignment.physical_block_ids,
         )

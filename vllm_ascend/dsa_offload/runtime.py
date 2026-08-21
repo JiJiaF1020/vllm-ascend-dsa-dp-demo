@@ -12,7 +12,8 @@
 
 固定 MTP3 使用两块 parity tail，位置映射化简为 ``position % 256``。
 已确认满块在下一 outer step、当前 target 层写 KV 前 dump；每个 target
-物理层只发射一次，同一请求的 logical block ledger 在 target arena 间共享。
+物理层只发射一次；logical block id 由 scheduler 分配，worker 只维护固定行
+镜像，同一 assignment 在 target Indexer/MLA arena 间共享。
 MTP proposer 使用原生 BF16 full cache，不绑定本 runtime。
 
 所有大 tensor 在 model runner 初始化期预分配。steady step 只刷新 active
@@ -37,13 +38,14 @@ from vllm_ascend.dsa_offload.contracts import (
     DSA_LIDU_OUTPUT_CAPACITY,
     DSA_ROW_MODE_SPARSE,
 )
-from vllm_ascend.dsa_offload.dram_store import DSAHotDRAMStore
+from vllm_ascend.dsa_offload.worker_dram_store import DSAWorkerDRAMStore
 from vllm_ascend.dsa_offload.ops import (
     DSALightningIndexerOutputs,
     DSAOffloadSelectionOutput,
     a5_kvcache_scatter_copy_c8,
     a5_lightning_indexer_decode_update_c8,
     a5_lightning_indexer_decode_update_mtp_c8,
+    dump_full_cache_plane_bytes,
     dump_full_kv_cache_blocks,
     dump_full_kv_cache_blocks_c8,
     kvcache_scatter_copy,
@@ -188,13 +190,25 @@ class DSAOffloadRuntime:
             device=self.device,
             pin_memory=pin_memory,
         )
+        self.dump_indexer_src_block_ids = CpuGpuBuffer(
+            max_dump_jobs,
+            dtype=torch.int32,
+            device=self.device,
+            pin_memory=pin_memory,
+        )
         self.dump_src_block_ids.np.fill(0)
+        self.dump_indexer_src_block_ids.np.fill(0)
         self.dump_dst_block_ids.np.fill(DSA_DUMP_NOOP_DST_BLOCK_ID)
         self.dump_src_block_ids.gpu.zero_()
+        self.dump_indexer_src_block_ids.gpu.zero_()
         self.dump_dst_block_ids.gpu.fill_(DSA_DUMP_NOOP_DST_BLOCK_ID)
         self._dump_pool_indices = np.empty(max_dump_jobs, dtype=np.intp)
         self._dump_logical_indices = np.empty(max_dump_jobs, dtype=np.intp)
         self._dump_source_blocks = np.empty(max_dump_jobs, dtype=np.int32)
+        self._dump_indexer_source_blocks = np.empty(
+            max_dump_jobs,
+            dtype=np.int32,
+        )
         self._logical_block_indices = np.arange(
             self.max_logical_blocks,
             dtype=np.intp,
@@ -222,7 +236,7 @@ class DSAOffloadRuntime:
             self._durable_full_blocks
         )
 
-        self.dram_store: DSAHotDRAMStore | None = None
+        self.dram_store: DSAWorkerDRAMStore | None = None
         self.active_num_reqs = 0
         self.execution_num_reqs = 0
         self.dump_job_count = 0
@@ -241,7 +255,7 @@ class DSAOffloadRuntime:
         # 跑过 LIDU 的 full 层；shared 层据此拒绝跨 step 的陈旧输出。
         self._selection_source_layer: int | None = None
 
-    def bind_dram_store(self, store: DSAHotDRAMStore) -> None:
+    def bind_dram_store(self, store: DSAWorkerDRAMStore) -> None:
         if self.dram_store is not None:
             raise RuntimeError("DSA offload runtime DRAM store was bound twice")
         if store.storage_rows != self.resident_token_pool.storage_rows:
@@ -278,6 +292,7 @@ class DSAOffloadRuntime:
         num_reqs: int,
         num_tokens: int,
         resident_group_id: int,
+        indexer_group_id: int,
         decode_forward: bool,
     ) -> torch.Tensor:
         """刷新本轮统一元数据并返回 resident slot-mapping positions。"""
@@ -306,6 +321,7 @@ class DSAOffloadRuntime:
             state=state,
             num_scheduled_tokens=num_scheduled_tokens,
             resident_group_id=resident_group_id,
+            indexer_group_id=indexer_group_id,
         )
         self._refresh_candidate_lens(state)
         # 七列共用一个 owner，仅一次 H2D；后续 tensor 均为该 owner 的 view。
@@ -505,11 +521,16 @@ class DSAOffloadRuntime:
             if self.dump_job_count < launch_count:
                 tail = slice(self.dump_job_count, launch_count)
                 self.dump_src_block_ids.np[tail] = 0
+                self.dump_indexer_src_block_ids.np[tail] = 0
                 self.dump_dst_block_ids.np[tail] = DSA_DUMP_NOOP_DST_BLOCK_ID
 
         if launch_count:
             self.dump_src_block_ids.gpu[:launch_count].copy_(
                 self.dump_src_block_ids.cpu[:launch_count],
+                non_blocking=True,
+            )
+            self.dump_indexer_src_block_ids.gpu[:launch_count].copy_(
+                self.dump_indexer_src_block_ids.cpu[:launch_count],
                 non_blocking=True,
             )
             self.dump_dst_block_ids.gpu[:launch_count].copy_(
@@ -540,8 +561,10 @@ class DSAOffloadRuntime:
             self.active_dram_block_table.np[:row_count].fill(DSA_DRAM_NULL_BLOCK_ID)
             self.active_dram_block_table.gpu[:row_count].zero_()
             self.dump_src_block_ids.np[:row_count] = 0
+            self.dump_indexer_src_block_ids.np[:row_count] = 0
             self.dump_dst_block_ids.np[:row_count] = DSA_DUMP_NOOP_DST_BLOCK_ID
             self.dump_src_block_ids.gpu[:row_count].zero_()
+            self.dump_indexer_src_block_ids.gpu[:row_count].zero_()
             self.dump_dst_block_ids.gpu[:row_count].fill_(DSA_DUMP_NOOP_DST_BLOCK_ID)
             self.active_num_reqs = row_count
             self.execution_num_reqs = row_count
@@ -583,6 +606,7 @@ class DSAOffloadRuntime:
         state: DSAInputBatchCacheLayout,
         num_scheduled_tokens: np.ndarray,
         resident_group_id: int,
+        indexer_group_id: int,
     ) -> None:
         """按 durable 水位差构造本轮紧凑 dump jobs。
 
@@ -644,6 +668,9 @@ class DSAOffloadRuntime:
         resident_table = input_batch.block_table[int(resident_group_id)]
         resident_blocks = resident_table.get_numpy_array()
         resident_row_widths = resident_table.num_blocks_per_row
+        indexer_table = input_batch.block_table[int(indexer_group_id)]
+        indexer_blocks = indexer_table.get_numpy_array()
+        indexer_row_widths = indexer_table.num_blocks_per_row
         job_count = 0
         for row_value in boundary_rows:
             row = int(row_value)
@@ -661,6 +688,16 @@ class DSAOffloadRuntime:
             jobs = slice(job_count, next_job_count)
             self._dump_pool_indices[jobs] = state.resident_pool_indices_cpu[row]
             self._dump_logical_indices[jobs] = self._logical_block_indices[logical_start:logical_end]
+            if logical_end > int(indexer_row_widths[row]):
+                raise RuntimeError(
+                    "DSA complete dump references an unallocated Indexer "
+                    f"block: row={row}, logical_end={logical_end}, "
+                    f"indexer_blocks={int(indexer_row_widths[row])}"
+                )
+            self._dump_indexer_source_blocks[jobs] = indexer_blocks[
+                row,
+                logical_start:logical_end,
+            ]
             if state.row_modes_cpu[row] == DSA_ROW_MODE_SPARSE:
                 if count > 1:
                     raise RuntimeError(
@@ -704,19 +741,18 @@ class DSAOffloadRuntime:
             self.dump_job_count = 0
             return
 
-        reservation = store.reserve_blocks(
+        physical_block_ids = store.resolve_blocks(
             pool_indices=self._dump_pool_indices[:job_count],
             logical_block_indices=self._dump_logical_indices[:job_count],
         )
-        if not np.all(reservation.new_mask):
-            raise RuntimeError(
-                "DSA durable watermark is behind its DRAM logical table"
-            )
         self.dump_src_block_ids.np[:job_count] = (
             self._dump_source_blocks[:job_count]
         )
+        self.dump_indexer_src_block_ids.np[:job_count] = (
+            self._dump_indexer_source_blocks[:job_count]
+        )
         self.dump_dst_block_ids.np[:job_count] = (
-            reservation.physical_block_ids
+            physical_block_ids
         )
         store.commit_durable_full_block_counts(
             pool_indices=pool_indices[boundary_rows],
@@ -1141,14 +1177,34 @@ class DSALayerOffloadContext:
                 src_block_ids=self.runtime.dump_src_block_ids.gpu[:job_count],
                 dst_block_ids=self.runtime.dump_dst_block_ids.gpu[:job_count],
             )
-            return
-        if len(resident_cache) < 2 or arenas.nope is None or arenas.rope is None:
-            raise RuntimeError("DSA bf16 dump requires NOPE and ROPE HBM/DRAM planes")
-        dump_full_kv_cache_blocks(
-            resident_nope_cache=resident_cache[0],
-            resident_rope_cache=resident_cache[1],
-            dram_nope_arena=arenas.nope,
-            dram_rope_arena=arenas.rope,
-            src_block_ids=self.runtime.dump_src_block_ids.gpu[:job_count],
-            dst_block_ids=self.runtime.dump_dst_block_ids.gpu[:job_count],
-        )
+        else:
+            if len(resident_cache) < 2 or arenas.nope is None or arenas.rope is None:
+                raise RuntimeError("DSA bf16 dump requires NOPE and ROPE HBM/DRAM planes")
+            dump_full_kv_cache_blocks(
+                resident_nope_cache=resident_cache[0],
+                resident_rope_cache=resident_cache[1],
+                dram_nope_arena=arenas.nope,
+                dram_rope_arena=arenas.rope,
+                src_block_ids=self.runtime.dump_src_block_ids.gpu[:job_count],
+                dst_block_ids=self.runtime.dump_dst_block_ids.gpu[:job_count],
+            )
+
+        if len(arenas.indexer_source_bytes) != len(
+            arenas.indexer_dram_bytes
+        ):
+            raise RuntimeError(
+                "DSA Indexer source/DRAM plane count mismatch"
+            )
+        for source_bytes, dram_bytes in zip(
+            arenas.indexer_source_bytes,
+            arenas.indexer_dram_bytes,
+            strict=True,
+        ):
+            dump_full_cache_plane_bytes(
+                source_bytes=source_bytes,
+                dram_bytes=dram_bytes,
+                src_block_ids=(
+                    self.runtime.dump_indexer_src_block_ids.gpu[:job_count]
+                ),
+                dst_block_ids=self.runtime.dump_dst_block_ids.gpu[:job_count],
+            )

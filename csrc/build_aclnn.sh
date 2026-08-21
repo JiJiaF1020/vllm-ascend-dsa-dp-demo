@@ -105,6 +105,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
         "sparse_flash_attention_for_offload"
         "kvcache_scatter_copy"
         "kv_cache_full_block_dump"
+        "kv_cache_full_block_dump_bytes"
         "kv_quant_sparse_flash_attention"
         "matmul_allreduce_add_rmsnorm"
         "moe_init_routing_custom"
@@ -158,6 +159,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "sparse_flash_attention_for_offload"
         "kvcache_scatter_copy"
         "kv_cache_full_block_dump"
+        "kv_cache_full_block_dump_bytes"
         "kv_quant_sparse_flash_attention"
         "dispatch_ffn_combine"
         "dispatch_ffn_combine_w4_a8"
@@ -233,6 +235,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "vllm_a5_li_manage_c8"
         "vllm_a5_kvcache_scatter_copy_c8"
         "kv_cache_full_block_dump_c8"
+        "kv_cache_full_block_dump_bytes"
     )
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
@@ -41,7 +42,11 @@ from vllm.v1.core.single_type_kv_cache_manager import (
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
+from vllm_ascend.dsa_offload.scheduler_dram_pool import (
+    DSASchedulerDRAMBlockDirectory,
+)
 from vllm_ascend.dsa_offload.kv_cache import (
+    DSAKVCacheConfig,
     get_dsa_group_num_blocks,
     get_dsa_kv_cache_group_ids,
     validate_dsa_kv_cache_config,
@@ -137,6 +142,14 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
             )
 
         validate_dsa_kv_cache_config(kv_cache_config)
+        if (
+            not isinstance(kv_cache_config, DSAKVCacheConfig)
+            or kv_cache_config.dram_capacity is None
+        ):
+            raise RuntimeError(
+                "DSA coordinator requires the scheduler-finalized DRAM "
+                "capacity plan"
+            )
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
         self.enable_caching = False
@@ -174,6 +187,21 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
         )
         self.num_single_type_manager = len(self.single_type_managers)
         self.group_ids = get_dsa_kv_cache_group_ids(kv_cache_config)
+        indexer_block_size = int(
+            kv_cache_config.kv_cache_groups[
+                self.group_ids.indexer
+            ].kv_cache_spec.block_size
+        )
+        # vLLM Scheduler.block_size 在 hybrid/hash/CP 配置下可能与单个
+        # 物理 group 不同，不能用它推导 DSA DRAM logical block 数。
+        # DRAM bundle 与 Indexer/MLA payload 一一对应，唯一真源是最终
+        # Indexer spec 的物理 block size。
+        self.dram_block_size = indexer_block_size
+        self.dram_directory = DSASchedulerDRAMBlockDirectory(
+            usable_blocks=kv_cache_config.dram_capacity.usable_blocks,
+            max_logical_blocks=cdiv(max_model_len, indexer_block_size),
+            block_size=indexer_block_size,
+        )
         self.eagle_group_ids = (
             {self.group_ids.mtp_full}
             if self.group_ids.mtp_full is not None
@@ -362,6 +390,31 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
     ) -> DSARequestCacheState | None:
         return self.request_cache_layout.get_state(request_id)
 
+    def ensure_request_dram_blocks(
+        self,
+        request_id: str,
+        logical_block_count: int,
+    ) -> tuple[int, tuple[int, ...]]:
+        """让 DRAM 目录覆盖本轮可持久化的 durable full-block 前缀。"""
+
+        indexer_blocks = self.indexer_manager.req_to_blocks.get(
+            request_id,
+            (),
+        )
+        logical_block_count = int(logical_block_count)
+        if logical_block_count > len(indexer_blocks):
+            raise RuntimeError(
+                "DSA durable DRAM prefix exceeds the committed HBM Indexer "
+                "table: "
+                f"request_id={request_id!r}, "
+                f"durable_blocks={logical_block_count}, "
+                f"indexer_blocks={len(indexer_blocks)}"
+            )
+        return self.dram_directory.ensure_request_blocks(
+            request_id,
+            logical_block_count,
+        )
+
     def release_prefill_resident_blocks(
         self,
         request_id: str,
@@ -391,6 +444,7 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
 
     def free(self, request_id: str) -> None:
         super().free(request_id)
+        self.dram_directory.free_request(request_id)
         self.request_cache_layout.free(request_id)
 
     def get_num_common_prefix_blocks(

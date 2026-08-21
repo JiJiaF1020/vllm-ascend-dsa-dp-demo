@@ -10,6 +10,7 @@ from vllm_ascend.dsa_offload.request_cache_layout import (
     DSARequestCacheStage,
 )
 from vllm_ascend.dsa_offload.scheduler_output import (
+    DSADRAMBlockAssignment,
     DSAOffloadSchedulerOutput,
     DSARequestCacheLayoutProjection,
 )
@@ -23,6 +24,13 @@ def _projection() -> DSARequestCacheLayoutProjection:
         sparse_budget_tokens=(0,),
         resident_valid_tokens=(-1,),
         resident_block_table_replacements=(),
+        dram_block_assignments=(
+            DSADRAMBlockAssignment(
+                request_id="req",
+                logical_block_start=0,
+                physical_block_ids=(9, 10),
+            ),
+        ),
     )
 
 
@@ -54,4 +62,23 @@ def test_projection_rejects_columns_with_different_lengths() -> None:
             sparse_budget_tokens=(0,),
             resident_valid_tokens=(-1,),
             resident_block_table_replacements=(),
+        )
+
+
+def test_projection_rejects_dram_assignment_for_unscheduled_request() -> None:
+    with pytest.raises(ValueError, match="unscheduled request"):
+        DSARequestCacheLayoutProjection(
+            request_ids=("req",),
+            stages=(int(DSARequestCacheStage.DENSE_DECODE),),
+            target_resident_budget_tokens=(2048,),
+            sparse_budget_tokens=(0,),
+            resident_valid_tokens=(-1,),
+            resident_block_table_replacements=(),
+            dram_block_assignments=(
+                DSADRAMBlockAssignment(
+                    request_id="other",
+                    logical_block_start=0,
+                    physical_block_ids=(1,),
+                ),
+            ),
         )

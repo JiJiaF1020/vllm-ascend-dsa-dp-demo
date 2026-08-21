@@ -11,11 +11,14 @@ from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.dsa_offload import kv_cache as dsa_kv_cache
 from vllm_ascend.dsa_offload.kv_cache import (
     DSAIndexerKVSpec,
+    DSAKVCacheConfig,
     DSAResidentMLAAttentionSpec,
     build_dsa_kv_cache_config,
     build_dsa_kv_cache_groups,
+    dsa_dram_bytes_per_logical_block,
     dsa_max_memory_usage_bytes,
     dsa_pool_bytes_per_base_block,
+    finalize_dsa_dram_capacity,
     get_dsa_group_num_blocks,
     get_dsa_kv_cache_binding_order,
     get_dsa_kv_cache_group_ids,
@@ -27,6 +30,7 @@ from vllm_ascend.dsa_offload.kv_cache_coordinator import (
 )
 from vllm_ascend.patch.platform.patch_kv_cache_utils import (
     _ascend_get_kv_cache_groups,
+    _ascend_resolve_kv_cache_block_sizes,
 )
 
 
@@ -61,11 +65,18 @@ def _make_vllm_config(
     override: int | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
-        cache_config=SimpleNamespace(num_gpu_blocks_override=override),
+        cache_config=SimpleNamespace(
+            num_gpu_blocks_override=override,
+            block_size=128,
+            hash_block_size=None,
+            enable_prefix_caching=False,
+        ),
         model_config=SimpleNamespace(max_model_len=max_model_len),
+        kv_transfer_config=None,
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=1,
             prefill_context_parallel_size=1,
+            tensor_parallel_size=2,
         ),
     )
 
@@ -269,6 +280,62 @@ def test_ratio_is_expressed_by_final_tensor_sizes(
     assert not hasattr(groups[1], "dsa_num_blocks")
 
 
+def test_current_dsa_groups_resolve_scheduler_and_hash_to_128(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(dsa_kv_cache, "_get_dsa_ratio", lambda: 2)
+    vllm_config = _make_vllm_config()
+    groups = build_dsa_kv_cache_groups(_make_specs())
+    config = build_dsa_kv_cache_config(
+        vllm_config,
+        groups,
+        available_memory=dsa_pool_bytes_per_base_block(groups) * 128,
+    )
+
+    assert _ascend_resolve_kv_cache_block_sizes(
+        config,
+        vllm_config,
+    ) == (128, 128)
+
+
+def test_engine_core_finalizes_one_shared_dram_capacity_plan(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(dsa_kv_cache, "_get_dsa_ratio", lambda: 3)
+    monkeypatch.setattr(
+        "vllm_ascend.ascend_config.get_ascend_config",
+        lambda: SimpleNamespace(
+            dsa_offload_config=SimpleNamespace(
+                hot_cpu_block_multiple=1.5,
+            )
+        ),
+    )
+    groups = build_dsa_kv_cache_groups(_make_specs())
+    hbm_bytes = dsa_pool_bytes_per_base_block(groups) * 128
+    configs = [
+        build_dsa_kv_cache_config(
+            _make_vllm_config(),
+            groups,
+            available_memory=hbm_bytes,
+        )
+        for _ in range(2)
+    ]
+    bundle_bytes = dsa_dram_bytes_per_logical_block(groups)
+    indexer_blocks = get_dsa_group_num_blocks(configs[0], groups[0])
+    desired = int(indexer_blocks * 1.5)
+
+    plan = finalize_dsa_dram_capacity(
+        _make_vllm_config(),
+        configs,
+        host_available_bytes=(desired + 1) * bundle_bytes * 2,
+    )
+
+    assert plan is not None
+    assert plan.usable_blocks == desired
+    assert all(isinstance(config, DSAKVCacheConfig) for config in configs)
+    assert all(config.dram_capacity is plan for config in configs)
+
+
 def test_mtp_full_group_uses_dense_three_x_capacity(
     monkeypatch,
 ) -> None:
@@ -292,6 +359,11 @@ def test_mtp_full_group_uses_dense_three_x_capacity(
     assert get_dsa_group_num_blocks(config, groups[0]) == 768
     assert get_dsa_group_num_blocks(config, groups[1]) == 256
     assert get_dsa_group_num_blocks(config, groups[2]) == 768
+    assert dsa_dram_bytes_per_logical_block(groups) == (
+        groups[0].kv_cache_spec.page_size_bytes * len(groups[0].layer_names)
+        + groups[1].kv_cache_spec.page_size_bytes
+        * len(groups[1].layer_names)
+    )
 
 
 def test_mtp_full_group_requires_target_indexer_token_coverage(
@@ -377,6 +449,31 @@ def test_split_groups_accept_indexer_subset_for_shared_topology() -> None:
     assert len(groups) == 2
     assert len(groups[0].layer_names) == 1  # 仅 layer 0 有 indexer
     assert len(groups[1].layer_names) == 2
+
+
+def test_glm52_complete_dram_block_does_not_pad_shared_indexers() -> None:
+    # 真实 GLM-5.2 拓扑：前两层 full，之后每四层一个 full，合计
+    # 78 resident MLA + 21 full Indexer。shared follower 只复用 top-K，
+    # 不应为 DRAM 完整块额外占一份空 Indexer payload。
+    full_indexer_layers = {0, 1, *range(2, 78, 4)}
+    assert len(full_indexer_layers) == 21
+    specs = _make_specs(num_layers=78)
+    for layer_index in range(78):
+        if layer_index not in full_indexer_layers:
+            del specs[
+                f"model.layers.{layer_index}.self_attn.indexer.k_cache"
+            ]
+
+    groups = build_dsa_kv_cache_groups(specs)
+    indexer_group, resident_group = groups
+    expected = (
+        21 * indexer_group.kv_cache_spec.page_size_bytes
+        + 78 * resident_group.kv_cache_spec.page_size_bytes
+    )
+
+    assert len(indexer_group.layer_names) == 21
+    assert len(resident_group.layer_names) == 78
+    assert dsa_dram_bytes_per_logical_block(groups) == expected
 
 
 def test_split_groups_reject_orphan_indexer_without_resident() -> None:

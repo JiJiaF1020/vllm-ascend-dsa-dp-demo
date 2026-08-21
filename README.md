@@ -11,15 +11,18 @@
 ## 当前能力
 
 - HBM KV cache 拆分为完整 Indexer K 平面和有界 resident MLA 平面；
-- worker 持有固定容量、固定地址的 hot DRAM arena：A3 为 NOPE/ROPE，A5
-  C8 为 656-byte packed payload；
+- EngineCore/scheduler 按单机可用内存和本地 TP 数统一规划 DRAM 容量，
+  coordinator 统一管理 DRAM block id，worker 只创建固定地址 arena 并镜像
+  assignment；
+- 一个 DRAM block 完整保存 target Indexer+MLA：A3 为 dense Indexer 与
+  NOPE/ROPE，A5 C8 为 Indexer key/scale 与 656-byte packed MLA；
 - scheduler 统一管理 `PREFILL`、`DENSE_DECODE`、
   `ENTER_SPARSE_DECODE`、`SPARSE_DECODE` 请求布局；
 - decode 整批执行 LI/resident-update -> KSC -> sparse attention，不按
   dense/sparse 拆分子 batch；A5 C8 decode 使用融合 Quant-LI/resident-update，
   prefill 复用社区 Quant-LI，attention 复用社区 QSFA；
-- prefill 与 decode 新满 MLA block 通过独立
-  `KvCacheFullBlockDump` 算子写入 DRAM；
+- prefill 与 decode 新满 target Indexer+MLA block 通过 full-block dump
+  算子写入同一个逻辑 DRAM block id；
 - 支持 chunked prefill；完整 prompt 必须先在所有启用的 full-context group 完成容量准入，
   中间 chunk 保持 PREFILL，下一轮 decode 才允许进入 DENSE/ENTER；
 - eager 与 ACL FULL decode graph 共用同一套 InputBatch 行状态、
@@ -33,12 +36,14 @@ flowchart LR
     C["additional_config.dsa_sparse_config"] --> A["AscendConfig"]
     A --> K["Target split cache / optional MTP full cache"]
     A --> S["DSAOffloadScheduler"]
-    S --> I["NPUInputBatch 七列投影"]
+    S --> Q["DRAM capacity / block directory"]
+    S --> I["NPUInputBatch 七列投影 + assignment"]
     I --> R["共享 eager/graph runtime"]
     R --> L["A3 LIDU / A5 C8 fused LIDU"]
     L --> X["KSC miss 换入"]
     X --> F["SFA-Offload"]
-    D["Hot DRAM arena"] --> X
+    Q --> D["Complete Indexer+MLA DRAM arena"]
+    D --> X
     F --> U["Full-block dump"]
     U --> D
 ```
@@ -114,6 +119,11 @@ additional_config={
 首次部署或更新 DSA 自定义算子后，必须完整重编译并重新安装
 vLLM-Ascend。
 
+若改动同时新增了 ``torch.ops._C_ascend`` schema，除了清理根目录
+``build`` 和 ``csrc/build|output|build_out``，还要移除源码包内可能抢先于
+site-packages 被导入的旧 ``vllm_ascend/vllm_ascend_C*.so``，并确认新扩展
+实际复制回当前 checkout。仅重建 CANN OPP 不能刷新 Torch schema。
+
 ### A5 C8 增量配置
 
 A5 当前只接通 SFA C8 与 LI C8 同时开启的完整数据面。在上述
@@ -176,6 +186,7 @@ MTP3 下 B 个请求对应 `4 * B` 个 target query token。SPARSE resident 固�
 - KV-cache metrics/events；
 - GLM-5.2 A5 C8 的正式 QA、长稳并发与性能验收；
 - A5 BF16 DSA 算子链。
+- 多机 TP 的按节点 DRAM 容量规划（当前自动规划只承诺单机 TP）。
 
 具有显式配置入口的未支持组合会在启动期拒绝，preemption/resume 会在当前
 运行边界明确失败。A5 GLM-5.1 与 GLM-5.2 MTP 已取得上板冒烟结果，但仍以

@@ -23,6 +23,7 @@ from vllm_ascend.dsa_offload.scheduler import (
     _is_prefill_request,
 )
 from vllm_ascend.dsa_offload.scheduler_output import (
+    DSADRAMBlockAssignment,
     DSAResidentBlockTableReplacement,
 )
 
@@ -287,6 +288,9 @@ def test_final_prefill_chunk_releases_resident_blocks_after_output(
 
 def test_projection_carries_enter_resident_table_and_scalar_state() -> None:
     scheduler = _make_scheduler()
+    # 模拟 hybrid group 的通用 scheduler LCM 为 256，而 DSA
+    # Indexer/MLA/DRAM 的物理 block size 为 128。
+    scheduler.block_size = 256
     output = SchedulerOutput.make_empty()
     output.num_scheduled_tokens = {"dense": 1, "enter": 1}
     output.total_num_scheduled_tokens = 2
@@ -304,8 +308,28 @@ def test_projection_carries_enter_resident_table_and_scalar_state() -> None:
             resident_valid_tokens=4097,
         ),
     }
+    scheduler.requests = {
+        # 模拟 super().schedule() 已把本轮 1 token 计入 computed。
+        "dense": _Request("dense", 2048, 2049, 1, 2049),
+        "enter": _Request("enter", 4096, 4097, 1, 4097),
+    }
+    durable_counts: dict[str, int] = {}
+
+    def ensure_dram_blocks(
+        request_id: str,
+        logical_block_count: int,
+    ) -> tuple[int, tuple[int, ...]]:
+        durable_counts[request_id] = logical_block_count
+        return (
+            (0, (701, 702))
+            if request_id == "dense"
+            else (2, (703,))
+        )
+
     scheduler.dsa_coordinator = SimpleNamespace(
+        dram_block_size=128,
         get_request_cache_state=states.get,
+        ensure_request_dram_blocks=ensure_dram_blocks,
         resident_manager=SimpleNamespace(
             req_to_blocks={
                 "enter": [
@@ -330,4 +354,86 @@ def test_projection_carries_enter_resident_table_and_scalar_state() -> None:
             block_ids=(301, 302),
         ),
     )
+    assert projection.dram_block_assignments == (
+        DSADRAMBlockAssignment(
+            request_id="dense",
+            logical_block_start=0,
+            physical_block_ids=(701, 702),
+        ),
+        DSADRAMBlockAssignment(
+            request_id="enter",
+            logical_block_start=2,
+            physical_block_ids=(703,),
+        ),
+    )
+    assert durable_counts == {"dense": 16, "enter": 32}
     assert projection.num_enter_rows == 1
+
+
+def test_mtp_decode_dram_assignment_excludes_provisional_tokens() -> None:
+    scheduler = _make_scheduler()
+    scheduler.block_size = 256
+    scheduler.num_spec_tokens = 3
+    # forward 开始为 255；super().schedule() 已乐观加入本轮 Q=4。
+    request = _Request("mtp", 128, 259, 1, 260)
+    request.spec_token_ids = [11, 12, 13]
+    scheduler.requests = {request.request_id: request}
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {request.request_id: 4}
+    output.total_num_scheduled_tokens = 4
+    observed: list[int] = []
+    scheduler.dsa_coordinator = SimpleNamespace(
+        dram_block_size=128,
+        get_request_cache_state=lambda request_id: SimpleNamespace(
+            stage=DSARequestCacheStage.SPARSE_DECODE,
+            target_resident_budget_tokens=8192,
+            sparse_budget_tokens=8192,
+            resident_valid_tokens=8319,
+        ),
+        ensure_request_dram_blocks=(
+            lambda request_id, logical_block_count: (
+                observed.append(logical_block_count) or (0, ())
+            )
+        ),
+        resident_manager=SimpleNamespace(req_to_blocks={}),
+    )
+
+    scheduler._build_dsa_cache_layout_projection(output)
+
+    # floor(255 / 128) == 1。若错误地把本轮 4 个 target query 算进去，
+    # 会提前得到 floor(259 / 128) == 2 并为未验证尾块分配 DRAM id。
+    assert observed == [1]
+
+
+def test_mtp_prefill_dram_assignment_includes_current_chunk() -> None:
+    scheduler = _make_scheduler()
+    scheduler.block_size = 256
+    scheduler.num_spec_tokens = 3
+    # forward 开始为 127；prefill 的 129-token chunk 已计入 computed。
+    request = _Request("prefill", 384, 256, 0, 384)
+    scheduler.requests = {request.request_id: request}
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {request.request_id: 129}
+    output.total_num_scheduled_tokens = 129
+    observed: list[int] = []
+    scheduler.dsa_coordinator = SimpleNamespace(
+        dram_block_size=128,
+        get_request_cache_state=lambda request_id: SimpleNamespace(
+            stage=DSARequestCacheStage.PREFILL,
+            target_resident_budget_tokens=8192,
+            sparse_budget_tokens=0,
+            resident_valid_tokens=-1,
+        ),
+        ensure_request_dram_blocks=(
+            lambda request_id, logical_block_count: (
+                observed.append(logical_block_count) or (0, ())
+            )
+        ),
+        resident_manager=SimpleNamespace(req_to_blocks={}),
+    )
+
+    scheduler._build_dsa_cache_layout_projection(output)
+
+    # Prefill 在 cache write 后 dump，因此本轮 127+129 个 token 对应的
+    # 两个 full block 都可以在 forward 前获得 DRAM assignment。
+    assert observed == [2]

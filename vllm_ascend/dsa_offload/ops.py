@@ -3,7 +3,7 @@
 """DSA 数据面到 Ascend 自定义算子的薄适配层。
 
 本模块只固定 LIDU、KSC、SFA-Offload 和满块复制的 tensor ABI。请求阶段、
-resident 行分配、DRAM block 预留和 attention 时序由上层 runtime 负责；
+resident 行分配、scheduler DRAM block 投影和 attention 时序由上层负责；
 这里不隐式创建输出 tensor，也不执行 D2H 或 list-to-tensor 转换。
 """
 
@@ -50,12 +50,14 @@ _REQUIRED_OPS = (
     "npu_kvcache_scatter_copy",
     "npu_sparse_flash_attention_for_offload",
     "kv_cache_full_block_dump",
+    "kv_cache_full_block_dump_bytes",
 )
 
 _REQUIRED_A5_C8_OPS = (
     "npu_dsa_a5_li_manage_nomtp_c8_out",
     "npu_dsa_a5_kvcache_scatter_copy_c8_out",
     "kv_cache_full_block_dump_c8",
+    "kv_cache_full_block_dump_bytes",
 )
 _REQUIRED_A5_MTP_OPS = ("npu_dsa_a5_li_manage_c8_out",)
 
@@ -347,6 +349,50 @@ def dump_full_kv_cache_blocks_c8(
     torch.ops._C_ascend.kv_cache_full_block_dump_c8(
         _packed_byte_view(resident_packed_cache, name="resident_packed_cache"),
         _packed_byte_view(dram_packed_arena, name="dram_packed_arena"),
+        src_block_ids,
+        dst_block_ids,
+    )
+
+
+def cache_block_byte_view(
+    cache: torch.Tensor,
+    *,
+    name: str,
+) -> torch.Tensor:
+    """在初始化期把任意连续 cache plane 建成无复制的二维字节块 view。"""
+
+    if cache.ndim < 2 or cache.shape[0] <= 0:
+        raise ValueError(
+            f"{name} must contain physical cache blocks, got {tuple(cache.shape)}"
+        )
+    if not cache.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+    byte_view = cache.view(torch.int8).reshape(int(cache.shape[0]), -1)
+    if (
+        not byte_view.is_contiguous()
+        or byte_view.shape[1] <= 0
+        or byte_view.data_ptr() != cache.data_ptr()
+    ):
+        raise RuntimeError(
+            f"{name} did not produce a zero-copy contiguous byte-block view"
+        )
+    return byte_view
+
+
+def dump_full_cache_plane_bytes(
+    *,
+    source_bytes: torch.Tensor,
+    dram_bytes: torch.Tensor,
+    src_block_ids: torch.Tensor,
+    dst_block_ids: torch.Tensor,
+) -> None:
+    """复制一个 opaque cache plane；``dst=-1`` 沿用图空转语义。"""
+
+    if src_block_ids.numel() == 0:
+        return
+    torch.ops._C_ascend.kv_cache_full_block_dump_bytes(
+        source_bytes,
+        dram_bytes,
         src_block_ids,
         dst_block_ids,
     )

@@ -10,8 +10,8 @@ budget、请求队列、KV block 分配和输出更新；DSA 子类只补充当�
 * prefill 数据面完成后，scheduler 才能释放已卸载的 resident 满块；
 * preemption/resume 尚未建立 DRAM ledger 恢复协议，发生时显式失败。
 
-阶段与 budget 的语义真源位于 ``request_cache_layout``，物理 block table 由
-``DSAKVCacheCoordinator`` 持有。每轮输出只用一个薄
+阶段与 budget 的语义真源位于 ``request_cache_layout``，HBM block table 与
+DRAM block directory 都由 ``DSAKVCacheCoordinator`` 持有。每轮输出只用一个薄
 ``DSAOffloadSchedulerOutput`` 投影已提交状态，不向 vLLM ``Request`` 动态
 追加字段，也不复制调度输出的构造逻辑。
 """
@@ -36,6 +36,7 @@ from vllm_ascend.dsa_offload.request_cache_layout import (
     DSARequestCacheStage,
 )
 from vllm_ascend.dsa_offload.scheduler_output import (
+    DSADRAMBlockAssignment,
     DSAOffloadSchedulerOutput,
     DSARequestCacheLayoutProjection,
     DSAResidentBlockTableReplacement,
@@ -204,6 +205,7 @@ class DSAOffloadScheduler(Scheduler):
         sparse_budgets = [0] * row_count
         resident_valid_tokens = [-1] * row_count
         resident_replacements: list[DSAResidentBlockTableReplacement] = []
+        dram_assignments: list[DSADRAMBlockAssignment] = []
 
         for row, request_id in enumerate(request_ids):
             state = self.dsa_coordinator.get_request_cache_state(request_id)
@@ -215,6 +217,54 @@ class DSAOffloadScheduler(Scheduler):
             target_budgets[row] = int(state.target_resident_budget_tokens)
             sparse_budgets[row] = int(state.sparse_budget_tokens)
             resident_valid_tokens[row] = int(state.resident_valid_tokens)
+
+            request = self.requests.get(request_id)
+            if request is None:
+                raise RuntimeError(
+                    "DSA scheduled request disappeared before DRAM "
+                    f"projection: request_id={request_id!r}"
+                )
+            scheduled_tokens = int(
+                scheduler_output.num_scheduled_tokens[request_id]
+            )
+            # super().schedule() 返回前已经通过 _update_after_schedule()
+            # 把 scheduled_tokens 加进 request.num_computed_tokens，因此这里
+            # 看到的是本轮结束位置，不能再次相加。普通路径和 prefill 在
+            # cache write 后 dump，直接使用该 end 值。固定 MTP decode 在
+            # 写入 provisional KV 前 dump，必须减回 scheduled_tokens，只
+            # 覆盖 forward 开始时已确认的前缀。
+            durable_tokens = int(request.num_computed_tokens)
+            if (
+                self.num_spec_tokens
+                and state.stage != DSARequestCacheStage.PREFILL
+            ):
+                durable_tokens -= scheduled_tokens
+            if durable_tokens < 0:
+                raise RuntimeError(
+                    "DSA durable token prefix became negative after removing "
+                    "MTP provisional tokens: "
+                    f"request_id={request_id!r}, "
+                    f"computed={request.num_computed_tokens}, "
+                    f"scheduled={scheduled_tokens}"
+                )
+            durable_full_blocks = (
+                durable_tokens
+                // self.dsa_coordinator.dram_block_size
+            )
+            logical_start, physical_ids = (
+                self.dsa_coordinator.ensure_request_dram_blocks(
+                    request_id,
+                    durable_full_blocks,
+                )
+            )
+            if physical_ids:
+                dram_assignments.append(
+                    DSADRAMBlockAssignment(
+                        request_id=request_id,
+                        logical_block_start=logical_start,
+                        physical_block_ids=physical_ids,
+                    )
+                )
 
             if state.stage == DSARequestCacheStage.ENTER_SPARSE_DECODE:
                 resident_blocks = self.dsa_coordinator.resident_manager.req_to_blocks.get(request_id)
@@ -236,6 +286,7 @@ class DSAOffloadScheduler(Scheduler):
             sparse_budget_tokens=tuple(sparse_budgets),
             resident_valid_tokens=tuple(resident_valid_tokens),
             resident_block_table_replacements=tuple(resident_replacements),
+            dram_block_assignments=tuple(dram_assignments),
         )
 
     def _attach_dsa_cache_layout(

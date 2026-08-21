@@ -12,6 +12,7 @@ vLLM v0.23 的 ``SchedulerOutput`` 对 cached request 只传新增 block IDs，
 * request 语义按 ``num_scheduled_tokens`` 的顺序列式传输，避免四份
   request-id→scalar 字典；
 * 只有 ENTER 行携带 resident block IDs 全量快照。
+* DRAM 目录只传本轮新增的连续 assignment 后缀，不重传完整逻辑表。
 
 多进程执行器使用 pickle 传递 scheduler output，因此该类型化子类会随普通
 ``SchedulerOutput`` 一起跨进程恢复。worker 最终仍按自己的 ``InputBatch``
@@ -42,6 +43,25 @@ class DSAResidentBlockTableReplacement:
 
 
 @dataclass(frozen=True, slots=True)
+class DSADRAMBlockAssignment:
+    """scheduler 为一个请求新增的连续逻辑 DRAM block-id 后缀。"""
+
+    request_id: str
+    logical_block_start: int
+    physical_block_ids: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if self.logical_block_start < 0:
+            raise ValueError("DSA DRAM assignment start must be non-negative")
+        if not self.physical_block_ids:
+            raise ValueError("DSA DRAM assignment cannot be empty")
+        if any(block_id <= 0 for block_id in self.physical_block_ids):
+            raise ValueError(
+                "DSA DRAM assignment block IDs must be greater than zero"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class DSARequestCacheLayoutProjection:
     """一次 model-forward 中 scheduled request 的 cache 布局列。"""
 
@@ -54,6 +74,7 @@ class DSARequestCacheLayoutProjection:
         DSAResidentBlockTableReplacement,
         ...,
     ]
+    dram_block_assignments: tuple[DSADRAMBlockAssignment, ...] = ()
 
     def __post_init__(self) -> None:
         row_count = len(self.request_ids)
@@ -75,6 +96,20 @@ class DSARequestCacheLayoutProjection:
                 f"replacements={len(self.resident_block_table_replacements)}, "
                 f"enter_rows={enter_rows}"
             )
+        scheduled_request_ids = set(self.request_ids)
+        assignment_request_ids: set[str] = set()
+        for assignment in self.dram_block_assignments:
+            if assignment.request_id not in scheduled_request_ids:
+                raise ValueError(
+                    "DSA DRAM assignment belongs to an unscheduled request: "
+                    f"request_id={assignment.request_id!r}"
+                )
+            if assignment.request_id in assignment_request_ids:
+                raise ValueError(
+                    "DSA projection contains duplicate DRAM assignments for "
+                    f"request {assignment.request_id!r}"
+                )
+            assignment_request_ids.add(assignment.request_id)
 
     @property
     def num_rows(self) -> int:

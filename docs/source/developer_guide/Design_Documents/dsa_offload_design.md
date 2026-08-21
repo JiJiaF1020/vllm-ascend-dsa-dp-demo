@@ -20,7 +20,7 @@
 DSA 稀疏卸载最终目标是在长上下文 decode 中实现：
 
 1. Indexer K 保存完整上下文并驻留 HBM；
-2. MLA 完整满块卸载到 worker 本地 hot DRAM；
+2. target Indexer+MLA 完整满块卸载到 worker 本地 hot DRAM；
 3. HBM MLA 只保留有界 resident budget 与固定尾区；普通 decode 为一块，
    固定 MTP3 为两块 parity tail；
 4. LIDU 选择重要 token 并更新 resident 映射；
@@ -96,7 +96,9 @@ flowchart TB
     PROJECTION --> INPUT["NPUInputBatch 固定容量行状态"]
     INPUT --> POOL["稳定 resident token pool / cache_slots"]
     INPUT --> RUNTIME["DSAOffloadRuntime 固定 metadata owner"]
-    RUNTIME --> DRAM["固定 hot DRAM arena / logical ledger"]
+    COORD --> DIRECTORY["scheduler DRAM block directory"]
+    DIRECTORY --> PROJECTION
+    RUNTIME --> DRAM["固定完整 Indexer+MLA arena / worker mirror"]
     POOL --> DATA["LIDU -> KSC -> SFA-Offload"]
     DRAM --> DATA
     DATA --> DUMP["SFA 后 full-block dump"]
@@ -114,7 +116,8 @@ flowchart TB
 | 请求 cache 布局 | 阶段、冻结预算、resident 有效长度 | `DSARequestCachePlanner` |
 | 物理块表 | target 两 plane 与可选 MTP full group 的 request→blocks 映射 | `DSAKVCacheCoordinator` 下的各 group manager |
 | worker resident 映射 | request→稳定 pool row、逐层 token→slot | `DSAResidentTokenPool` |
-| DRAM 逻辑账本 | pool row→logical full block→DRAM block | `DSAHotDRAMStore` |
+| DRAM 逻辑真源 | request→logical full block→DRAM block | `DSAKVCacheCoordinator` |
+| DRAM worker 镜像 | pool row→logical full block→DRAM block | `DSAWorkerDRAMStore` |
 
 worker 行状态是上述 scheduler/core 真源的 **投影**，不是第二套请求阶段
 账本。eager 与 graph 后续都必须消费这个投影和同一个 buffer owner。
@@ -243,7 +246,7 @@ KV-cache metrics/events 等未建立完整合同的组合。
 | `prompt_budget_thresholds` | `[32768, 65536]` | admission 时按 prompt 长度选择 resident 档位 |
 | `resident_budget_tokens` | `[6144, 10240, 12288]` | N 个 prompt 阈值划分 N+1 个区间，每个区间对应一个冻结 resident budget |
 | `max_active_reqs` | `256` | 配置上界，必须覆盖 `max_num_seqs`；不是实际预分配行数 |
-| `hot_cpu_block_multiple` | `3.0` | DRAM usable blocks 相对 Indexer HBM blocks 的浮点倍数，最终向上取整 |
+| `hot_cpu_block_multiple` | `3.0` | 期望 DRAM usable blocks 相对 Indexer HBM blocks 的浮点倍数，最终向上取整；单机内存不足可缩容但不得低于 1x Indexer blocks |
 | `enable_row_mode_decode_graph` | `False` | 允许普通 Q=1 或 MTP3 uniform Q=4 decode 进入原生 FULL graph |
 | `trace_points` | 关闭 | 拉起期解析的预留调测合同；当前仅接受 `first_sample`，尚无稳定日志 consumer |
 
@@ -402,7 +405,13 @@ scheduler→worker 投影真源，避免 worker、eager 和 graph 各自重新�
 
 - `DSAIndexerKVCacheManager` 保存完整上下文块；
 - `DSAResidentMLAKVCacheManager` 保存 dense 或 resident 布局块。
-- 启用 MTP 时，原生 `CompressAttentionManager` 保存 MTP BF16 full-cache 块。
+- 启用 MTP 时，原生 `FullAttentionManager` 保存 MTP BF16 full-cache 块。
+
+这些 group 复用同一个基线 `BlockPool` 类型，但不是同一个实例：Indexer、
+resident MLA 和可选 MTP 的物理 block 数及 id 空间彼此独立。当前所有 HBM
+pool 都以 `enable_caching=False` 构造，尤其 resident MLA 的 budget/tail block
+不代表完整上下文块，不能产生 prefix hash。后续 prefix identity 只绑定
+DRAM 中完整的 dense Indexer+MLA bundle。
 
 分配规则：
 
@@ -451,6 +460,8 @@ host 输出返回释放 HBM 块。
 - `DSARequestCacheLayoutProjection` 按 scheduled request 顺序列式承载
   stage、target/sparse budget、resident valid length；
 - `DSAOffloadSchedulerOutput` 浅包装原生输出，基线字段继续共享原对象；
+- coordinator 按已提交的 Indexer block table 扩展 DRAM directory，投影只
+  携带本轮新增的连续 assignment 后缀，不重传完整 DRAM 表；
 - 多进程 pickle 往返保留 projection 类型和内容；
 - worker 先执行原生 `_update_states()` 的 remove/add/condense/reorder，
   再通过 `req_id_to_index` 投影到最终行序；
@@ -486,9 +497,10 @@ eager 路径按以下结构接通：
   最后一列保存未初始化、first-fill 或 steady budget 标记；
 - pool row 释放时只归还行号，下一次分配前执行唯一一次整行清理，避免
   request release 和 row reuse 重复写同一块大状态 tensor；
-- `DSAHotDRAMStore` 按层持有固定地址 NOPE/ROPE 或 packed-C8 arena，逻辑
-  块表使用 `pool_row × logical_block`，请求释放时整行回收；这里只注册
-  target 层，MTP proposer 不创建 DRAM payload arena；
+- `DSAWorkerDRAMStore` 按层持有固定地址 target MLA arena，并为 full Indexer
+  层额外持有完整 Indexer plane；逻辑块表使用
+  `pool_row × logical_block`，但只镜像 scheduler assignment，不在 worker
+  分配 physical id；MTP proposer 不创建 DRAM payload arena；
 - `DSAOffloadRuntime` 是 eager/graph 共用的物理 metadata owner，持有
   resident positions、active DRAM table、dump 列和 LIDU scratch；
 - LIDU 的 topK/slot/miss/tail 输出只在当前 selection group 内存活：full 层
@@ -597,8 +609,16 @@ DENSE 不使用上述“完整块 + tail”拆分：其 KV 全在 HBM，每个 q
 MTP target 验算产生的 target 满块在下一 outer step 才成为 durable。runtime 比较请求级
 `confirmed_full_blocks` 与 DRAM watermark，预先构造一份固定地址 dump plan；
 每个 target 物理层在写入当前 KV 前，把同一 logical block 写到自己的 arena。
-MTP full cache 不参与该 dump。当前实现保持单 stream 顺序；未来若改为异步
+对应 DRAM id 也只在这个下一 outer step 分配；provisional query 即使跨过
+128-token 边界并写满一块双尾区，也不会提前占用或写入 DRAM。MTP full
+cache 不参与该 dump。当前实现保持单 stream 顺序；未来若改为异步
 多流，必须增加 event 和逐层可见性协议。
+
+当前 prefix cache 仍关闭，请求结束会直接释放 DRAM directory。未来保留
+finished request 作为 prefix 前，MTP 还必须补一个 terminal flush：若最后一次
+验算新确认的 token 恰好补满 full block，而请求随后立刻 EOS/length finish，
+不会再有下一 outer step 执行 pre-write dump。该尾块不能标记 hash-ready，
+必须先通过显式 flush-only 数据面完成完整 Indexer+MLA dump。
 
 ## 11. Decode 数据面与算子 ABI
 
@@ -762,48 +782,90 @@ Indexer cache、layer id 和 runtime 在初始化期绑定，热路径不重复�
 
 ### 12.1 Arena 和 ledger
 
-`DSAHotDRAMStore` 对每层创建两张 NPU 可寻址 swapped-memory arena：
+EngineCore 在基线 HBM `KVCacheConfig` 已完成各 rank 收敛后，只观测一次
+当前单机可用内存（同时考虑常见 cgroup 上限），生成
+`DSADRAMCapacityPlan`：
+
+该自动规划首版只承诺单机 TP（PP 仍由配置合同拒绝）；多机 TP 需要按节点
+而非全局 TP 数切分内存，尚未开放。
 
 ```text
-NOPE: [dram_blocks + 1, block_size, 1, kv_lora_rank]
-ROPE: [dram_blocks + 1, block_size, 1, qk_rope_head_dim]
+minimum = HBM Indexer blocks per rank
+desired = ceil(minimum * hot_cpu_block_multiple)
+per_rank_available = host_available / tensor_parallel_size
+max_usable = floor(per_rank_available / complete_block_bytes) - 1
+usable = max(minimum, min(desired, max_usable))
 ```
 
-不同层的 payload tensor 独立，但所有层共享同一套 DRAM physical block-id
-语义和请求逻辑表。block `0` 是已清零的空映射；有效 DRAM block id 从 1
-开始。容量按
-`ceil(indexer_hbm_blocks * hot_cpu_block_multiple)` 计算，初始化后不扩容，
-保证 eager 和 graph 中 arena 基地址稳定。
+减一是因为所有 worker arena 都保留已清零的 block `0` 作为空映射。若完整
+block 的最大可用数量小于 HBM Indexer blocks，启动直接失败；若只是不足
+配置倍数，则统一缩容并在容量报告中打印实际倍数。计划随类型化
+`DSAKVCacheConfig` 同时下发 scheduler 和所有 TP worker；worker 不允许自行
+缩容，任一 swapped-memory arena 创建失败会终止启动。
 
-逻辑表为：
+一个逻辑 DRAM block 包含本 rank 的全部 target dense 语义 payload：
+
+```text
+A3: all full Indexer BF16 planes + all resident MLA NOPE/ROPE planes
+A5: all full Indexer FP8-key/FP32-scale planes + all packed-C8 MLA planes
+```
+
+GLM-5.2 只保存 21 个 full Indexer 的 payload，57 个 shared follower 只保存
+自己的 MLA；它们复用所属 full 层的 Indexer 结果，不重复落一份 Indexer。
+妥协版 MTP proposer 的 BF16 full cache 仍独立全驻留 HBM，不进入 DRAM
+容量和 payload bundle。
+
+`DSASchedulerDRAMBlockDirectory` 是 physical id 唯一分配者。它直接复用
+vLLM 原生 `BlockPool(usable_blocks + 1)` 的 null block、refcount 和 free
+queue，并按本轮确定可持久化的 durable full-block 前缀增量扩展；该前缀
+始终受已提交 Indexer block table 覆盖：
+
+durable block 数必须使用 finalized Indexer spec 的物理 block size。vLLM
+通用 scheduler/hash 粒度在 hybrid group、context parallel 或显式 hash 配置
+下允许与单个物理 group 不同，不能用于 DRAM 物理块计数。
+此外，DSA projection 发生在基线 `_update_after_schedule()` 之后，此时
+`request.num_computed_tokens` 已包含本轮 scheduled tokens：prefill/普通路径
+直接使用该 end 值；MTP pre-write dump 则减回 scheduled tokens 得到本轮
+开始时已确认的 durable 前缀，任何路径都不能再次把 scheduled 相加。
+
+```text
+request_id -> [logical block 0 -> dram id, logical block 1 -> dram id, ...]
+```
+
+只有新增连续后缀通过 scheduler output 发送。worker 的
+`DSAWorkerDRAMStore` 使用 stable resident pool row 保存镜像：
+
 
 ```text
 [resident_pool_storage_rows, ceil(max_model_len / block_size)]
 ```
 
-它记录 `stable pool row -> logical full block -> DRAM block id`。当前关闭
-prefix cache、preemption 和 KV connector，所以不同请求不共享 DRAM
-block，也没有 hash/refcount 管理。
+worker 只校验越界、重复 id 和跨行碰撞，绝不在 dump 热路径补分配。当前
+关闭 prefix cache、preemption 和 KV connector，因此 scheduler 在请求结束
+时归还 physical id，worker 通过基线 `finished_req_ids` 清镜像行；尚未增加
+hash/refcount/LRU。
 
 ### 12.2 Dump 计划与执行时序
 
-model-forward 元数据准备阶段批量识别本轮新完成的 full block，并预留
-DRAM block。逐层 attention 完成 SFA 后，`KvCacheFullBlockDump` 只接收：
+model-forward 元数据准备阶段仍只批量识别本轮新完成的 full block；对应
+DRAM id 已由 scheduler 预先下发。逐层 attention 完成 SFA 后：
 
 ```text
-resident NOPE/ROPE cache
-DRAM NOPE/ROPE arena
-src_hbm_block_ids
+resident MLA source block ids
+dense Indexer source block ids
 dst_dram_block_ids
 ```
 
-算子不感知请求、stage 或 token position。prefill 与 decode 使用相同
-复制 ABI；差别只在本轮 job 数量。
+每个 target 层把 MLA payload 写到同一逻辑 id；full Indexer 层还通过
+`KvCacheFullBlockDumpBytes` 写入 Indexer plane。后者把初始化期建立的连续
+cache byte view 当作 opaque payload，支持 A3 BF16 与 A5 FP8/FP32 的不同
+dtype，而不在热路径执行转换或 `.contiguous()`。算子不感知请求、stage 或
+token position；prefill 与 decode 使用相同 job 列。
 
 当前所有 attention 和 dump 位于同一 NPU stream，stream 内严格保序：
 
 ```text
-本层 SFA 读取 HBM -> 本层 full-block dump -> 后续层
+本层 SFA 读取 HBM -> 本层 MLA/可选 Indexer full-block dump -> 后续层
 ```
 
 该 block 到下一 model-forward 才可能被 LIDU/KSC 消费。因此当前不需要
@@ -815,7 +877,8 @@ model output 返回后释放已经 dump 的 resident 满块。未来引入异步
 
 - eager：没有新满块时直接跳过算子；有 job 时提交紧凑 src/dst 前缀；
 - graph：为了保持 captured topology，始终传 captured-row 固定宽度；
-  空行使用 `src=0, dst=-1`；
+  MLA 与 full Indexer dump 都使用同一组固定 src/dst owner，空行使用
+  `src=0, dst=-1`；
 - `dst=-1` 是 dump 算子的唯一空转哨兵，不能和 DRAM ledger 的空映射
   block `0` 混用。
 
@@ -827,7 +890,8 @@ model output 返回后释放已经 dump 的 resident 满块。未来引入异步
 |---|---|---|
 | 拉起期 | 类型化配置、spec、固定容量 tensor | `AscendConfig` / model runner |
 | 请求跨 step | 阶段、冻结预算、resident 有效长度 | scheduler/core planner |
-| worker 跨 step | InputBatch 七列投影、stable pool row、`cache_slots`、DRAM ledger | `NPUInputBatch` / resident pool / DRAM store |
+| scheduler 跨 step | 请求 DRAM logical block→physical id 目录 | `DSAKVCacheCoordinator` |
+| worker 跨 step | InputBatch 七列投影、stable pool row、`cache_slots`、DRAM 目录镜像 | `NPUInputBatch` / resident pool / DRAM store |
 | 单次 model forward | token row mode、slot mapping position、active DRAM table、dump jobs | `DSAOffloadRuntime` |
 | 单层 | LIDU 四个输出和 SFA selection view | `DSALayerOffloadContext` |
 
@@ -922,7 +986,8 @@ stateDiagram-v2
 
 1. 基线移除 InputBatch 行；
 2. resident pool 归还 stable row，但不立即清大 tensor；
-3. DRAM store 批量回收该 row 的 physical block ids 并清 logical row；
+3. scheduler DRAM directory 归还该请求的 physical block ids；worker 收到
+   `finished_req_ids` 后清除 stable row 镜像；
 4. 该 resident row 下次 `acquire()` 时只做一次所有层整行清理；
 5. scheduler/core 同时释放所有 HBM group manager 和请求 cache-layout state。
 
@@ -951,7 +1016,7 @@ condense/reorder 时必须保留该请求的 resident/DRAM 所有权。
 - graph 使用固定地址 view，不在 replay 前替换 owner；
 - request-id 映射只在 InputBatch 结构变化时做，steady 行序批量刷新。
 
-当前仍有两个已知成本：
+当前仍有三个已知成本：
 
 1. scheduler 需要在 `super().schedule()` 返回后对最终 scheduled requests
    做一次 O(B) projection。vLLM v0.23 没有逐请求输出扩展钩子；为了消掉
@@ -960,6 +1025,10 @@ condense/reorder 时必须保留该请求的 resident/DRAM 所有权。
    A5 融合 LIDU 已通过 `weight_stride` 直接读取该 view，不再逐层执行
    `weights.contiguous()`；A3 路径继续沿用社区算子的既有布局合同。后续改动
    必须保留这一零临时拷贝性质。
+3. 完整 bundle 使 full Indexer 层在 full-block dump 时增加一个或两个
+   byte-plane copy kernel；graph 空转 step 也会保留这些节点。首版优先保证
+   目录与 payload 语义完整，上板后必须单独比较无 dump steady step 和
+   128-token 边界 step，再决定是否把同层 MLA/Indexer copy 融成单算子。
 
 ## 16. 代码索引
 
@@ -968,8 +1037,8 @@ condense/reorder 时必须保留该请求的 resident/DRAM 所有权。
 | `dsa_offload/config.py` | 类型化配置、算子 ABI 和支持矩阵校验 |
 | `dsa_offload/contracts.py` | 框架与四个算子共享的静态常量 |
 | `dsa_offload/model_support.py` | 模型能力判断 |
-| `dsa_offload/kv_cache.py` | spec、group、容量、绑定顺序和报告 |
-| `dsa_offload/kv_cache_coordinator.py` | 多物理 pool 所有权和请求块表 |
+| `dsa_offload/kv_cache.py` | spec、HBM group、DRAM 容量合同、绑定顺序和报告 |
+| `dsa_offload/kv_cache_coordinator.py` | HBM 多物理 pool 与 scheduler DRAM directory |
 | `dsa_offload/kv_cache_manager.py` | 阶段感知的实际 block 分配 |
 | `dsa_offload/request_cache_layout.py` | 请求 cache 布局 plan/commit |
 | `dsa_offload/scheduler.py` | 薄 phase barrier 与输出后释放 |
@@ -977,7 +1046,8 @@ condense/reorder 时必须保留该请求的 resident/DRAM 所有权。
 | `dsa_offload/input_batch.py` | worker 固定容量行状态与 ENTER 整表覆盖 |
 | `dsa_offload/graph_gate.py` | 原生 FULL decode graph 的纯准入策略 |
 | `dsa_offload/resident_pool.py` | stable pool row 与逐层 LIDU `cache_slots` |
-| `dsa_offload/dram_store.py` | 固定 DRAM arena、逻辑 block ledger 与批量释放 |
+| `dsa_offload/scheduler_dram_pool.py` | 单机容量计划与 scheduler physical-id 目录 |
+| `dsa_offload/worker_dram_store.py` | 固定 payload arena 与 worker 逻辑表镜像 |
 | `dsa_offload/runtime.py` | eager/graph 共用 metadata owner 与逐层上下文 |
 | `dsa_offload/ops.py` | LIDU、KSC、SFA-Offload、full-block dump tensor ABI |
 | `core/kv_cache_interface.py` | DSA spec/manager registry 注册 |
@@ -1017,6 +1087,12 @@ condense/reorder 时必须保留该请求的 resident/DRAM 所有权。
   8K/5K/70K/40K 的 bsz=4 混合长度。
 
 这些结果证明当前核心控制面、eager 和 graph 主路径可运行。尚需补齐：
+
+- 本轮 scheduler-owned complete DRAM pool 的新增 UT、A3/A5 byte-plane
+  dump 编译与上板用例；
+- 启动日志中 `DSA DRAM CAPACITY REPORT` 的目标容量、自动缩容、1x 最低
+  Indexer mirror 和各 TP worker arena 创建一致性；
+- 完整 Indexer+MLA dump 后的 eager/FULL graph 精度与 128-token 边界性能；
 
 - QA 数据集 disabled/eager/graph 精度对照；
 - bsz=1 与 bsz>1、全 DENSE、全 SPARSE、ENTER mixed；

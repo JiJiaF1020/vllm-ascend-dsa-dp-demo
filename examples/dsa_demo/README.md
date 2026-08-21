@@ -33,14 +33,17 @@ A5 packed C8 物理布局另外复用 vLLM-Ascend 原生的
 不暴露 DSA 不支持的半开组合。该开关在 `disabled` 模式下也会保留，以便
 使用相同 packed C8 cache 编码公平对照原生路径与 DSA 路径。
 
-首次拉起应看到且只看到一份：
+首次拉起应分别看到且只看到一份：
 
 ```text
 ================ DSA HBM CACHE CAPACITY REPORT ================
+================ DSA DRAM CAPACITY REPORT ====================
 ```
 
 报告中的 Indexer blocks 应等于 resident MLA base blocks 乘
-`indexer_mla_block_ratio`。
+`indexer_mla_block_ratio`。DRAM 的 selected usable blocks 必须不少于
+HBM Indexer blocks；若主机内存不足配置倍数但仍满足 1x 完整 mirror，日志会
+明确显示 downsized 和实际倍数，任一 worker arena 创建失败则启动失败。
 
 ## 2. 快速冒烟
 
@@ -73,7 +76,8 @@ python examples/dsa_demo/simple_prompt_test.py
 
 - `disabled`：不传 `dsa_sparse_config`；A5 C8 开关可独立保留，用于验证 DSA
   修改未影响相同 cache 编码下的原生路径；
-- `cache-init`：只构造 `LLM`，验证 Indexer/resident MLA 双平面初始化；
+- `cache-init`：只构造 `LLM`，验证 HBM 双平面、scheduler DRAM 容量合同和
+  各 worker 完整 Indexer+MLA arena 初始化；
 - `eager`：执行 DSA LIDU/KSC/SFA-Offload 和满块 dump；
 - `graph`：执行 `VLLM_COMPILE + FULL_DECODE_ONLY`。
 
@@ -303,7 +307,7 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
 
 在线冒烟至少核对：
 
-- 启动日志中 DSA HBM 容量报告只出现一次；
+- 启动日志中 DSA HBM/DRAM 两份容量报告各只出现一次；
 - `/v1/models` 返回 `glm-5.1-dsa`；
 - SSE/客户端内容逐步输出，而非等待完整回答后一次性打印；
 - 同一短请求在在线 eager 与离线 eager 下无明显语义差异；

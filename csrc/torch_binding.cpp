@@ -39,6 +39,7 @@
 #include "gmm/grouped_matmul_swiglu_quant_weight_nz_tensor_list/grouped_matmul_swiglu_quant_torch_adpt.h"
 #include "gmm/grouped_matmul_swiglu_quant_v2/grouped_matmul_swiglu_quant_v2_torch_adpt.h"
 #include "attention/kv_cache_full_block_dump/kv_cache_full_block_dump_torch_adpt.h"
+#include "attention/kv_cache_full_block_dump_bytes/kv_cache_full_block_dump_bytes_torch_adpt.h"
 #include "attention/kv_cache_full_block_dump_c8/kv_cache_full_block_dump_c8_torch_adpt.h"
 #include "attention/kvcache_scatter_copy/kvcache_scatter_copy_torch_adpt.h"
 #include "attention/lightning_indexer/lightning_indexer_torch_adpt.h"
@@ -2482,6 +2483,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.impl("kv_cache_full_block_dump_c8",
              torch::kPrivateUse1,
              &vllm_ascend::npu_kv_cache_full_block_dump_c8);
+
+    ops.def(
+        "kv_cache_full_block_dump_bytes(Tensor src_cache, "
+        "Tensor(a!) dst_cache, Tensor src_block_ids, "
+        "Tensor dst_block_ids) -> ()");
+    ops.impl("kv_cache_full_block_dump_bytes",
+             torch::kPrivateUse1,
+             &vllm_ascend::npu_kv_cache_full_block_dump_bytes);
 
     ops.def(
         "npu_sparse_flash_attention_for_offload("

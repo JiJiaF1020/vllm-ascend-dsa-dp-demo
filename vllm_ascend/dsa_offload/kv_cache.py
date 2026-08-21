@@ -34,6 +34,11 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+from vllm_ascend.dsa_offload.scheduler_dram_pool import (
+    DSADRAMCapacityPlan,
+    calculate_dram_capacity_plan,
+    get_host_available_memory_bytes,
+)
 
 # 沿用 v0.19 DSA 原型的物理块数对齐。该对齐只作用于自动计算出来的
 # base block 数；显式 num_gpu_blocks_override 仍由 vLLM 的标准入口接管。
@@ -107,6 +112,13 @@ class DSAKVCacheGroupIds:
     indexer: int
     resident_mla: int
     mtp_full: int | None = None
+
+
+@dataclass
+class DSAKVCacheConfig(KVCacheConfig):
+    """携带 scheduler 统一 DRAM 容量合同的 DSA KV-cache 配置。"""
+
+    dram_capacity: DSADRAMCapacityPlan | None = None
 
 
 def is_dsa_indexer_spec(spec: KVCacheSpec) -> bool:
@@ -343,7 +355,7 @@ def build_dsa_kv_cache_config(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
     available_memory: int,
-) -> KVCacheConfig:
+) -> DSAKVCacheConfig:
     """为 worker 构造 ratio 解耦的最终物理 tensor 布局。"""
 
     bytes_per_base_block = dsa_pool_bytes_per_base_block(kv_cache_groups)
@@ -373,7 +385,7 @@ def build_dsa_kv_cache_config(
                 )
             )
 
-    config = KVCacheConfig(
+    config = DSAKVCacheConfig(
         # vLLM v0.23 仍保留一个标量 num_blocks。DSA 将它定义为 MLA
         # base capacity；Indexer 的 ratio 容量只由最终 tensor size 表达。
         num_blocks=num_base_blocks,
@@ -382,6 +394,179 @@ def build_dsa_kv_cache_config(
     )
     validate_dsa_kv_cache_config(config)
     return config
+
+
+def dsa_dram_bytes_per_logical_block(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> int:
+    """返回 target dense Indexer+MLA 一个完整语义块的每-rank 字节数。"""
+
+    target_groups = [
+        group
+        for group in kv_cache_groups
+        if (
+            is_dsa_indexer_spec(group.kv_cache_spec)
+            or is_dsa_resident_mla_spec(group.kv_cache_spec)
+        )
+    ]
+    indexer_groups = [
+        group
+        for group in target_groups
+        if is_dsa_indexer_spec(group.kv_cache_spec)
+    ]
+    resident_groups = [
+        group
+        for group in target_groups
+        if is_dsa_resident_mla_spec(group.kv_cache_spec)
+    ]
+    if len(indexer_groups) != 1 or len(resident_groups) != 1:
+        raise RuntimeError(
+            "DSA DRAM sizing requires exactly one target Indexer group and "
+            "one target resident MLA group"
+        )
+    indexer_block_size = int(indexer_groups[0].kv_cache_spec.block_size)
+    resident_block_size = int(resident_groups[0].kv_cache_spec.block_size)
+    if indexer_block_size != resident_block_size:
+        raise RuntimeError(
+            "DSA complete DRAM blocks require matching target Indexer/MLA "
+            "block sizes: "
+            f"indexer={indexer_block_size}, resident={resident_block_size}"
+        )
+    total = sum(
+        int(group.kv_cache_spec.page_size_bytes)
+        * len(group.layer_names)
+        for group in target_groups
+    )
+    if total <= 0:
+        raise RuntimeError("DSA complete DRAM block contains no target payload")
+    return total
+
+
+def finalize_dsa_dram_capacity(
+    vllm_config: VllmConfig,
+    kv_cache_configs: list[KVCacheConfig],
+    *,
+    host_available_bytes: int | None = None,
+) -> DSADRAMCapacityPlan | None:
+    """在 EngineCore/scheduler 进程中为所有本机 TP worker 固化同一计划。"""
+
+    dsa_configs = [
+        config
+        for config in kv_cache_configs
+        if has_dsa_split_kv_cache_groups(config.kv_cache_groups)
+    ]
+    if not dsa_configs:
+        return None
+    if len(dsa_configs) != len(kv_cache_configs):
+        raise RuntimeError(
+            "DSA KV-cache layout cannot be mixed with non-DSA workers in "
+            "one executor"
+        )
+    if not all(isinstance(config, DSAKVCacheConfig) for config in dsa_configs):
+        raise RuntimeError(
+            "DSA KV-cache configs lost their typed DRAM capacity field"
+        )
+
+    tp_size = int(vllm_config.parallel_config.tensor_parallel_size)
+    if len(dsa_configs) != tp_size:
+        raise RuntimeError(
+            "Initial DSA scheduler-owned DRAM planning requires one local "
+            "worker per TP rank: "
+            f"worker_configs={len(dsa_configs)}, tp_size={tp_size}"
+        )
+
+    bundle_sizes = {
+        dsa_dram_bytes_per_logical_block(config.kv_cache_groups)
+        for config in dsa_configs
+    }
+    if len(bundle_sizes) != 1:
+        raise RuntimeError(
+            "DSA TP workers have different complete DRAM block sizes: "
+            f"sizes={sorted(bundle_sizes)}"
+        )
+    indexer_block_counts: set[int] = set()
+    for config in dsa_configs:
+        group_ids = get_dsa_kv_cache_group_ids(config)
+        indexer_block_counts.add(
+            get_dsa_group_num_blocks(
+                config,
+                config.kv_cache_groups[group_ids.indexer],
+            )
+        )
+    if len(indexer_block_counts) != 1:
+        raise RuntimeError(
+            "DSA TP workers have different HBM Indexer capacities: "
+            f"blocks={sorted(indexer_block_counts)}"
+        )
+
+    from vllm_ascend.ascend_config import get_ascend_config
+
+    observed_available = (
+        get_host_available_memory_bytes()
+        if host_available_bytes is None
+        else int(host_available_bytes)
+    )
+    plan = calculate_dram_capacity_plan(
+        indexer_num_blocks=indexer_block_counts.pop(),
+        block_multiple=(
+            get_ascend_config().dsa_offload_config.hot_cpu_block_multiple
+        ),
+        bytes_per_logical_block=bundle_sizes.pop(),
+        tensor_parallel_size=tp_size,
+        host_available_bytes=observed_available,
+    )
+    for config in dsa_configs:
+        assert isinstance(config, DSAKVCacheConfig)
+        config.dram_capacity = plan
+
+    if plan.was_downsized:
+        logger.warning_once(
+            "DSA host DRAM cannot satisfy hot_cpu_block_multiple; using "
+            "the largest complete Indexer+MLA pool that fits: "
+            "desired_blocks=%d, selected_blocks=%d, effective_multiple=%.3f",
+            plan.desired_usable_blocks,
+            plan.usable_blocks,
+            plan.effective_block_multiple,
+        )
+    elif plan.desired_usable_blocks < plan.minimum_usable_blocks:
+        logger.warning_once(
+            "DSA hot_cpu_block_multiple requested less than one complete "
+            "HBM Indexer mirror; clamping DRAM usable blocks from %d to %d",
+            plan.desired_usable_blocks,
+            plan.usable_blocks,
+        )
+
+    logger.info_once(
+        "\n"
+        "================ DSA DRAM CAPACITY REPORT ====================\n"
+        "  Host available bytes      : %s bytes (%s GiB)\n"
+        "  Local TP workers          : %s\n"
+        "  Per-rank available bytes  : %s bytes (%s GiB)\n"
+        "  Complete block payload    : %s bytes (target Indexer + MLA)\n"
+        "  Minimum usable blocks     : %s (per-rank HBM Indexer mirror)\n"
+        "  Desired usable blocks     : %s\n"
+        "  Selected usable blocks    : %s (effective multiple %.3fx)\n"
+        "  Per-rank reserved bytes   : %s bytes (%s GiB, includes block 0)\n"
+        "  Total planned host bytes  : %s bytes (%s GiB)\n"
+        "  Capacity downsized        : %s\n"
+        "=================================================================",
+        f"{plan.host_available_bytes:,}",
+        format_gib(plan.host_available_bytes),
+        f"{plan.tensor_parallel_size:,}",
+        f"{plan.per_rank_available_bytes:,}",
+        format_gib(plan.per_rank_available_bytes),
+        f"{plan.bytes_per_logical_block:,}",
+        f"{plan.minimum_usable_blocks:,}",
+        f"{plan.desired_usable_blocks:,}",
+        f"{plan.usable_blocks:,}",
+        plan.effective_block_multiple,
+        f"{plan.per_rank_reserved_bytes:,}",
+        format_gib(plan.per_rank_reserved_bytes),
+        f"{plan.total_reserved_bytes:,}",
+        format_gib(plan.total_reserved_bytes),
+        plan.was_downsized,
+    )
+    return plan
 
 
 def dsa_max_memory_usage_bytes(

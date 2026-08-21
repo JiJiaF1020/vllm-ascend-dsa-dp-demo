@@ -8,7 +8,7 @@ import pytest
 import torch
 
 import vllm_ascend.dsa_offload.runtime as runtime_module
-from vllm_ascend.dsa_offload.dram_store import DSAHotDRAMStore
+from vllm_ascend.dsa_offload.worker_dram_store import DSAWorkerDRAMStore
 from vllm_ascend.dsa_offload.input_batch import DSAInputBatchCacheLayout
 from vllm_ascend.dsa_offload.request_cache_layout import (
     DSARequestCacheStage,
@@ -43,7 +43,7 @@ def _make_runtime(
 ) -> tuple[
     DSAResidentTokenPool,
     DSAOffloadRuntime,
-    DSAHotDRAMStore,
+    DSAWorkerDRAMStore,
 ]:
     resident_pool = DSAResidentTokenPool(
         max_num_reqs=max_num_reqs,
@@ -64,7 +64,7 @@ def _make_runtime(
         packed_c8=packed_c8,
         max_decode_query_len=max_decode_query_len,
     )
-    store = DSAHotDRAMStore(
+    store = DSAWorkerDRAMStore(
         usable_blocks=8,
         storage_rows=resident_pool.storage_rows,
         max_logical_blocks=runtime.max_logical_blocks,
@@ -104,7 +104,7 @@ def test_shared_topology_allocates_only_full_selection_states() -> None:
         resident_pool.get_cache_slots(1)
 
 
-def _register_layer_arenas(store: DSAHotDRAMStore, num_layers: int = 2) -> None:
+def _register_layer_arenas(store: DSAWorkerDRAMStore, num_layers: int = 2) -> None:
     for layer_id in range(num_layers):
         store.add_layer(
             layer_id=layer_id,
@@ -647,7 +647,11 @@ def test_dump_plan_is_compact_and_idempotent() -> None:
         req_ids=["req-0"],
         req_id_to_index={"req-0": 0},
         num_computed_tokens_cpu=np.array([0], dtype=np.int32),
-        block_table=[_ResidentBlockTable()],
+        block_table=[_ResidentBlockTable(), _ResidentBlockTable()],
+    )
+    input_batch.block_table[1]._rows = np.array(
+        [[40, 41, 42, 0]],
+        dtype=np.int32,
     )
     state.refresh(
         input_batch=input_batch,
@@ -663,6 +667,11 @@ def test_dump_plan_is_compact_and_idempotent() -> None:
     positions = torch.arange(257, dtype=torch.int64)
     req_indices = torch.zeros(257, dtype=torch.int64)
     scheduled = np.array([257], dtype=np.int32)
+    store.apply_assignment(
+        pool_index=0,
+        logical_block_start=0,
+        physical_block_ids=(1, 2, 3),
+    )
 
     returned_positions = runtime.prepare_forward(
         input_batch=input_batch,
@@ -673,12 +682,14 @@ def test_dump_plan_is_compact_and_idempotent() -> None:
         num_reqs=1,
         num_tokens=257,
         resident_group_id=0,
+        indexer_group_id=1,
         decode_forward=False,
     )
 
     assert returned_positions.data_ptr() == positions.data_ptr()
     assert runtime.dump_job_count == 2
     assert runtime.dump_src_block_ids.np[:2].tolist() == [10, 11]
+    assert runtime.dump_indexer_src_block_ids.np[:2].tolist() == [40, 41]
     assert store.logical_block_table[0, :2].tolist() != [0, 0]
 
     runtime.prepare_forward(
@@ -690,6 +701,7 @@ def test_dump_plan_is_compact_and_idempotent() -> None:
         num_reqs=1,
         num_tokens=257,
         resident_group_id=0,
+        indexer_group_id=1,
         decode_forward=False,
     )
     assert runtime.dump_job_count == 0
@@ -728,11 +740,11 @@ def test_mtp_double_tail_crosses_boundary_and_dumps_on_next_outer_step() -> None
         dtype=np.int32,
     )
     input_batch.block_table[0].num_blocks_per_row[0] = 4
-    reservation = store.reserve_blocks(
-        pool_indices=np.array([0, 0], dtype=np.intp),
-        logical_block_indices=np.array([0, 1], dtype=np.intp),
+    store.apply_assignment(
+        pool_index=0,
+        logical_block_start=0,
+        physical_block_ids=(1, 2),
     )
-    assert reservation.new_mask.tolist() == [True, True]
     store.commit_durable_full_block_counts(
         pool_indices=np.array([0], dtype=np.intp),
         full_block_counts=np.array([2], dtype=np.int32),
@@ -747,14 +759,21 @@ def test_mtp_double_tail_crosses_boundary_and_dumps_on_next_outer_step() -> None
         num_reqs=1,
         num_tokens=4,
         resident_group_id=0,
+        indexer_group_id=0,
         decode_forward=True,
     )
     assert resident_positions.tolist() == [381, 382, 383, 384]
     assert runtime.dump_job_count == 0
 
     # Acceptance advances the durable prefix to logical block 2. The next
-    # outer step persists parity-0 tail block 12 before any new KV write.
+    # outer step first receives the newly durable scheduler assignment, then
+    # persists parity-0 tail block 12 before any new KV write.
     input_batch.num_computed_tokens_cpu[0] = 384
+    store.apply_assignment(
+        pool_index=0,
+        logical_block_start=2,
+        physical_block_ids=(3,),
+    )
     runtime.prepare_forward(
         input_batch=input_batch,
         state=state,
@@ -764,6 +783,7 @@ def test_mtp_double_tail_crosses_boundary_and_dumps_on_next_outer_step() -> None
         num_reqs=1,
         num_tokens=4,
         resident_group_id=0,
+        indexer_group_id=0,
         decode_forward=True,
     )
     assert runtime.dump_before_cache_write
@@ -798,6 +818,11 @@ def test_consecutive_prefill_chunks_dump_only_newly_completed_blocks() -> None:
             resident_block_table_replacements=(),
         ),
     )
+    store.apply_assignment(
+        pool_index=0,
+        logical_block_start=0,
+        physical_block_ids=(1, 2, 3, 4),
+    )
 
     runtime.prepare_forward(
         input_batch=input_batch,
@@ -808,6 +833,7 @@ def test_consecutive_prefill_chunks_dump_only_newly_completed_blocks() -> None:
         num_reqs=1,
         num_tokens=257,
         resident_group_id=0,
+        indexer_group_id=0,
         decode_forward=False,
     )
     assert runtime.dump_job_count == 2
@@ -823,6 +849,7 @@ def test_consecutive_prefill_chunks_dump_only_newly_completed_blocks() -> None:
         num_reqs=1,
         num_tokens=128,
         resident_group_id=0,
+        indexer_group_id=0,
         decode_forward=False,
     )
 
@@ -877,6 +904,7 @@ def test_enter_rejects_missing_dram_source_blocks() -> None:
             num_reqs=1,
             num_tokens=1,
             resident_group_id=0,
+            indexer_group_id=0,
             decode_forward=True,
         )
     except RuntimeError as error:
@@ -954,6 +982,55 @@ def test_layer_claims_one_prewrite_dump_per_outer_forward() -> None:
     )
 
 
+def test_full_indexer_layer_dumps_mla_and_indexer_to_one_logical_id(
+    monkeypatch,
+) -> None:
+    _, runtime, store = _make_runtime(
+        resident_layer_count=1,
+        selection_state_count=1,
+    )
+    resident_nope = torch.zeros((2, 4, 8), dtype=torch.bfloat16)
+    resident_rope = torch.zeros((2, 4, 2), dtype=torch.bfloat16)
+    indexer = torch.zeros((2, 4, 16), dtype=torch.bfloat16)
+    store.add_layer(
+        layer_id=0,
+        resident_nope_cache=resident_nope,
+        resident_rope_cache=resident_rope,
+        indexer_cache=indexer,
+    )
+    context = DSALayerOffloadContext(
+        layer_id=0,
+        indexer_cache=indexer,
+        runtime=runtime,
+        selection_state_id=0,
+        selection_source_layer_id=None,
+    )
+    runtime.dump_launch_count = 1
+    runtime.dump_before_cache_write = False
+    runtime._forward_epoch = 3
+    runtime.dump_src_block_ids.gpu[0] = 1
+    runtime.dump_indexer_src_block_ids.gpu[0] = 0
+    runtime.dump_dst_block_ids.gpu[0] = 7
+    calls: list[str] = []
+    monkeypatch.setattr(
+        runtime_module,
+        "dump_full_kv_cache_blocks",
+        lambda **kwargs: calls.append("mla"),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "dump_full_cache_plane_bytes",
+        lambda **kwargs: calls.append("indexer"),
+    )
+
+    context.dump_full_blocks(
+        resident_cache=(resident_nope, resident_rope),
+        before_cache_write=False,
+    )
+
+    assert calls == ["mla", "indexer"]
+
+
 def test_graph_capture_runtime_can_be_reused_for_multiple_sizes() -> None:
     _, runtime, _ = _make_runtime(max_num_reqs=4)
 
@@ -965,6 +1042,7 @@ def test_graph_capture_runtime_can_be_reused_for_multiple_sizes() -> None:
         assert runtime.execution_num_reqs == row_count
         assert runtime.dump_launch_count == row_count
         assert runtime.active_dram_block_table.gpu[:row_count].eq(0).all()
+        assert runtime.dump_indexer_src_block_ids.gpu[:row_count].eq(0).all()
         assert runtime.dump_dst_block_ids.gpu[:row_count].eq(-1).all()
 
         runtime.restore_after_graph_capture()

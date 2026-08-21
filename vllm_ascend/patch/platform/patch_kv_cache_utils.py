@@ -31,6 +31,7 @@ from vllm_ascend.dsa_offload.kv_cache import (
     build_dsa_kv_cache_groups,
     dsa_max_memory_usage_bytes,
     dsa_pool_bytes_per_base_block,
+    finalize_dsa_dram_capacity,
     has_dsa_split_kv_cache_groups,
     has_dsa_split_kv_cache_specs,
     report_dsa_kv_cache_config,
@@ -121,6 +122,7 @@ _orig_get_kv_cache_config_from_groups = vllm.v1.core.kv_cache_utils.get_kv_cache
 _orig_pool_bytes_per_block = vllm.v1.core.kv_cache_utils._pool_bytes_per_block
 _orig_max_memory_usage_bytes_from_groups = vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups
 _orig_report_kv_cache_config = vllm.v1.core.kv_cache_utils._report_kv_cache_config
+_orig_get_kv_cache_configs = vllm.v1.core.kv_cache_utils.get_kv_cache_configs
 
 
 def _ascend_resolve_kv_cache_block_sizes(
@@ -395,6 +397,22 @@ def _ascend_get_kv_cache_config_from_groups(
     )
 
 
+def _ascend_get_kv_cache_configs(
+    vllm_config: VllmConfig,
+    kv_cache_specs: list[dict[str, KVCacheSpec]],
+    available_memory: list[int],
+) -> list[KVCacheConfig]:
+    """沿用基线 HBM 规划，再由 EngineCore 一次固化单机 DRAM 合同。"""
+
+    configs = _orig_get_kv_cache_configs(
+        vllm_config,
+        kv_cache_specs,
+        available_memory,
+    )
+    finalize_dsa_dram_capacity(vllm_config, configs)
+    return configs
+
+
 def _ascend_pool_bytes_per_block(
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> int:
@@ -430,6 +448,7 @@ vllm.v1.core.kv_cache_utils.group_and_unify_kv_cache_specs = group_and_unify_kv_
 vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_groups = _get_kv_cache_groups_uniform_groups
 vllm.v1.core.kv_cache_utils.get_kv_cache_groups = _ascend_get_kv_cache_groups
 vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups = _ascend_get_kv_cache_config_from_groups
+vllm.v1.core.kv_cache_utils.get_kv_cache_configs = _ascend_get_kv_cache_configs
 vllm.v1.core.kv_cache_utils._pool_bytes_per_block = _ascend_pool_bytes_per_block
 vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups = _ascend_max_memory_usage_bytes_from_groups
 vllm.v1.core.kv_cache_utils._report_kv_cache_config = _ascend_report_kv_cache_config
@@ -445,3 +464,4 @@ else:
 import vllm.v1.engine.core  # noqa: E402
 
 vllm.v1.engine.core.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
+vllm.v1.engine.core.get_kv_cache_configs = _ascend_get_kv_cache_configs

@@ -109,6 +109,15 @@ class _TopManager:
         return blocks
 
 
+class _DRAMDirectory:
+    def __init__(self) -> None:
+        self.freed_request_ids: list[str] = []
+
+    def free_request(self, request_id: str) -> tuple[int, ...]:
+        self.freed_request_ids.append(request_id)
+        return ()
+
+
 @dataclass
 class _Request:
     request_id: str
@@ -155,6 +164,7 @@ def _make_manager(
     coordinator.mtp_full_manager = mtp_full_manager
     coordinator.single_type_managers = tuple(managers)
     coordinator.physical_block_pools = tuple(pools)
+    coordinator.dram_directory = _DRAMDirectory()
     coordinator.request_cache_layout = DSARequestCachePlanner(
         block_size=128,
         sparse_activation_tokens=2048,
@@ -452,3 +462,4 @@ def test_free_clears_all_physical_planes_and_request_cache_state() -> None:
     assert coordinator.mtp_full_manager is not None
     assert "req" not in coordinator.mtp_full_manager.req_to_blocks
     assert coordinator.request_cache_layout.get_state("req") is None
+    assert coordinator.dram_directory.freed_request_ids == ["req"]

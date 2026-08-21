@@ -196,20 +196,18 @@ else:
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSlidingWindowMLASpec
-from vllm_ascend.dsa_offload.dram_store import (
-    DSAHotDRAMStore,
-    calculate_dram_usable_blocks,
-)
 from vllm_ascend.dsa_offload.graph_gate import (
     DSARowModeGraphDecision,
     evaluate_dsa_row_mode_decode_graph,
 )
 from vllm_ascend.dsa_offload.input_batch import (
     apply_dsa_cache_layout_projection,
+    apply_dsa_dram_assignments,
     normalize_dsa_enter_updates_before_base,
 )
 from vllm_ascend.dsa_offload.kv_cache import (
     DSAIndexerKVSpec,
+    DSAKVCacheConfig,
     DSAKVCacheGroupIds,
     DSAResidentMLAAttentionSpec,
     get_dsa_group_num_blocks,
@@ -225,6 +223,9 @@ from vllm_ascend.dsa_offload.runtime import (
 )
 from vllm_ascend.dsa_offload.scheduler_output import (
     DSAOffloadSchedulerOutput,
+)
+from vllm_ascend.dsa_offload.worker_dram_store import (
+    DSAWorkerDRAMStore,
 )
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
@@ -446,7 +447,7 @@ class NPUModelRunner(GPUModelRunner):
             if self.dsa_resident_token_pool is not None
             else None
         )
-        self.dsa_hot_dram_store: DSAHotDRAMStore | None = None
+        self.dsa_worker_dram_store: DSAWorkerDRAMStore | None = None
         self._dsa_decode_forward = False
         set_weight_prefetch_method(self.ascend_config.weight_prefetch_config)
 
@@ -1001,7 +1002,7 @@ class NPUModelRunner(GPUModelRunner):
                 raise RuntimeError(
                     "DSA is enabled but NPUInputBatch has no cache-layout owner"
                 )
-            # resident pool/DRAM ledger 属于请求生命周期，不能跟随基线
+            # resident pool/DRAM worker 镜像属于请求生命周期，不能跟随基线
             # persistent InputBatch 对“本轮未调度行”的临时移除而释放。
             # 必须在 super() 消费 finished_req_ids 前显式回收。
             for req_id in scheduler_output.finished_req_ids:
@@ -1081,6 +1082,19 @@ class NPUModelRunner(GPUModelRunner):
             projection=projection,
             resident_group_id=group_ids.resident_mla,
         )
+        if projection.dram_block_assignments:
+            store = self.dsa_worker_dram_store
+            if store is None:
+                raise RuntimeError(
+                    "DSA worker DRAM store is not initialized"
+                )
+            # resident pool 行在上面的统一 InputBatch refresh 中完成 acquire。
+            # assignment 只携带新增长度的后缀，steady decode 通常为空。
+            apply_dsa_dram_assignments(
+                state=state,
+                projection=projection,
+                store=store,
+            )
 
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
@@ -1647,6 +1661,7 @@ class NPUModelRunner(GPUModelRunner):
                 num_reqs=num_reqs,
                 num_tokens=total_num_scheduled_tokens,
                 resident_group_id=group_ids.resident_mla,
+                indexer_group_id=group_ids.indexer,
                 decode_forward=self._dsa_decode_forward,
             )
 
@@ -4815,14 +4830,29 @@ class NPUModelRunner(GPUModelRunner):
             kv_cache_config,
             indexer_group,
         )
-        store = DSAHotDRAMStore(
-            usable_blocks=calculate_dram_usable_blocks(
-                indexer_num_blocks,
-                self.ascend_config.dsa_offload_config.hot_cpu_block_multiple,
-            ),
+        if (
+            not isinstance(kv_cache_config, DSAKVCacheConfig)
+            or kv_cache_config.dram_capacity is None
+        ):
+            raise RuntimeError(
+                "DSA worker requires the scheduler-finalized DRAM capacity "
+                "plan"
+            )
+        dram_capacity = kv_cache_config.dram_capacity
+        if dram_capacity.minimum_usable_blocks != indexer_num_blocks:
+            raise RuntimeError(
+                "DSA worker DRAM minimum disagrees with its HBM Indexer "
+                f"capacity: dram={dram_capacity.minimum_usable_blocks}, "
+                f"indexer={indexer_num_blocks}"
+            )
+        store = DSAWorkerDRAMStore(
+            usable_blocks=dram_capacity.usable_blocks,
             storage_rows=resident_pool.storage_rows,
             max_logical_blocks=runtime.max_logical_blocks,
             device=self.device,
+            expected_bytes_per_logical_block=(
+                dram_capacity.bytes_per_logical_block
+            ),
         )
 
         ordered_layer_indices = sorted(resident_names)
@@ -4953,12 +4983,14 @@ class NPUModelRunner(GPUModelRunner):
                 store.add_packed_layer(
                     layer_id=runtime_layer_id,
                     resident_packed_cache=resident_cache[0],
+                    indexer_cache=indexer_cache,
                 )
             else:
                 store.add_layer(
                     layer_id=runtime_layer_id,
                     resident_nope_cache=resident_cache[0],
                     resident_rope_cache=resident_cache[1],
+                    indexer_cache=indexer_cache,
                 )
             resident_impl.bind_dsa_offload_context(
                 DSALayerOffloadContext(
@@ -4978,11 +5010,13 @@ class NPUModelRunner(GPUModelRunner):
                 f"capacity={resident_pool.num_layers}"
             )
 
+        store.finalize_payload_layout()
+
         runtime.bind_dram_store(store)
         cache_layout.set_pool_release_callback(
             runtime.release_pool_index
         )
-        self.dsa_hot_dram_store = store
+        self.dsa_worker_dram_store = store
 
     def _get_layer_kv_cache_specs(self, kv_cache_config: KVCacheConfig) -> dict[str, KVCacheSpec]:
         layer_kv_cache_spec: dict[str, KVCacheSpec] = {}

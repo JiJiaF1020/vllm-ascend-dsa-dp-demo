@@ -130,6 +130,86 @@ def test_packed_c8_full_block_dump_writes_only_active_rows() -> None:
     assert torch.count_nonzero(actual[:2]).item() == 0
 
 
+def test_complete_indexer_byte_plane_dump_preserves_fp32_scale_bits() -> None:
+    scale = torch.arange(
+        2 * _BLOCK_SIZE,
+        dtype=torch.float32,
+        device="npu",
+    ).view(2, _BLOCK_SIZE, 1, 1)
+    source_bytes = scale.view(torch.int8).reshape(2, -1)
+    destination = _swapped_arena((3, int(source_bytes.shape[1])))
+    destination.zero_()
+    src_block_ids = torch.tensor([1], dtype=torch.int32, device="npu")
+    dst_block_ids = torch.tensor([2], dtype=torch.int32, device="npu")
+
+    torch.ops._C_ascend.kv_cache_full_block_dump_bytes(
+        source_bytes,
+        destination,
+        src_block_ids,
+        dst_block_ids,
+    )
+    torch.npu.synchronize()
+
+    actual = _read_swapped_arena(destination)
+    assert torch.equal(actual[2], source_bytes[1].cpu())
+    assert torch.count_nonzero(actual[:2]).item() == 0
+
+
+def test_complete_indexer_byte_plane_dump_replays_fixed_metadata() -> None:
+    key = torch.randn(
+        (2, _BLOCK_SIZE, 1, 128),
+        dtype=torch.bfloat16,
+        device="npu",
+    ).to(torch.float8_e4m3fn)
+    source_bytes = key.view(torch.int8).reshape(2, -1)
+    destination = _swapped_arena((3, int(source_bytes.shape[1])))
+    destination.zero_()
+    src_block_ids = torch.tensor([0], dtype=torch.int32, device="npu")
+    dst_block_ids = torch.tensor([1], dtype=torch.int32, device="npu")
+    stable_pointers = (
+        source_bytes.data_ptr(),
+        destination.data_ptr(),
+        src_block_ids.data_ptr(),
+        dst_block_ids.data_ptr(),
+    )
+
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph, pool=torch.npu.graph_pool_handle()):
+        torch.ops._C_ascend.kv_cache_full_block_dump_bytes(
+            source_bytes,
+            destination,
+            src_block_ids,
+            dst_block_ids,
+        )
+
+    graph.replay()
+    torch.npu.synchronize()
+    actual = _read_swapped_arena(destination)
+    assert torch.equal(actual[1], source_bytes[0].cpu())
+
+    _write_swapped_arena(destination, torch.zeros_like(actual))
+    src_block_ids.fill_(1)
+    dst_block_ids.fill_(2)
+    graph.replay()
+    torch.npu.synchronize()
+    actual = _read_swapped_arena(destination)
+    assert torch.equal(actual[2], source_bytes[1].cpu())
+
+    # 图 PAD/steady 空转只允许读取 dst=-1；非法 src 不得被解引用。
+    _write_swapped_arena(destination, torch.zeros_like(actual))
+    src_block_ids.fill_(999)
+    dst_block_ids.fill_(-1)
+    graph.replay()
+    torch.npu.synchronize()
+    assert torch.count_nonzero(_read_swapped_arena(destination)).item() == 0
+    assert stable_pointers == (
+        source_bytes.data_ptr(),
+        destination.data_ptr(),
+        src_block_ids.data_ptr(),
+        dst_block_ids.data_ptr(),
+    )
+
+
 def _make_fused_lidu_inputs(
     *,
     candidate_len: int,

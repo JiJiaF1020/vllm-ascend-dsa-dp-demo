@@ -359,6 +359,46 @@ def test_kv_cache_full_block_dump_many_blocks_swapped() -> None:
 
 
 @torch.inference_mode()
+def test_kv_cache_full_block_dump_bytes_copies_opaque_plane() -> None:
+    """Generic byte-plane dump must preserve mixed-dtype cache bit patterns."""
+
+    block_count = 3
+    bytes_per_block = 128 * 4
+    source = (
+        torch.arange(
+            block_count * bytes_per_block,
+            dtype=torch.int32,
+        )
+        .remainder(251)
+        .sub(125)
+        .to(torch.int8)
+        .view(block_count, bytes_per_block)
+        .to("npu")
+    )
+    destination = _swapped_arena(
+        (block_count + 1, bytes_per_block),
+        torch.int8,
+    )
+    destination.fill_(-1)
+    src_ids = torch.tensor([2, 0], dtype=torch.int32, device="npu")
+    dst_ids = torch.tensor([1, 3], dtype=torch.int32, device="npu")
+
+    torch.ops._C_ascend.kv_cache_full_block_dump_bytes(
+        source,
+        destination,
+        src_ids,
+        dst_ids,
+    )
+    torch.npu.synchronize()
+
+    actual = _read_swapped_arena(destination)
+    torch.testing.assert_close(actual[1], source[2].cpu())
+    torch.testing.assert_close(actual[3], source[0].cpu())
+    assert torch.all(actual[0] == -1)
+    assert torch.all(actual[2] == -1)
+
+
+@torch.inference_mode()
 def test_kv_cache_full_block_dump_bandwidth() -> None:
     """Report effective HBM-to-swapped-DRAM payload bandwidth.
 
