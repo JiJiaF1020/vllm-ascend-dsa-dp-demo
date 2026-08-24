@@ -11,6 +11,7 @@
 | `serve_dsa.sh` | 以 OpenAI 兼容在线服务拉起 DSA eager/graph |
 | `stream_chat_client.py` | 交互式多轮流式客户端 |
 | `online_long_context_dataset_test.py` | 在线长上下文数据集分桶回归 |
+| `L3_cache_sys_api_test/` | Mooncake/MemCache 独立 API、baseline L3 与后续 DSA 分层缓存测试 |
 
 当前架构和稳定 ABI 见
 [DSA 稀疏卸载详细设计](../../docs/source/developer_guide/Design_Documents/dsa_offload_design.md)。

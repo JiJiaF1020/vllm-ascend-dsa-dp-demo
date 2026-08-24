@@ -1,8 +1,9 @@
 # vLLM-Ascend DSA Sparse Offload
 
-本分支在 vLLM-Ascend v0.23.0 上实现 DSA 稀疏卸载，不修改配套的 vLLM
-源码。实现以 GLM-5.1/GLM-5.2 为首要验收模型，并保留 DeepSeek-V3.2
-兼容回归。
+本分支基于 vLLM-Ascend v0.23.0 正式版（`5cb98caa`）实现 DSA 稀疏卸载，
+不修改配套的 vLLM 源码。实现以 GLM-5.1/GLM-5.2 为首要验收模型，并保留
+DeepSeek-V3.2 兼容回归。构建合同与正式版保持一致：CANN 9.1.0、
+TorchNPU 2.10.0.post4、Triton Ascend 3.2.2。
 
 > 上游 vLLM-Ascend 项目说明原样保存在
 > [README.upstream.md](README.upstream.md) 和

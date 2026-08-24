@@ -1,7 +1,9 @@
 # DSA 稀疏卸载当前设计
 
-> - 最后更新：2026-08-21
-> - 目标基线：vLLM v0.23.0 + vLLM-Ascend v0.23.0
+> - 最后更新：2026-08-25
+> - 目标基线：vLLM v0.23.0 + vLLM-Ascend v0.23.0 正式版
+>   `5cb98caa`（CANN 9.1.0、TorchNPU 2.10.0.post4、
+>   Triton Ascend 3.2.2）
 > - 当前完成度：核心控制面、eager 和 FULL decode graph 已完成 910C 初验；
 >   chunked prefill 已完成分段 prefill/首 token 初验，完整 sparse decode
 >   验收待补；A5 packed C8 已完成 GLM-5.1 eager/graph 端到端初验；
@@ -61,6 +63,15 @@ DSA 稀疏卸载最终目标是在长上下文 decode 中实现：
 - scheduler-owned DRAM complete bundle 的 hash-ready、LRU/refcount、
   请求结束保留、最长连续命中、target 分平面 restore，以及可选 MTP
   full-HBM EAGLE 公共命中第一版；该能力尚未完成服务器端到端验收。
+
+正式版基线同时提供并由 DSA 原样继承：
+
+- MTP draft slot mapping 的固定容量补偿，覆盖 BlockTable 与 proposer buffer；
+- spawn 后 `enable_npugraph_ex`、static-kernel 等最终图配置回写；
+- AscendStore layerwise MTP 层注册与 PCP/DCP/PP/rank 隔离 GVA key；
+- MemCache lazy-init 查询保护、在线 `shm_broadcast` 槽位释放修复；
+- async accepted-token/SWA 生命周期修复。DSA 当前仍显式拒绝 async
+  scheduling，但不能绕开或覆盖这些基线补丁。
 
 当前尚未完成：
 

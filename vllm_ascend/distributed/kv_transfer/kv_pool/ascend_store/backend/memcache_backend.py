@@ -92,7 +92,11 @@ class MemcacheBackend(Backend):
             logger.error("Store initialization failed. error=%s. Check memcache setup and dependencies.", exc)
             raise
 
-        assert res == 0
+        if res != 0:
+            raise RuntimeError(
+                "Memcache store initialization failed: "
+                f"local_rank={self.local_rank}, init_bm={self._init_bm}, ret={res}"
+            )
         time.sleep(MEMCACHE_THREAD_START_WAIT_S)
         return store
 
