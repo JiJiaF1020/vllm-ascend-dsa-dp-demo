@@ -27,6 +27,12 @@ MOONCAKE_TP_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-${ASCEND_VISIBLE_DEVICE
 MOONCAKE_TP_ACTIVE_DEVICES=${MOONCAKE_TP_ACTIVE_DEVICES:-$MOONCAKE_TP_VISIBLE_DEVICES}
 MOONCAKE_TP_COMM_MODE=${MOONCAKE_TP_COMM_MODE:-global_ub_device}
 MOONCAKE_TP_MAX_ACTIVE_CHANNELS=${MOONCAKE_TP_MAX_ACTIVE_CHANNELS:-8}
+DSA_SWAPPED_COMPONENT=${DSA_SWAPPED_COMPONENT:-all}
+DSA_SWAPPED_SCHEMA_MODE=${DSA_SWAPPED_SCHEMA_MODE:-exact}
+DSA_SWAPPED_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-${ASCEND_VISIBLE_DEVICES:-$DEVICE_ID}}
+DSA_SWAPPED_MAX_ACTIVE_CHANNELS=${DSA_SWAPPED_MAX_ACTIVE_CHANNELS:-1}
+DSA_SWAPPED_MOONCAKE_COMM_MODE=${DSA_SWAPPED_MOONCAKE_COMM_MODE:-global_ub}
+DSA_SWAPPED_MEMCACHE_LOCAL_EID=${DSA_SWAPPED_MEMCACHE_LOCAL_EID:-${USE_LOCAL_EID:-}}
 
 mkdir -p "$LOG_DIR"
 
@@ -54,6 +60,8 @@ Gates:
   mooncake-gdb-engine    Capture the engine import abort under GDB.
   mooncake-npu           Run NPU multi-buffer IO only if imports are stable.
   mooncake-tp            Test TP workers' cross-segment NPU round trip.
+  dsa-swapped-mooncake   Test one exact A5 DSA block in swapped memory.
+  dsa-swapped-memcache   Run the same swapped-memory schema on MemCache.
   hixlep-config          Validate A5 per-device LocalCommRes JSON files.
   hixlep-tooling         Inspect installed LocalCommRes generation tools.
   hcomm-logs             Collect recent endpoint/channel/UB plog excerpts.
@@ -66,7 +74,10 @@ Environment overrides:
   MEMCACHE_TP_LOCAL_EID_MAP, MEMCACHE_TP_LOCAL_EID_MAP_FILE,
   MOONCAKE_LOCAL_HOST, MOONCAKE_TP_LOCAL_HOST,
   MOONCAKE_MASTER_ADDRESS, HIXLEP_CONFIG_PATH, MOONCAKE_TP_COMM_MODE,
-  MOONCAKE_TP_ACTIVE_DEVICES, MOONCAKE_TP_MAX_ACTIVE_CHANNELS
+  MOONCAKE_TP_ACTIVE_DEVICES, MOONCAKE_TP_MAX_ACTIVE_CHANNELS,
+  DSA_SWAPPED_COMPONENT, DSA_SWAPPED_SCHEMA_MODE, DSA_SWAPPED_VISIBLE_DEVICES,
+  DSA_SWAPPED_MAX_ACTIVE_CHANNELS, DSA_SWAPPED_MOONCAKE_COMM_MODE,
+  DSA_SWAPPED_MEMCACHE_LOCAL_EID
 
 Examples:
   bash run_l3_cache_api_tests.sh memcache-host
@@ -455,6 +466,45 @@ mooncake_tp() {
     return "$status"
 }
 
+dsa_swapped_mooncake() {
+    maybe_source_cann
+    local status=0
+    run_logged dsa_swapped_mooncake \
+        "$PYTHON_BIN" "$SCRIPT_DIR/test_dsa_swapped_l3_io.py" \
+        --backend mooncake \
+        --component "$DSA_SWAPPED_COMPONENT" \
+        --schema-mode "$DSA_SWAPPED_SCHEMA_MODE" \
+        --device-id "$DEVICE_ID" \
+        --visible-devices "$DSA_SWAPPED_VISIBLE_DEVICES" \
+        --local-host "$MOONCAKE_LOCAL_HOST" \
+        --mooncake-master "$MOONCAKE_MASTER_ADDRESS" \
+        --mooncake-comm-mode "$DSA_SWAPPED_MOONCAKE_COMM_MODE" \
+        --max-active-channels "$DSA_SWAPPED_MAX_ACTIVE_CHANNELS" \
+        || status=$?
+    if ((status != 0)); then
+        collect_recent_hcomm_logs dsa_swapped_mooncake
+    fi
+    return "$status"
+}
+
+dsa_swapped_memcache() {
+    memcache_aicpu_check
+    maybe_source_cann
+    local -a args=(
+        "$PYTHON_BIN" "$SCRIPT_DIR/test_dsa_swapped_l3_io.py"
+        --backend memcache
+        --component "$DSA_SWAPPED_COMPONENT"
+        --schema-mode "$DSA_SWAPPED_SCHEMA_MODE"
+        --device-id "$DEVICE_ID"
+        --visible-devices "$DSA_SWAPPED_VISIBLE_DEVICES"
+        --memcache-config "$MEMCACHE_TP_CONFIG_PATH"
+    )
+    if [[ -n $DSA_SWAPPED_MEMCACHE_LOCAL_EID ]]; then
+        args+=(--memcache-local-eid "$DSA_SWAPPED_MEMCACHE_LOCAL_EID")
+    fi
+    run_logged dsa_swapped_memcache "${args[@]}"
+}
+
 hixlep_config() {
     local visible_devices=${ASCEND_RT_VISIBLE_DEVICES:-${ASCEND_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}}
     run_logged hixlep_config \
@@ -584,6 +634,12 @@ case "$gate" in
         ;;
     mooncake-tp)
         mooncake_tp
+        ;;
+    dsa-swapped-mooncake)
+        dsa_swapped_mooncake
+        ;;
+    dsa-swapped-memcache)
+        dsa_swapped_memcache
         ;;
     hixlep-config)
         hixlep_config

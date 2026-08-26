@@ -34,7 +34,50 @@
 - [x] DSA-disabled MemCache 完整模型：3200/3287 tokens external hit，热重放
   token/logprobs 稳定且与 HBM prefix 热路径完全一致；仍保留 GLM-5.2 冷/热
   prefix 路径输出差异作为独立精度问题。
-- [ ] DSA-disabled Mooncake 完整模型冷/热两轮。
+- [x] DSA-disabled Mooncake 完整模型：TP8 `global_ub_device` 下 3200/3287
+  tokens external hit；两轮 warm replay 稳定。每轮 8 个 rank 均完成 25/25
+  keys、`failed=0`，每 rank 实际恢复 304,742,400 bytes。首次 warm load 的
+  10.7~23.8s 来自跨 segment 懒建链，连接复用后各 rank get 降至
+  17~327ms。
+
+进入 DSA 正式接入前还需要两个精确介质门禁：
+
+- [ ] 单卡真实 DSA swapped schema：42 个 Indexer plane + 78 个 MLA plane，
+  普通 HBM 先注册、swapped range 后注册，两个 component put/get 逐字节一致；
+- [ ] 用 DSA A5 真实 split schema（21 个 full Indexer key/scale plane +
+  78 个 packed MLA plane）完成 TP8 HBM put/get 逐字节往返；
+- [ ] 验证 `empty_with_swapped_memory` L2 arena 能否直接作为 Mooncake
+  `global_ub_device` put 源和 get 目标；若不能，记录错误并切换到固定 staging
+  ring 方案。
+
+当前先执行单卡 swapped gate：
+
+```bash
+cd /home/y00813308/vllm-ascend-v0.23/examples/dsa_demo/L3_cache_sys_api_test
+
+ASCEND_VISIBLE_DEVICES=0 \
+ASCEND_RT_VISIBLE_DEVICES=0 \
+DEVICE_ID=0 \
+DSA_SWAPPED_COMPONENT=all \
+DSA_SWAPPED_SCHEMA_MODE=smoke \
+bash run_l3_cache_api_tests.sh dsa-swapped-mooncake
+
+ASCEND_VISIBLE_DEVICES=0 \
+ASCEND_RT_VISIBLE_DEVICES=0 \
+DEVICE_ID=0 \
+DSA_SWAPPED_COMPONENT=all \
+DSA_SWAPPED_SCHEMA_MODE=exact \
+bash run_l3_cache_api_tests.sh dsa-swapped-mooncake
+```
+
+回传完整日志，尤其保留：schema、`register_memory` 失败位置、put/get 返回值、
+registered region 数量、digest 和最终退出码。若失败，再分别执行：
+
+```bash
+DSA_SWAPPED_SCHEMA_MODE=smoke bash run_l3_cache_api_tests.sh dsa-swapped-mooncake
+DSA_SWAPPED_COMPONENT=indexer bash run_l3_cache_api_tests.sh dsa-swapped-mooncake
+DSA_SWAPPED_COMPONENT=mla bash run_l3_cache_api_tests.sh dsa-swapped-mooncake
+```
 
 ## 0. 公共准备
 

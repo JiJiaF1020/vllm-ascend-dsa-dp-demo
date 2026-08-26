@@ -202,6 +202,7 @@ DP=1 为主；DP 扩展、完整数据集与性能验收属于下一阶段。
 ## 文档与测试入口
 
 - [DSA 稀疏卸载详细设计](docs/source/developer_guide/Design_Documents/dsa_offload_design.md)
+- [DSA L1/L2/L3 分层缓存详细设计](docs/source/developer_guide/Design_Documents/dsa_l2_l3_cache_design.md)
 - [DSA demo 与测试说明](examples/dsa_demo/README.md)
 - [上游 vLLM-Ascend README](README.upstream.md)
 

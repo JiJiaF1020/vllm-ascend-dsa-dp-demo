@@ -15,6 +15,8 @@
 
 当前架构和稳定 ABI 见
 [DSA 稀疏卸载详细设计](../../docs/source/developer_guide/Design_Documents/dsa_offload_design.md)。
+L3 接入、异步 write-behind 和 HBM 热层后续方案见
+[DSA L1/L2/L3 分层缓存详细设计](../../docs/source/developer_guide/Design_Documents/dsa_l2_l3_cache_design.md)。
 
 ## 1. 前置条件
 

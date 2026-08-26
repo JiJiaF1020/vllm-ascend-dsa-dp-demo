@@ -949,6 +949,93 @@ component 之间取公共前缀。当前接口已把 Indexer/MLA restore 分列�
 报告中的 prefix-enabled 状态和 vLLM 原生聚合 hit rate 同时保留。进入性能
 验收后应将逐请求日志降为 DEBUG、采样或移除，避免在线高 QPS 日志放大。
 
+### 12.5 Rank-local L2 与 AscendStore L3 对接计划
+
+完整接口、异步 job/reuse-fence、component schema、支持矩阵和测试门禁见
+{doc}`dsa_l2_l3_cache_design`。本节只保留总览。
+
+RoadMap 中的 scheduler-owned DRAM pool 和完整 Indexer+MLA 本地 prefix bundle
+已经落地；Mooncake `global_ub_device` 也已经通过 TP8 逐字节探针及 DSA-disabled
+完整模型 external-hit。下一阶段不再重新设计 L2，而是在现有两级命中上增加
+AscendStore L3。
+
+第一版采用以下读路径：
+
+```text
+scheduler 查询 rank-local L2 完整 bundle
+    -> AscendStore 查询 L3 中更长的公共 Indexer/MLA 前缀
+    -> 为 L2 hit + L3-only suffix + 本轮新 token 一次完成 HBM admission
+    -> worker 先执行既有 L2 -> HBM restore
+    -> Connector 将不重叠的 L3-only suffix 直接恢复到 HBM
+    -> model forward
+    -> 既有 full-block dump 将 L3 suffix 和本轮新满块物化到 rank-local L2
+    -> worker 成功返回后发布新增 L2 hash
+```
+
+L3 不先落 L2 再二次回 HBM。这样可以复用 vLLM 的“本地命中后继续查询
+connector”语义和 AscendStore 的 HBM load 生命周期；L2 restore 与 L3 load
+写入互不重叠的 HBM block 区间。外部 IO、L2 restore 都位于 model forward / graph
+replay 之前，eager 与 graph 继续消费同一份最终 HBM block table 和 DSA metadata。
+chunked prefill 也沿用同一流程：首个有 external hit 的 chunk 完成恢复，后续 chunk
+继续按当前 durable watermark 增量 dump。
+
+L3 对同一个 token block 使用两个独立组件对象：
+
+```text
+dsa-target-indexer-v1(hash) -> 仅 full Indexer 层的全部物理 plane
+dsa-target-mla-v1(hash)     -> 全部 target MLA dense plane
+```
+
+scheduler 只把二者最长连续公共前缀视为 L3 hit。本地 L2 仍保持一个 physical id
+绑定完整 bundle；L3 不复用该 id，而以 block hash 为身份。这既保留本地原子
+bundle 的简单性，也为后续 Indexer/MLA 从不同层级恢复留下空间。
+
+L3 key 必须包含模型命名空间、DSA schema 版本、block size、层拓扑、plane
+顺序/字节数和 component，不能直接复用 DSA-disabled 基线 key。A5 GLM-5.2
+实测中，DSA packed-C8 完整 L2 block 为 6,904,320 bytes，而 DSA-disabled
+AscendStore HBM block 为 12,189,696 bytes；即使 token hash 相同，payload ABI
+也不同。
+
+框架侧采用“DSA schema 适配器 + 既有 AscendStore Backend”的分层：
+
+- DSA connector/scheduler 负责本地命中长度、外部增量命中、HBM admission、
+  request 生命周期和 component 公共前缀；
+- DSA worker 负责把 split HBM group 或 rank-local DRAM arena 映射为
+  `keys/addrs/sizes`；
+- Mooncake、MemCache 差异继续封装在现有 `Backend.exists/put/get/register_buffer`
+  接口内，DSA 控制面不按 backend 分叉；
+- Backend 的 put/get 必须返回可校验的逐 key 状态。DSA 初版固定 fail-fast，
+  任何 rank、任何 component 失败都不能进入 forward 或静默 recompute。
+
+L2 -> L3 使用异步 write-behind，而不是当前 AscendStore 非 layerwise 路径中的
+每轮 `request_queue.join()`：
+
+1. scheduler 在 L2 ready watermark 推进后生成尚未远端发布的 hash/component；
+2. 仅 TP rank 0 提交共享 payload，其他副本 rank 不重复写；
+3. scheduler 记录 physical block id -> pending job；该 id 即将被重新分配时，
+   通过 `jobs_to_flush` 要求 worker 在 overwrite 前等待上传完成；
+4. worker 返回明确完成状态后清理 reuse fence 并标记 remote-ready；
+5. put 失败只损失 L3 副本，不破坏本地 L2；失败 key 不得对 lookup 可见。
+
+如果 `empty_with_swapped_memory` arena 不能被 A5 `global_ub_device` 直接注册为
+Mooncake 源地址，则使用初始化期预分配的固定 staging ring；不能在 forward 热
+路径临时创建 tensor，也不能在未获得完成回报前复用 staging slot。
+
+实施顺序：
+
+1. **P0 介质与 schema 门禁**：用 21 个 full Indexer（key/scale）plane 和
+   78 个 packed MLA plane 构造一个真实 6,904,320-byte DSA block，分别验证
+   split HBM 与 swapped L2 的 TP8 put/get、逐字节结果和 buffer registration；
+2. **P1 只读接入**：关闭 MTP、preemption、async scheduling、PP/CP，先打通
+   `L2 local hit + Mooncake additional hit -> HBM -> forward -> L2`，保留
+   `load_async=False` 和 `kv_load_failure_policy=fail`；
+3. **P2 rank0 异步写回**：按 ready watermark 增量上传 L2 的 Indexer/MLA
+   component，补 reuse fence、完成聚合、去重、失败处理和 shutdown drain；
+4. **P3 层级优化**：加入 component-wise `HBM > L2 > L3` source plan、连接
+   预热、批量/并发 IO 和性能门禁，再复用同一 schema 接入 MemCache；
+5. MTP L3、preemption/resume、P/D、跨节点 TP 和 L3 eviction event 均在上述
+   正确性闭环后单独开放，初版配置必须显式拒绝。
+
 ## 13. 统一 metadata 与图模式
 
 ### 13.1 生命周期分层

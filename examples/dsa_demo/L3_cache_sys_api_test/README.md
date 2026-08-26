@@ -24,6 +24,7 @@
 | `CURRENT_TEST_CHECKLIST.md` | 当前环境应执行的最短门禁顺序、停止条件和回传日志 |
 | `test_mooncake.py` | Mooncake A5 TransferEngine 与 multi-buffer IO 探针 |
 | `test_mooncake_tp.py` | 8 个 A5 worker 的跨 segment HIXL 往返探针 |
+| `test_dsa_swapped_l3_io.py` | 真实 21 Indexer + 78 MLA DSA swapped-memory L3 往返门禁 |
 | `MOONCAKE_A5_TP_BLOCKER.md` | Mooncake A5 TP 历史问题、兼容路径与 TP8 通过结论 |
 | `test_memcache.py` | MemCache 探针统一入口 |
 | `test_memcache_tp.py` | 多个 A5 LocalService 的跨 rank URMA 数据往返探针 |
@@ -39,6 +40,80 @@
 | `run_l3_cache_api_tests.sh` | 分 Gate 执行、记录日志并保留真实退出码 |
 | `README_memcache_a5_probe.md` | MemCache 分阶段命令和故障定位 |
 | `baseline_e2e/` | DSA disabled 的配置模板、L3 服务和在线/离线双轮验证 |
+
+## DSA swapped-memory 第一门禁
+
+先在单卡验证 swapped pointer，再扩大到一个真实 A5 DSA logical block。
+Mooncake Master 保持运行后依次执行：
+
+```bash
+cd examples/dsa_demo/L3_cache_sys_api_test
+
+ASCEND_VISIBLE_DEVICES=0 \
+ASCEND_RT_VISIBLE_DEVICES=0 \
+DEVICE_ID=0 \
+DSA_SWAPPED_COMPONENT=all \
+DSA_SWAPPED_SCHEMA_MODE=smoke \
+DSA_SWAPPED_MOONCAKE_COMM_MODE=global_ub \
+bash run_l3_cache_api_tests.sh dsa-swapped-mooncake
+
+ASCEND_VISIBLE_DEVICES=0 \
+ASCEND_RT_VISIBLE_DEVICES=0 \
+DEVICE_ID=0 \
+DSA_SWAPPED_COMPONENT=all \
+DSA_SWAPPED_SCHEMA_MODE=exact \
+DSA_SWAPPED_MOONCAKE_COMM_MODE=global_ub \
+bash run_l3_cache_api_tests.sh dsa-swapped-mooncake
+```
+
+该 gate 会创建 42 个 Indexer key/scale plane 和 78 个 packed MLA plane，source
+与 destination 均使用 `empty_with_swapped_memory`。每个 plane 默认包含 8 个
+physical block，注册完整 arena 后使用 block 1 的 interior address 做 IO。普通
+HBM buffer 先注册，swapped ranges 后注册；随后按 Indexer/MLA 两个 component
+执行 put/get 和逐字节校验。成功标志是：
+
+```text
+[dsa-swapped-l3] DSA SWAPPED L3 ROUND TRIP PASSED
+```
+
+失败时可分别缩小到 `DSA_SWAPPED_COMPONENT=indexer` 和
+`DSA_SWAPPED_COMPONENT=mla`，区分 plane 数量/注册问题与单对象大小问题。
+若需要单独重跑最小双 plane gate：
+
+```bash
+DSA_SWAPPED_SCHEMA_MODE=smoke \
+bash run_l3_cache_api_tests.sh dsa-swapped-mooncake
+```
+
+该单卡 gate 默认设置 `DSA_SWAPPED_MAX_ACTIVE_CHANNELS=1` 和
+`DSA_SWAPPED_MOONCAKE_COMM_MODE=global_ub`。它先初始化
+Mooncake/HIXL，再分配和注册 swapped arena，与 vLLM-Ascend 的 backend -> KV
+buffer 注册顺序一致，也避免为了一个串行 round-trip 额外占用 HComm
+Thread/Stream。若失败发生在
+`stage=transfer_engine_initialize`，说明尚未进入 swapped-memory 注册或 IO，优先
+排查 HComm/AICPU 环境与设备资源；门禁会自动把近期 HComm 日志收集到
+`/tmp/dsa_l3_cache_probe_logs/dsa_swapped_mooncake_hcomm.log`。
+
+`empty_with_swapped_memory` 的底层是已经通过 `aclrtHostRegister` 映射过的
+host memory。`global_ub` 同时提供 device/host endpoint：普通 HBM 注册到 device
+endpoint，swapped arena 注册到 host endpoint。不要把 `global_ub_device` 作为
+这条 DSA L2 gate 的默认值；device-only endpoint 会尝试再次映射 host 地址，当前
+驱动返回 `halHostRegister drvRetCode=12`。保留该模式仅用于负向诊断。
+
+`smoke` 通过而 `exact` 失败，说明 swapped pointer 本身可用，问题更可能是
+registration region 数量、单对象 multi-buffer 数量或资源上限。
+
+Mooncake 不支持 swapped-memory 时，再启动 MemCache MetaService，并使用当前
+机器已经验证的本地 fullmesh EID：
+
+```bash
+ASCEND_VISIBLE_DEVICES=0 \
+ASCEND_RT_VISIBLE_DEVICES=0 \
+DEVICE_ID=0 \
+DSA_SWAPPED_COMPONENT=all \
+DSA_SWAPPED_MEMCACHE_LOCAL_EID=<device-0-fullmesh-eid> \
+bash run_l3_cache_api_tests.sh dsa-swapped-memcache
+```
 
 ## 对齐版本
 

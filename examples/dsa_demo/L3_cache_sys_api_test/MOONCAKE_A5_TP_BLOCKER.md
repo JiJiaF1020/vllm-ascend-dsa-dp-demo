@@ -135,17 +135,24 @@ HIXL 官方提交
 
 ## 当前推进边界
 
-Mooncake A5 TP 当前标记为 **轻量数据面已通过，进入框架级验证**：
+Mooncake A5 TP 当前标记为 **轻量数据面与 DSA-disabled 框架 E2E 已通过，进入
+DSA split-cache schema 验证**：
 
 - CANN 9.1.0 下固定使用已验证的 `global_ub_device`；
 - 不把未发布 HIXL master 动态库覆盖到现有 CANN；
 - 共享节点出现初始化失败时，先排除 HComm/AICPU 资源竞争；
 - `ub_ctp:device + ub_ctp:host` 仅在获得正式修复运行时后回归；
 - MemCache 的单机选路限制不再阻塞 Mooncake 路线。
+- DSA-disabled GLM-5.2 TP8 已确认 3200/3287 external hit，所有 rank 的
+  `batch_get_into_multi_buffers` 均为 25/25 keys、`failed=0`；首次热请求慢于
+  冷算来自 segment 懒建链，不是超时回算。
 
 ## 下一步
 
-1. 将 baseline E2E 包装脚本默认通信模式收敛到 `global_ub_device`。
-2. 完成真实 `MooncakeBackend` TP8 与 DSA-disabled 模型冷/热两轮 external hit。
-3. 增加 eager/graph、在线/离线和 chunked prefill 回归。
-4. 上述基线稳定后，再进入 DSA Indexer/MLA component schema 与生命周期集成。
+1. 用 DSA A5 的 21 full Indexer + 78 packed MLA 真实 component schema 完成
+   TP8 HBM multi-buffer 往返；
+2. 验证 swapped-memory L2 arena 是否可由 `global_ub_device` 直接 put/get；
+3. 打通 DSA 本地 L2 hit 后继续查询 Mooncake，并将 L3-only suffix 直接恢复到
+   HBM、经同轮 full-block dump 物化回 L2；
+4. 增加 rank0 异步 L2->L3 write-behind，再覆盖 eager/graph、在线/离线和
+   chunked prefill 回归。

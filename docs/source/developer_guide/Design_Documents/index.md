@@ -16,6 +16,7 @@ eplb_swift_balancer
 ACL_Graph
 KV_Cache_Pool_Guide
 dsa_offload_design
+dsa_l2_l3_cache_design
 add_custom_aclnn_op
 context_parallel
 dynamic_chunked_pipeline_parallel
