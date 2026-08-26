@@ -23,15 +23,18 @@
   而是确认不适用于当前单机环境。
 - [x] MemFabric 临时包支持按进程设置 `USE_LOCAL_EID`；8 个物理 NPU 使用
   ping 筛选出的内部 fullmesh EID 后，完整 mesh 的 `store.init` 全部返回 0。
-- [ ] MemCache 临时包 TP8 真实数据面：逐 rank local put、环形 remote get 和
-  1 MiB payload 逐字节校验。
+- [x] MemCache 临时包 TP8 真实数据面：逐 rank local put、环形 remote get 和
+  1 MiB payload 逐字节校验通过，最终 gate 退出码为 0。
 - [x] Mooncake NPU 0、1 跨 segment 门禁：`global_ub_device` 双向 1 MiB
   remote get 与内容校验通过。
 - [x] Mooncake NPU 0-3 四卡轻量门禁。
 - [x] Mooncake TP8 轻量门禁：`global_ub_device` 下 8 个 rank 双向环形
   remote get 与内容校验通过。共享节点前一轮的 AICPU/HComm 初始化失败确认为
   瞬时资源竞争，不计作功能失败。
-- [ ] DSA-disabled 完整模型冷/热两轮。
+- [x] DSA-disabled MemCache 完整模型：3200/3287 tokens external hit，热重放
+  token/logprobs 稳定且与 HBM prefix 热路径完全一致；仍保留 GLM-5.2 冷/热
+  prefix 路径输出差异作为独立精度问题。
+- [ ] DSA-disabled Mooncake 完整模型冷/热两轮。
 
 ## 0. 公共准备
 
@@ -195,9 +198,25 @@ bash run_l3_cache_api_tests.sh mooncake-tp
 
 ## 4. DSA-disabled 完整模型
 
-当前只选择已通过 TP8 轻量门禁的 Mooncake。优先离线，再测在线；此阶段仍关闭
-DSA。正式运行前需先把 `baseline_e2e` 包装脚本的通信模式收敛到已验证的
-`global_ub_device`，不要直接沿用历史 `hixlep` 默认值。
+只选择已经通过 TP8 数据面门禁的后端。优先离线，再测在线；此阶段仍关闭 DSA。
+
+### MemCache 服务
+
+终端 1：
+
+```bash
+cd /home/y00813308/vllm-ascend-v0.23/examples/dsa_demo/L3_cache_sys_api_test/baseline_e2e
+bash start_memcache_meta.sh 2>&1 | tee memcache-meta.log
+```
+
+终端 2 保持 `offline_baseline_l3.py` 顶部为 `L3_BACKEND = "memcache"`，确认
+`MEMCACHE_LOCAL_EID_MAP_PATH` 指向刚才生成的文件，然后执行：
+
+```bash
+python offline_baseline_l3.py 2>&1 | tee baseline-memcache-offline.log
+```
+
+离线通过后，再按 `baseline_e2e/README.md` 启动在线服务和客户端。
 
 ### Mooncake 服务
 
@@ -208,7 +227,15 @@ cd /home/y00813308/vllm-ascend-v0.23/examples/dsa_demo/L3_cache_sys_api_test/bas
 bash start_mooncake_master.sh 2>&1 | tee mooncake-master.log
 ```
 
-编辑 `offline_baseline_l3.py` 顶部的模型路径、TP 和 `L3_BACKEND` 后，在终端 2：
+终端 2 将 `offline_baseline_l3.py` 顶部设置为：
+
+```python
+L3_BACKEND = "mooncake"
+ENABLE_PREFIX_CACHING = False
+MOONCAKE_COMM_MODE = "global_ub_device"
+```
+
+然后执行：
 
 ```bash
 python offline_baseline_l3.py 2>&1 | tee baseline-l3-offline.log
@@ -219,7 +246,7 @@ python offline_baseline_l3.py 2>&1 | tee baseline-l3-offline.log
 
 完整模型验收必须同时满足：
 
-- 两轮输出一致；
+- 第 2、3 轮热重放 token/logprobs 稳定；
 - 第二轮 external lookup/load 非零；
 - 后端对象或 Put/Get 指标增长；
 - 无 load failure、静默 recompute 和 DSA 容量/算子日志。

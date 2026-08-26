@@ -55,6 +55,28 @@ def _resolve_local_host(value: str) -> str:
     return sorted(candidates)[0]
 
 
+def _require_master_service(address: str) -> None:
+    host, separator, raw_port = address.rpartition(":")
+    if not separator or not host:
+        raise ValueError(
+            f"invalid Mooncake master address {address!r}; expected host:port"
+        )
+    try:
+        port = int(raw_port)
+    except ValueError as exc:
+        raise ValueError(
+            f"invalid Mooncake master port in {address!r}"
+        ) from exc
+    try:
+        with socket.create_connection((host, port), timeout=1.0):
+            pass
+    except OSError as exc:
+        raise RuntimeError(
+            f"Mooncake Master is not reachable at {address}; start "
+            "baseline_e2e/start_mooncake_master.sh in another terminal"
+        ) from exc
+
+
 def _wait_exists(store: Any, key: str, timeout_seconds: float) -> None:
     deadline = time.monotonic() + timeout_seconds
     latest: list[int] = []
@@ -268,7 +290,7 @@ def main() -> int:
     parser.add_argument(
         "--comm-mode",
         choices=("global_ub", "global_ub_device", "hixlep", "auto"),
-        default="global_ub",
+        default="global_ub_device",
     )
     parser.add_argument("--max-active-channels", type=int, default=8)
     parser.add_argument("--local-host", default="auto")
@@ -294,6 +316,7 @@ def main() -> int:
             "cross-segment TP probe requires at least two visible devices; "
             f"got {devices}"
         )
+    _require_master_service(args.master_address)
     local_host = _resolve_local_host(args.local_host)
     run_id = uuid.uuid4().hex
     print(

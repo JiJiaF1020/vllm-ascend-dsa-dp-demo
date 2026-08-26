@@ -3,8 +3,8 @@
 > 默认包结论：当前并非 rootinfo 文件损坏，也不是 vLLM/DSA 初始化错误。MemFabric
 > `device_urma/UBC_CTP` 使用 rootinfo 中的出框 EID，未为同机 peer 选择内部
 > fullmesh 通路，因此在只有一台 Ascend 950DT 服务器时无法完成两卡建链。
-> 临时包已增加进程级 `USE_LOCAL_EID`，八卡完整 mesh 初始化通过，真实数据 IO
-> 待 `test_memcache_tp.py` 验证。
+> 临时包已增加进程级 `USE_LOCAL_EID`，八卡完整 mesh 初始化和真实跨 rank
+> payload IO 均通过。
 
 ## 一句话现象
 
@@ -255,7 +255,7 @@ urma_admin show topo > /tmp/urma_topo.current.txt
 
 1. 当前 DSA L3 集成优先使用已经通过单机 TP8 门禁的 Mooncake
    `global_ub_device`。
-2. MemCache 使用临时包和显式物理卡 EID 映射，依次验证两卡、TP8 的真实跨 rank
-   payload IO；建链成功不能替代数据校验。
-3. 若数据面通过，再评估在 vLLM-Ascend worker 初始化 MemcacheBackend 前按物理
-   NPU ID 设置 EID；正式方案仍应由 MemFabric 提供 peer-locality 选路或配置合同。
+2. MemCache TP8 数据面已通过，下一步可评估在 vLLM-Ascend worker 初始化
+   MemcacheBackend 前按物理 NPU ID 设置 EID，并执行 DSA-disabled 模型冷暖两轮。
+3. 临时环境变量可用于功能打通；正式方案仍应由 MemFabric 提供 peer-locality
+   选路或稳定配置合同。

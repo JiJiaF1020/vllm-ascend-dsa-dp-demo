@@ -595,30 +595,39 @@ def adapt_patch(is_global_patch: bool = False):
         from vllm_ascend.patch import worker  # noqa: F401
 
 
+def _get_visible_npu_devices() -> list[int]:
+    visible_devices = os.getenv("ASCEND_RT_VISIBLE_DEVICES") or os.getenv("ASCEND_VISIBLE_DEVICES")
+    if visible_devices is None:
+        from vllm_ascend.cpu_binding import DeviceInfo
+
+        return sorted([int(x) for x in DeviceInfo.get_npu_map_info()])
+    try:
+        return [int(x) for x in visible_devices.split(",") if x.strip()]
+    except ValueError as exc:
+        raise ValueError(f"Invalid visible NPU device list: {visible_devices!r}") from exc
+
+
+def _get_physical_npu_id(local_rank: int) -> int:
+    devices = _get_visible_npu_devices()
+    if not devices:
+        raise ValueError("No NPU devices found or specified in ASCEND_RT_VISIBLE_DEVICES.")
+    if local_rank < 0 or local_rank >= len(devices):
+        raise ValueError(f"local_rank {local_rank} is out of bounds for the available NPU devices: {devices}")
+    return devices[local_rank]
+
+
 def setup_ascend_local_comm_res(local_rank: int, kv_transfer_config: Any | None) -> None:
     """Load the local A5 endpoint config into ASCEND_LOCAL_COMM_RES."""
     if kv_transfer_config is None:
         return
-
-    visible_devices = os.getenv("ASCEND_RT_VISIBLE_DEVICES")
-    if visible_devices is None:
-        from vllm_ascend.cpu_binding import DeviceInfo
-
-        devices = sorted([int(x) for x in DeviceInfo.get_npu_map_info()])
-    else:
-        devices = [int(x) for x in visible_devices.split(",") if x.strip()]
 
     extra_config = kv_transfer_config.kv_connector_extra_config or {}
     local_comm_res_path = extra_config.get("ascend_local_comm_res_path")
     if not local_comm_res_path:
         return
 
-    if not devices:
-        raise ValueError("No NPU devices found or specified in ASCEND_RT_VISIBLE_DEVICES.")
-    if local_rank < 0 or local_rank >= len(devices):
-        raise ValueError(f"local_rank {local_rank} is out of bounds for the available NPU devices: {devices}")
-
-    local_comm_res_file = os.path.join(local_comm_res_path, f"ub_endpoint_npu_{devices[local_rank]}.json")
+    physical_device_id = _get_physical_npu_id(local_rank)
+    local_comm_res_file = os.path.join(local_comm_res_path, f"ub_endpoint_npu_{physical_device_id}.json")
     try:
         with open(local_comm_res_file) as f:
             data = json.load(f)
@@ -632,6 +641,81 @@ def setup_ascend_local_comm_res(local_rank: int, kv_transfer_config: Any | None)
         raise ValueError(f"Failed to parse endpoint config file: {local_comm_res_file}") from e
 
     os.environ["ASCEND_LOCAL_COMM_RES"] = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+
+def _normalize_memcache_local_eid_map(payload: Any) -> dict[int, str]:
+    if not isinstance(payload, dict):
+        raise ValueError("memcache_local_eid_map must be a JSON object")
+
+    result: dict[int, str] = {}
+    for raw_device_id, raw_eid in payload.items():
+        try:
+            device_id = int(raw_device_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid MemCache EID device id: {raw_device_id!r}") from exc
+        if device_id < 0:
+            raise ValueError(f"MemCache EID device id must be non-negative: {device_id}")
+        if not isinstance(raw_eid, str):
+            raise ValueError(f"MemCache EID for physical NPU {device_id} must be a string")
+        eid = raw_eid.strip().lower()
+        try:
+            eid_bytes = bytes.fromhex(eid)
+        except ValueError as exc:
+            raise ValueError(f"MemCache EID for physical NPU {device_id} is not hexadecimal") from exc
+        if len(eid) != 32 or len(eid_bytes) != 16:
+            raise ValueError(f"MemCache EID for physical NPU {device_id} must contain exactly 32 hex digits")
+        if device_id in result:
+            raise ValueError(f"Duplicate MemCache EID device id: {device_id}")
+        result[device_id] = eid
+    return result
+
+
+def setup_memcache_local_eid(local_rank: int, kv_transfer_config: Any | None) -> None:
+    """Set the per-worker fullmesh EID before MemCache initializes device_urma."""
+    if kv_transfer_config is None:
+        return
+
+    extra_config = kv_transfer_config.kv_connector_extra_config or {}
+    inline_map = extra_config.get("memcache_local_eid_map")
+    map_path = extra_config.get("memcache_local_eid_map_path")
+    if inline_map is None and map_path is None:
+        return
+    if str(extra_config.get("backend", "mooncake")).lower() != "memcache":
+        raise ValueError("MemCache local EID configuration requires kv_connector_extra_config.backend='memcache'")
+    if inline_map is not None and map_path is not None:
+        raise ValueError("Configure only one of memcache_local_eid_map and memcache_local_eid_map_path")
+
+    source = "kv_connector_extra_config.memcache_local_eid_map"
+    payload = inline_map
+    if map_path is not None:
+        if not isinstance(map_path, (str, os.PathLike)):
+            raise ValueError("memcache_local_eid_map_path must be a filesystem path")
+        resolved_path = os.path.realpath(os.path.expanduser(os.fspath(map_path)))
+        try:
+            with open(resolved_path, encoding="utf-8") as config_file:
+                payload = json.load(config_file)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"MemCache local EID map not found: {resolved_path}") from exc
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Failed to parse MemCache local EID map: {resolved_path}") from exc
+        source = resolved_path
+
+    eid_map = _normalize_memcache_local_eid_map(payload)
+    physical_device_id = _get_physical_npu_id(local_rank)
+    local_eid = eid_map.get(physical_device_id)
+    if local_eid is None:
+        raise ValueError(
+            f"MemCache local EID map does not contain physical NPU {physical_device_id}; "
+            f"available devices: {sorted(eid_map)}"
+        )
+    os.environ["USE_LOCAL_EID"] = local_eid
+    logger.info(
+        "Configured MemCache local fullmesh EID for local_rank=%d physical_device_id=%d from %s: %s",
+        local_rank,
+        physical_device_id,
+        source,
+        local_eid,
+    )
 
 
 @functools.cache

@@ -666,6 +666,45 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         worker.start_load_kv(meta)
         worker.m_store.get.assert_called_once()
 
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.logger")
+    def test_start_load_kv_sync_logs_transfer_summary(self, mock_logger):
+        worker = self._make_worker(
+            extra_config={
+                "backend": "mooncake",
+                "log_transfer_summary": True,
+            }
+        )
+        worker.m_store.get.return_value = [0]
+        worker.token_database.set_group_buffers({0: [1000, 2000]}, {0: [160]})
+
+        load_spec = LoadSpec(
+            vllm_cached_tokens=0,
+            kvpool_cached_tokens=16,
+            can_load=True,
+            token_len=16,
+        )
+        req = ReqMeta(
+            req_id="r1",
+            token_len_chunk=16,
+            block_ids=[0],
+            block_hashes=["h0"],
+            load_spec=load_spec,
+        )
+        meta = AscendConnectorMetadata(set(), set())
+        meta.add_request(req)
+
+        worker.start_load_kv(meta)
+
+        summary_calls = [
+            call for call in mock_logger.info.call_args_list
+            if call.args and "[KVPOOL-IO]" in call.args[0]
+        ]
+        self.assertEqual(len(summary_calls), 1)
+        self.assertEqual(summary_calls[0].args[1], "success")
+        self.assertEqual(summary_calls[0].args[2], "mooncake")
+        self.assertEqual(summary_calls[0].args[4], "r1")
+        self.assertEqual(summary_calls[0].args[7:11], (1, 1, 0, 160))
+
     def test_start_load_kv_sync_uses_tail_block_id(self):
         worker = self._make_worker()
         worker.m_store.get = MagicMock()

@@ -27,19 +27,28 @@ DSA 时对接 Mooncake 或 MemCache。测试刻意固定为：
 | `offline_baseline_l3.py` | 同一 `LLM` 内执行两轮离线 generate |
 | `baseline_prompt.py` | 在线/离线共享的确定性长前缀 |
 
-当前单机 A5 的主路线已切换为 Mooncake `global_ub_device`。独立探针已通过
-TP8，但本目录的在线/离线包装脚本仍保留历史 `memcache/hixlep` 默认值，下一步
-需要先收敛通信模式，再运行完整模型。证据见
+当前单机 A5 仍优先推进 Mooncake `global_ub_device`。独立探针已通过 TP8，证据见
 [Mooncake A5 TP 记录](../MOONCAKE_A5_TP_BLOCKER.md)。
 
-MemCache 两卡最小门禁已确认受单机内部 fullmesh 选路边界限制；其命令只保留
-给多服务器超节点或上游适配后的回归，不再作为本机完整模型候选。详见
+MemFabric 临时包支持按进程设置 `USE_LOCAL_EID` 后，MemCache 已通过单机 TP8
+完整建链和 1 MiB 环形 remote-get payload 校验。本目录现通过
+`kv_connector_extra_config.memcache_local_eid_map_path` 在每个 vLLM worker
+初始化时选择物理卡 EID，可进入 DSA-disabled baseline E2E。详见
 [MemCache A5 TP 记录](../MEMCACHE_A5_TP_BLOCKER.md)。
+
+本目录的在线、离线样例会设置
+`kv_connector_extra_config.log_transfer_summary=true`。每次真实外部 KV load
+完成后，各 TP rank 都会输出一条 `[KVPOOL-IO]`：只有 `status=success`、
+`returned=keys` 且 `failed=0` 才表示后端 `get` 成功返回。`elapsed_ms` 包含
+Mooncake 首次访问远端 segment 时的懒建链开销，后续请求可用它区分首次建链与
+稳态数据传输。
 
 ## 前置条件
 
 先完成上一级独立 API 与真实 Backend gate。MemCache 还必须安装与 wheel native
-commit 匹配的 `memfabric_hybrid_aicpu_kernel.run`。
+commit 匹配的 `memfabric_hybrid_aicpu_kernel.run`，并按
+[`CURRENT_TEST_CHECKLIST.md`](../CURRENT_TEST_CHECKLIST.md) 生成
+`/tmp/memcache-local-eids.json`。该映射只适用于当前实验节点。
 
 默认配置仅面向当前单机 A5：
 
@@ -52,19 +61,15 @@ MemCache Metrics 127.0.0.1:18000
 vLLM Online      127.0.0.1:8035
 ```
 
-在线/离线样例默认暴露 NPU `0..7` 并采用 TP8。MemCache 历史路径使用
+在线/离线样例默认暴露 NPU `0..7` 并采用 TP8。MemCache 使用
 `device_urma`，每个 worker 内嵌一个 LocalService，并向同一个外部 MetaService
-注册 1 GiB DRAM；该路径当前不用于单机 TP8。
+注册 1 GiB DRAM；worker 在创建 LocalService 前按物理 NPU ID 从 EID 映射文件
+设置进程级 `USE_LOCAL_EID`。scheduler 的 `init_bm=False` metadata client 不设置
+EID，也不创建数据 channel。
 
-历史脚本的 `MOONCAKE_COMM_MODE` 默认是 `hixlep`：样例先检查
-`/etc/hixlep/ub_endpoint_npu_<physical-id>.json`，再通过
-`kv_connector_extra_config.ascend_local_comm_res_path` 让每个 A5 worker 加载
-与物理卡对应的完整 `ASCEND_LOCAL_COMM_RES`。可用以下命令先做门禁：
-
-```bash
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-  bash ../run_l3_cache_api_tests.sh hixlep-config
-```
+在线和离线脚本的 `MOONCAKE_COMM_MODE` 默认均为 `global_ub_device`。它在首次导入
+vLLM 前设置 `ASCEND_GLOBAL_RESOURCE_CONFIG`，仅请求 `ub_ctp:device` endpoint，
+并将 `max_active_channels` 限制为 8；同时固定单机 `VLLM_HOST_IP=127.0.0.1`。
 
 Master 保持运行时，先用不加载模型的 TP8 门禁验证跨 segment 通道：
 
@@ -74,7 +79,7 @@ MOONCAKE_TP_COMM_MODE=global_ub_device \
   bash ../run_l3_cache_api_tests.sh mooncake-tp
 ```
 
-当前应显式使用 `MOONCAKE_TP_COMM_MODE=global_ub_device`。只有输出
+只有输出
 `CROSS-SEGMENT ROUND TRIP PASSED` 才继续拉起完整模型。
 
 单卡探针在 `auto` 下通过，只能证明一个 TransferEngine 的本地 IO；TP8 的复制
@@ -94,7 +99,7 @@ MemCache 每个 worker 默认贡献 1 GiB DRAM；`max.dram.size=1TB` 与
 必须大于 32 TiB、启用 56-bit GVA 的约束。当前只有 8 个 active worker，实际仍
 只申请 8 GiB DRAM。修改 `world_size` 后必须重启 MetaService。
 
-## MemCache 在线（仅保留回归资料）
+## MemCache 在线
 
 终端 1：
 
@@ -109,6 +114,12 @@ bash start_memcache_meta.sh 2>&1 | tee memcache-meta.log
 L3_BACKEND="memcache"
 ```
 
+脚本默认读取 `/tmp/memcache-local-eids.json`。使用其他路径时设置：
+
+```bash
+export MEMCACHE_LOCAL_EID_MAP_PATH=/path/to/memcache-local-eids.json
+```
+
 然后运行：
 
 ```bash
@@ -121,7 +132,7 @@ bash serve_baseline_l3.sh 2>&1 | tee baseline-memcache-online.log
 python online_baseline_l3.py
 ```
 
-## Mooncake 在线（当前主路线，包装脚本待收敛）
+## Mooncake 在线
 
 终端 1：
 
@@ -134,6 +145,12 @@ bash start_mooncake_master.sh 2>&1 | tee mooncake-master.log
 
 ```bash
 L3_BACKEND="mooncake"
+```
+
+并保持：
+
+```bash
+MOONCAKE_COMM_MODE="global_ub_device"
 ```
 
 然后运行：
@@ -151,14 +168,46 @@ python online_baseline_l3.py
 ## 离线
 
 离线测试同样要求终端 1 中的对应 Master/MetaService 保持运行。编辑
-`offline_baseline_l3.py` 顶部的 `MODEL_PATH`、`L3_BACKEND` 与 TP 配置，然后：
+`offline_baseline_l3.py` 顶部的 `MODEL_PATH`、`L3_BACKEND`、
+`MEMCACHE_LOCAL_EID_MAP_PATH` 与 TP 配置，然后：
 
 ```bash
 python offline_baseline_l3.py 2>&1 | tee baseline-l3-offline.log
 ```
 
 不要同时运行在线服务和离线脚本；二者默认使用相同的 NPU 和 connector IPC
-标识。
+标识。样例将 `shutdown_timeout` 设置为 30 秒，使 EngineCore 在请求完成后走 drain
+teardown；不要改回默认的 0 秒 abort，否则 Mooncake native 资源可能在 worker
+被强制 SIGTERM 时留下 ZMQ、semaphore 或 shared-memory 告警。
+
+### 冷热输出不一致诊断
+
+离线脚本默认执行三轮，并打印首个生成位置的 top-5 logprobs。出现冷/热 token
+不一致时，使用完全相同的模型、prompt 和采样参数分别运行三组独立进程：
+
+| 对照 | `L3_BACKEND` | `ENABLE_PREFIX_CACHING` | 目的 |
+|---|---|---|---|
+| 全量重算 | `"none"` | `False` | 判断模型重复执行本身是否稳定 |
+| HBM prefix | `"none"` | `True` | 判断跳过已缓存前缀后的基线数值路径是否稳定 |
+| MemCache | `"memcache"` | `False` | 验证外部恢复相对 HBM prefix 是否引入额外差异 |
+
+每组测试都重新启动 Python 进程。MemCache 组还应重启 MetaService，避免沿用上轮
+对象。若全量重算稳定、HBM prefix 与 MemCache 都以相近 logprobs 发生相同变化，
+优先判断为缓存命中改变 prefill shape 后的数值边界；若仅 MemCache 明显偏离 HBM
+prefix，则继续定位外部 KV 的保存、恢复或布局问题。
+
+GLM-5.2 的 78 个目标层中，前 2 层各有独立 Indexer，后续 76 层每 4 层共享一
+个 full Indexer。因此 AscendStore 注册摘要应体现 78 个 MLA 物理层和 21 个
+Indexer 物理层。shared 层复用的 topK buffer 是单轮 forward 临时状态，不属于
+L3 持久化对象；若日志把 78 层都登记成独立 Indexer cache，才说明基线 spec 或
+注册布局存在问题。
+
+当前 GLM-5.2 W4A4C8 MXFP4 实测中，全量重算三轮完全一致；HBM prefix 与
+MemCache 的两次热重放分别稳定，并且两种热路径的 top-5 token、排序和 logprob
+到 7 位小数完全一致。两种 prefix-hit 路径都与冷路径不同，因此该差异归属于
+GLM-5.2 基线 prefix-hit 计算路径，而不是 MemCache 引入的额外偏差。离线脚本将
+热重放稳定作为 L3 功能门禁，同时继续打印冷/热差异，不能据此宣称模型 prefix
+精度问题已经解决。
 
 ## 验收
 

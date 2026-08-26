@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import math
 import threading
+import time
 from collections.abc import Generator
 from typing import Any
 
@@ -133,6 +134,7 @@ class KVPoolWorker:
         self.use_layerwise = use_layerwise
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.load_async = extra_config.get("load_async", False)
+        self.log_transfer_summary = bool(extra_config.get("log_transfer_summary", False))
         self._invalid_block_ids: set[int] = set()
         self._invalid_block_ids_lock = threading.Lock()
         self.consumer_is_to_put = extra_config.get("consumer_is_to_put", False)
@@ -596,6 +598,15 @@ class KVPoolWorker:
         self.group_block_len[group_id] = group_block_lens
         self.group_block_stride[group_id] = group_block_strides
         self.group_num_layers[group_id] = len(physical_layers)
+        logger.info(
+            "KV pool cache group registered: group_id=%d family=%s "
+            "layer_names=%d physical_layers=%d tensors=%d",
+            group_id,
+            self._get_group_family(self.group_kv_cache_families, group_id),
+            len(layer_names),
+            len(physical_layers),
+            len(group_addrs),
+        )
 
     def _configure_registered_layerwise_layers(self, cache_groups: list[tuple[int, list[str]]]) -> None:
         """Map registered physical layers to dense local and group indices."""
@@ -841,7 +852,38 @@ class KVPoolWorker:
                 len(key_list_c),
                 key_list_c[:3],
             )
+            get_started_ns = time.perf_counter_ns() if self.log_transfer_summary else 0
             ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
+            if self.log_transfer_summary:
+                elapsed_ms = (time.perf_counter_ns() - get_started_ns) / 1_000_000
+                ret_codes = None if ret is None else [int(code) for code in ret]
+                returned_count = 0 if ret_codes is None else len(ret_codes)
+                failed_count = len(key_list_c) if ret_codes is None else sum(code != 0 for code in ret_codes)
+                status = (
+                    "success"
+                    if returned_count == len(key_list_c) and failed_count == 0
+                    else "failure"
+                )
+                total_bytes = sum(
+                    int(size)
+                    for sizes_for_key in size_list_c
+                    for size in sizes_for_key
+                )
+                logger.info(
+                    "[KVPOOL-IO] op=get status=%s backend=%s tp_rank=%d req=%s "
+                    "tokens=%d groups=%s keys=%d returned=%d failed=%d bytes=%d elapsed_ms=%.3f",
+                    status,
+                    self.backend_name,
+                    self.tp_rank,
+                    request.req_id,
+                    token_len,
+                    load_group_ids,
+                    len(key_list_c),
+                    returned_count,
+                    failed_count,
+                    total_bytes,
+                    elapsed_ms,
+                )
             if ret is not None and any(r != 0 for r in ret):
                 missing_block_ids = record_failed_blocks(
                     block_id_list_c,

@@ -36,6 +36,8 @@ When `MultiConnector` is used, configure `kv_load_failure_policy` on the `MultiC
 | `lookup_rpc_port` | Port for RPC Communication Between Pooling Scheduler Process and Worker Process: Each Instance Requires a Unique Port Configuration. |
 | `load_async` | Whether to Enable Asynchronous Loading. The default value is false. |
 | `backend` | Set the storage backend for kvpool (`mooncake`, `memcache`, `yuanrong`), with the default being `mooncake`. |
+| `memcache_local_eid_map` | Optional inline mapping from physical NPU IDs to 32-digit local fullmesh EIDs for the `memcache` backend on Ascend 950. Configure either this field or `memcache_local_eid_map_path`, not both. Requires a MemFabric build that supports the per-process `USE_LOCAL_EID` override. |
+| `memcache_local_eid_map_path` | Optional path to a JSON file containing the same physical-NPU-to-EID mapping. The file must be visible to every worker process and must be regenerated or revalidated when the server or NPU topology changes. |
 | `consumer_is_to_put` | Whether Decode node put KV Cache into KV Pool. The default value is false. |
 | `consumer_is_to_load` | Whether Decode node load KV cache from KV Pool. The default value is false. |
 | `use_layerwise` | Enable layer-by-layer KV save/load. Only supported on the Prefill node and requires the `memcache` backend. The default value is false. |
@@ -518,6 +520,27 @@ ock.mmc.local_service.dram.size = 1GB
 | `ock.mmc.local_service.world_size` | Maximum number of supported LocalService, including services that will be added in the future. |
 | `ock.mmc.local_service.protocol` | The recommended protocols are `device_rdma` (RDMA over device, supported for A2 and A3 when device RoCE is available, recommended for A2) and `device_sdma` (SDMA over device, supported for A3 when HCCS is available, recommended for A3). For details about other supported protocols, see the [MemCache LocalService configuration file](https://gitcode.com/Ascend/memcache/blob/master/config/mmc-local.conf). |
 | `ock.mmc.local_service.dram.size` | Sets the DRAM capacity provided by the current LocalService. |
+
+For a single Ascend 950 server whose MemCache `device_urma` traffic must use the
+internal fullmesh plane, a MemFabric build supporting `USE_LOCAL_EID` can receive
+the per-device mapping through `memcache_local_eid_map_path`:
+
+```json
+{
+  "kv_connector": "AscendStoreConnector",
+  "kv_role": "kv_both",
+  "kv_connector_extra_config": {
+    "backend": "memcache",
+    "lookup_rpc_port": "1",
+    "memcache_local_eid_map_path": "/tmp/memcache-local-eids.json"
+  }
+}
+```
+
+The map is indexed by physical NPU ID, not by the dynamically assigned MemCache
+rank. EIDs are topology-specific and must not be copied between servers. Without
+either mapping field, MemCache keeps its original rootinfo-based endpoint
+selection.
 
 ### Run Memcache MetaService
 

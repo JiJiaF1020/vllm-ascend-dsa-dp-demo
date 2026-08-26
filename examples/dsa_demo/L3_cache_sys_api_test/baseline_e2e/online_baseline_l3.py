@@ -14,7 +14,7 @@ from openai import OpenAI
 # =========================
 API_BASE = "http://127.0.0.1:8035/v1"
 API_KEY = "EMPTY"
-MODEL_NAME = "glm-5.1-baseline-l3"
+MODEL_NAME = "glm-5.2-baseline-l3"
 PROMPT_REPETITIONS = 48
 MAX_TOKENS = 1
 REPLAY_DELAY_SECONDS = 10.0

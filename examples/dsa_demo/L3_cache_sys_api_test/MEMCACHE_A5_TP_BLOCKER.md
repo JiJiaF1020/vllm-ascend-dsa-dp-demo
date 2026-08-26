@@ -169,10 +169,15 @@ MemFabric 临时包 native commit `c9258a05149447577a9f7e3eab434c757b59d23c`
 - barrier 后可以正常销毁 channel、unimport memory 并关闭 LocalService；
 - 子进程退出码为 `[0, 0, 0, 0, 0, 0, 0, 0]`。
 
-这证明临时覆盖能修复当前单机的建链选择，但该最小脚本没有执行 payload IO。
-下一门禁必须通过真实 `MemcacheBackend` 的 local put、环形 remote get 和逐字节
-校验，才可把 MemCache 恢复为 vLLM-Ascend 候选。未来框架接入时必须按物理 NPU
-ID 设置 EID，不能按 MemCache 动态 rank 设置。
+随后使用真实 `MemcacheBackend` 完成 TP8 数据面门禁：每个 rank 注册 1 MiB NPU
+source/destination buffer、执行 local put、从下一 rank remote get，并逐字节验证
+payload；最终输出 `CROSS-RANK ROUND TRIP PASSED`，gate 退出码为 0。这证明临时
+覆盖不仅恢复建链，也能承载当前 vLLM-Ascend Backend 使用的地址型数据 IO。
+
+退出阶段的 `NetEngineAcc has not been started` 与 `MetaNetClient has not been
+started` 是幂等 Stop 路径告警，出现在全部 payload 校验完成之后，不影响本门禁
+结论。未来框架接入时必须按物理 NPU ID 设置 EID，不能按 MemCache 动态 rank
+设置。
 
 ## 恢复条件
 
@@ -182,8 +187,6 @@ ID 设置 EID，不能按 MemCache 动态 rank 设置。
 2. MemFabric 正式支持按 peer locality 为同机 rank 选择内部 fullmesh 通路；
 3. 使用明确支持单机 A5 的其他 Device transport，并完成相同两卡逐字节门禁。
 
-临时包的 `USE_LOCAL_EID` 属于条件 2 的验证接口，尚不能替代正式选路机制。
-
-`test_memcache_tp.py` 输出 `CROSS-RANK ROUND TRIP PASSED` 后，才恢复 TP8 模型
-冷暖两轮 external hit。Host transport 可以做功能兜底，但不能作为 NPU 直通
-数据面通过的证明。
+临时包的 `USE_LOCAL_EID` 已满足功能验证所需的条件 2，但尚不能替代正式选路
+机制。TP8 NPU 直通数据面现已通过，可恢复 DSA-disabled 模型冷暖两轮 external
+hit；在完整模型通过前仍不声明生产可用。

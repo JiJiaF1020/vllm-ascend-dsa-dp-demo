@@ -70,6 +70,7 @@ from vllm_ascend.utils import (
     get_ascend_device_type,
     register_ascend_customop,
     setup_ascend_local_comm_res,
+    setup_memcache_local_eid,
     vllm_version_is,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
@@ -460,6 +461,7 @@ class NPUWorker(WorkerBase):
 
         if get_ascend_device_type() == AscendDeviceType.A5:
             setup_ascend_local_comm_res(self.local_rank, self.vllm_config.kv_transfer_config)
+            setup_memcache_local_eid(self.local_rank, self.vllm_config.kv_transfer_config)
 
         # take current memory snapshot
         if vllm_version_is("0.23.0"):

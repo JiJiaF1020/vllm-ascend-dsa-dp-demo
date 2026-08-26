@@ -13,8 +13,10 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import json
 import math
 import os
+import tempfile
 from unittest import mock
 
 import pytest
@@ -234,6 +236,96 @@ class TestUtils(TestBase):
         utils.vllm_version_is("1.0.0")
         hits = utils.vllm_version_is.cache_info().hits
         self.assertEqual(hits, 1)
+
+    def test_setup_memcache_local_eid_uses_physical_device_id(self):
+        local_eid = "000000000042050000100000df00f307"
+        kv_transfer_config = mock.MagicMock(
+            kv_connector_extra_config={
+                "backend": "memcache",
+                "memcache_local_eid_map": {
+                    "4": "000000000042050000100000df009304",
+                    "7": local_eid,
+                },
+            }
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ASCEND_RT_VISIBLE_DEVICES": "4,7",
+                "USE_LOCAL_EID": "stale",
+            },
+        ):
+            utils.setup_memcache_local_eid(1, kv_transfer_config)
+            self.assertEqual(os.environ["USE_LOCAL_EID"], local_eid)
+
+    def test_setup_memcache_local_eid_loads_map_file(self):
+        local_eid = "000000000047050000100000df003801"
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as config_file:
+            json.dump({"1": local_eid}, config_file)
+            map_path = config_file.name
+        self.addCleanup(lambda: os.unlink(map_path))
+        kv_transfer_config = mock.MagicMock(
+            kv_connector_extra_config={
+                "backend": "memcache",
+                "memcache_local_eid_map_path": map_path,
+            }
+        )
+        with mock.patch.dict(os.environ, {"ASCEND_RT_VISIBLE_DEVICES": "1"}):
+            utils.setup_memcache_local_eid(0, kv_transfer_config)
+            self.assertEqual(os.environ["USE_LOCAL_EID"], local_eid)
+
+    def test_setup_memcache_local_eid_rejects_invalid_config(self):
+        valid_eid = "000000000041050000100000df001200"
+        cases = [
+            (
+                {
+                    "backend": "mooncake",
+                    "memcache_local_eid_map": {"0": valid_eid},
+                },
+                "requires kv_connector_extra_config.backend='memcache'",
+            ),
+            (
+                {
+                    "backend": "memcache",
+                    "memcache_local_eid_map": {"1": valid_eid},
+                },
+                "does not contain physical NPU 0",
+            ),
+            (
+                {
+                    "backend": "memcache",
+                    "memcache_local_eid_map": {"0": "not-an-eid"},
+                },
+                "is not hexadecimal",
+            ),
+            (
+                {
+                    "backend": "memcache",
+                    "memcache_local_eid_map": {"0": valid_eid},
+                    "memcache_local_eid_map_path": "/tmp/duplicate-source.json",
+                },
+                "Configure only one",
+            ),
+        ]
+        with mock.patch.dict(os.environ, {"ASCEND_RT_VISIBLE_DEVICES": "0"}):
+            for extra_config, expected_message in cases:
+                with self.subTest(extra_config=extra_config):
+                    kv_transfer_config = mock.MagicMock(kv_connector_extra_config=extra_config)
+                    with self.assertRaisesRegex(ValueError, expected_message):
+                        utils.setup_memcache_local_eid(0, kv_transfer_config)
+
+    def test_setup_ascend_local_comm_res_keeps_physical_mapping(self):
+        with tempfile.TemporaryDirectory() as config_dir:
+            endpoint = {"version": "1.3", "physical_device_id": 7}
+            config_path = os.path.join(config_dir, "ub_endpoint_npu_7.json")
+            with open(config_path, "w", encoding="utf-8") as config_file:
+                json.dump(endpoint, config_file)
+            kv_transfer_config = mock.MagicMock(
+                kv_connector_extra_config={"ascend_local_comm_res_path": config_dir}
+            )
+            with mock.patch.dict(os.environ, {"ASCEND_RT_VISIBLE_DEVICES": "4,7"}):
+                utils.setup_ascend_local_comm_res(1, kv_transfer_config)
+                self.assertEqual(json.loads(os.environ["ASCEND_LOCAL_COMM_RES"]), endpoint)
 
     def test_get_max_hidden_layers(self):
         from transformers import PretrainedConfig

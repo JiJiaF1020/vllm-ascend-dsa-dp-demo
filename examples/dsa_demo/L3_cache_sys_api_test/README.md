@@ -74,9 +74,10 @@ channel 停在 `IN_PROGRESS` 并最终超时属于适用边界，而不是 DSA�
 
 2026-08-25 的 MemFabric 临时包增加了进程级 `USE_LOCAL_EID` 覆盖。为 8 个 worker
 按物理 NPU ID 设置已验证可达的内部 fullmesh EID 后，完整 mesh 初始化、内存
-import 和正常清理均通过，原先的 channel timeout 消失。这只证明建链恢复；真正
-的 local put、跨 rank remote get 和 payload 校验仍由 `test_memcache_tp.py` 门禁
-确认。Mooncake 继续作为主路线，MemCache 作为可并行验证的候选。
+import 和正常清理均通过，原先的 channel timeout 消失。后续 TP8
+`test_memcache_tp.py` 又完成每个 rank 的 local put、环形 remote get 和 1 MiB
+payload 逐字节校验，gate 退出码为 0。Mooncake 继续作为优先主路线，MemCache
+恢复为可并行推进到 DSA-disabled 完整模型的候选。
 
 ## A5 调试容器
 
