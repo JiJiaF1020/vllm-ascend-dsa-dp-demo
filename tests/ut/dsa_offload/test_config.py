@@ -23,6 +23,7 @@ def _vllm_config(
     block_size: int = 128,
     speculative_config=None,
     kv_transfer_config=None,
+    shutdown_timeout: int = 0,
     decode_context_parallel_size: int = 1,
     prefill_context_parallel_size: int = 1,
     pipeline_parallel_size: int = 1,
@@ -71,6 +72,7 @@ def _vllm_config(
         ),
         speculative_config=speculative_config,
         kv_transfer_config=kv_transfer_config,
+        shutdown_timeout=shutdown_timeout,
         compilation_config=SimpleNamespace(
             mode=compilation_mode,
             cudagraph_mode=cudagraph_mode,
@@ -207,7 +209,16 @@ def test_invalid_static_config_is_rejected(
             {"speculative_config": _mtp_config(method="ngram")},
             "method='mtp'",
         ),
-        ({"kv_transfer_config": object()}, "KV transfer connectors"),
+        (
+            {
+                "kv_transfer_config": SimpleNamespace(
+                    kv_connector="AscendStoreConnector",
+                    kv_role="kv_producer",
+                    kv_connector_extra_config={},
+                )
+            },
+            "validated DSAL3Connector",
+        ),
         (
             {"decode_context_parallel_size": 2},
             "context parallelism",
@@ -229,6 +240,62 @@ def test_initial_runtime_support_matrix_is_enforced(
         DSAOffloadConfig.from_dict(
             {"enabled": True},
             vllm_config=_vllm_config(**config_updates),
+        )
+
+
+def test_dsa_l3_connector_is_allowed_for_mooncake_without_mtp() -> None:
+    kv_transfer = SimpleNamespace(
+        kv_connector="DSAL3Connector",
+        kv_role="kv_producer",
+        kv_connector_extra_config={"backend": "mooncake"},
+    )
+
+    config = DSAOffloadConfig.from_dict(
+        {"enabled": True},
+        vllm_config=_vllm_config(
+            kv_transfer_config=kv_transfer,
+            shutdown_timeout=300,
+        ),
+    )
+
+    assert config.enabled
+
+
+def test_dsa_l3_connector_requires_positive_shutdown_timeout() -> None:
+    kv_transfer = SimpleNamespace(
+        kv_connector="DSAL3Connector",
+        kv_role="kv_producer",
+        kv_connector_extra_config={"backend": "mooncake"},
+    )
+
+    with pytest.raises(ValueError, match="shutdown_timeout>0"):
+        DSAOffloadConfig.from_dict(
+            {"enabled": True},
+            vllm_config=_vllm_config(
+                kv_transfer_config=kv_transfer,
+                shutdown_timeout=0,
+            ),
+        )
+
+
+def test_dsa_l3_connector_rejects_mtp_in_first_version() -> None:
+    kv_transfer = SimpleNamespace(
+        kv_connector="DSAL3Connector",
+        kv_role="kv_producer",
+        kv_connector_extra_config={"backend": "mooncake"},
+    )
+
+    with pytest.raises(ValueError, match="does not yet support MTP"):
+        DSAOffloadConfig.from_dict(
+            {
+                "enabled": True,
+                "sparse_activation_tokens": 8192,
+                "resident_budget_tokens": [8192, 10240, 12288],
+            },
+            vllm_config=_vllm_config(
+                kv_transfer_config=kv_transfer,
+                speculative_config=_mtp_config(),
+            ),
         )
 
 

@@ -1,0 +1,13 @@
+{
+  "metadata_server": "P2PHANDSHAKE",
+  "protocol": "tcp",
+  "device_name": "",
+  "master_server_address": "127.0.0.1:50088",
+  "global_segment_size": "4GB",
+  "local_buffer_size": 1073741824,
+  "preferred_segment": false,
+  "prefer_alloc_in_same_node": false,
+  "tcp_segment_port_base": 45000,
+  "enable_ssd_offload": false,
+  "ssd_offload_path": ""
+}

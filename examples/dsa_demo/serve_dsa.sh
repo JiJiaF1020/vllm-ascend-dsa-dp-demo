@@ -7,6 +7,7 @@
 #   bash examples/dsa_demo/serve_dsa.sh
 
 set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # =========================
 # 用户配置
@@ -20,6 +21,13 @@ RUN_MODE="eager"  # eager / graph
 # A5 DSA 只支持 LI C8 与 SFA C8 同时开启，不提供半开组合。
 ENABLE_A5_PACKED_C8_DSA="false"
 ENABLE_MTP="false"
+ENABLE_L3_WRITE_BEHIND="false"
+MOONCAKE_CONFIG_PATH="${SCRIPT_DIR}/L3_cache_sys_api_test/baseline_e2e/configs/mooncake-dsa-tcp.json"
+MOONCAKE_GLOBAL_SEGMENT_SIZE="4GB"
+DSA_L3_MAX_INFLIGHT_STORE_JOBS="8"
+DSA_L3_MAX_ACTIVE_CHANNELS="8"
+DSA_L3_MAX_DESCRIPTORS_PER_PUT="128"
+DSA_L3_SHUTDOWN_TIMEOUT_SECONDS="300"
 SAFETENSORS_LOAD_STRATEGY="prefetch"
 
 HOST="0.0.0.0"
@@ -98,6 +106,35 @@ case "${ENABLE_MTP}" in
         ;;
 esac
 
+case "${ENABLE_L3_WRITE_BEHIND}" in
+    true)
+        if [[ "${ENABLE_MTP}" == "true" ]]; then
+            echo "DSA L3 first version does not support MTP" >&2
+            exit 2
+        fi
+        if [[ ! -f "${MOONCAKE_CONFIG_PATH}" ]]; then
+            echo "Mooncake config does not exist: ${MOONCAKE_CONFIG_PATH}" >&2
+            exit 2
+        fi
+        export MOONCAKE_CONFIG_PATH
+        export MOONCAKE_GLOBAL_SEGMENT_SIZE
+        unset ASCEND_GLOBAL_RESOURCE_CONFIG || true
+        KV_TRANSFER_ARGS=(
+            --shutdown-timeout
+            "${DSA_L3_SHUTDOWN_TIMEOUT_SECONDS}"
+            --kv-transfer-config
+            "{\"kv_connector\":\"DSAL3Connector\",\"kv_role\":\"kv_producer\",\"kv_load_failure_policy\":\"fail\",\"kv_connector_extra_config\":{\"backend\":\"mooncake\",\"max_inflight_l3_store_jobs\":${DSA_L3_MAX_INFLIGHT_STORE_JOBS},\"max_active_channels\":${DSA_L3_MAX_ACTIVE_CHANNELS},\"max_descriptors_per_l3_put\":${DSA_L3_MAX_DESCRIPTORS_PER_PUT}}}"
+        )
+        ;;
+    false)
+        KV_TRANSFER_ARGS=()
+        ;;
+    *)
+        echo "ENABLE_L3_WRITE_BEHIND must be true or false, got: ${ENABLE_L3_WRITE_BEHIND}" >&2
+        exit 2
+        ;;
+esac
+
 case "${ENABLE_A5_PACKED_C8_DSA}" in
     true)
         A5_PACKED_CONFIG_FIELDS='"enable_sparse_sfa_c8":true,"enable_sparse_li_c8":true,'
@@ -143,6 +180,7 @@ JSON
 
 echo "[dsa-online] mode=${RUN_MODE} model=${MODEL_PATH}"
 echo "[dsa-online] a5_packed_c8=${ENABLE_A5_PACKED_C8_DSA} mtp3=${ENABLE_MTP} safetensors=${SAFETENSORS_LOAD_STRATEGY}"
+echo "[dsa-online] l3_write_behind=${ENABLE_L3_WRITE_BEHIND} mooncake_config=${MOONCAKE_CONFIG_PATH}"
 echo "[dsa-online] endpoint=http://${HOST}:${PORT}/v1"
 
 exec vllm serve "${MODEL_PATH}" \
@@ -169,6 +207,7 @@ exec vllm serve "${MODEL_PATH}" \
     --generation-config vllm \
     --reasoning-parser glm45 \
     --additional-config "${ADDITIONAL_CONFIG}" \
+    "${KV_TRANSFER_ARGS[@]}" \
     "${SPECULATIVE_ARGS[@]}" \
     "${PREFILL_ARGS[@]}" \
     "${EXECUTION_ARGS[@]}"

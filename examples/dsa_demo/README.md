@@ -24,7 +24,8 @@ L3 接入、异步 write-behind 和 HBM 热层后续方案见
 - 当前 checkout 的自定义算子已经完整编译并重新安装；
 - Ascend 910C 首版使用 PP=1、DCP=1、PCP=1；
 - `block_size=128`；
-- 关闭 async scheduling、KV transfer 和 KV-cache metrics/events；本地
+- 关闭 async scheduling 和 KV-cache metrics/events；KV transfer 只允许当前
+  首版 `DSAL3Connector`，其他 Connector 仍拒绝；本地
   DRAM prefix cache 可通过脚本中的 `ENABLE_PREFIX_CACHING` 单独开启；
   如启用 speculative decoding，只允许 A5 packed-C8
   下固定 MTP3 与 greedy sampling；
@@ -70,6 +71,7 @@ PREFIX_CACHE_REPLAY_ROUNDS = 1  # prefix 验收时与上项一起改为 2
 LOGGING_LEVEL = "INFO"
 ENABLE_A5_PACKED_C8_DSA = False  # A5 W4A4C8 设 True；A3 W4A8 保持 False
 ENABLE_MTP = False  # A5 C8 上设 True 后固定启用 3 个 draft token
+ENABLE_L3_WRITE_BEHIND = False  # 首版 Mooncake rank0 L2->L3 异步写
 RESULT_JSON = None  # 需要保存对照 token IDs 时填写路径
 ```
 
@@ -267,6 +269,40 @@ DSA resident/DRAM 数据面；默认 ratio=3 时启动容量报告应显示 targ
 若修改了 `SERVED_MODEL_NAME`，同步把 `stream_chat_client.py` 顶部的
 `MODEL_NAME` 改成相同值。
 
+首版 DSA L3 仅验证 write-behind。先启动 Mooncake Master，再设置：
+
+```bash
+ENABLE_MTP="false"
+ENABLE_L3_WRITE_BEHIND="true"
+MOONCAKE_CONFIG_PATH="${SCRIPT_DIR}/L3_cache_sys_api_test/baseline_e2e/configs/mooncake-dsa-tcp.json"
+MOONCAKE_GLOBAL_SEGMENT_SIZE="4GB"  # 单 40k DSA block 约占 2.2GB
+DSA_L3_MAX_DESCRIPTORS_PER_PUT="128"
+DSA_L3_SHUTDOWN_TIMEOUT_SECONDS="300"
+```
+
+该模式使用 `DSAL3Connector` 和 Mooncake Store-owned TCP。所有 TP rank 都按
+vLLM-Ascend embedded-client 范式贡献一段 `MOONCAKE_GLOBAL_SEGMENT_SIZE`，
+但只有 TP rank0 上传一份完整 Indexer+MLA L2 bundle；request finish 不等待，
+L2 physical block 被复用前才触发相关 job fence。当前尚不从 L3 lookup/load，
+因此启用后 TTFT 不应出现 external hit。验收时应看到每个 TP rank 的
+`contributes_segment=True`，以及唯一 producer 的 `store planned/submitted/`
+`completed success=True` 和 Mooncake 对象增长。请求响应不等待异步 put；当
+离线脚本随后销毁 EngineCore 时，框架会继续执行 zero-token connector progress
+step，待 pending store 完成后再关闭各 rank 的 Mooncake segment。DSA L3
+显式要求 `shutdown_timeout>0`；示例预留 300 秒是为了覆盖首次跨 segment 懒建链，
+并不改变请求完成时延，只限制进程退出最多等待多久。离线 `LLM` 的默认
+finalizer 不向 MPClient 传递该 timeout，因此 `simple_prompt_test.py` 会在成功
+生成后显式调用 engine-core shutdown；在线 launcher 原生会传递该配置。
+当前 A5 GLM-5.2 一个完整逻辑块包含 42 个 Indexer plane 和 78 个 MLA
+plane。示例按 128 个 Mooncake descriptor 切分 backend put，因此一次传一个完整
+Indexer+MLA 块，避免把 64 块合成 7,680 个 descriptor 后触发 10 秒同步传输
+超时；后续性能调优可在实测门禁下提高该预算。TCP 模式不创建外部
+`GlobalTE`，而是由 Mooncake Store 创建 engine，并通过
+`store.register_buffer()` 注册 TP0 固定 L2 arena。配置中的
+`tcp_segment_port_base + rank` 的保留区间仅用于生成 worker segment identity；
+scheduler-only client 使用额外固定 offset，真实 RPC/TCP 监听端口仍由 Mooncake
+分配。社区 `mooncake.json` 保持 `protocol=ascend`，不受 DSA TCP 改造影响。
+
 ```bash
 bash examples/dsa_demo/serve_dsa.sh 2>&1 | tee dsa-online.log
 ```
@@ -402,11 +438,11 @@ LV-Eval 或 CLongEval 官方排行榜分数。正式精度对比应保持相同�
 
 - prefill/decode mixed batch（chunked prefill 本身已支持）；
 - async scheduling；
-- HBM Indexer/dense-MLA 热副本协同命中与 L3 prefix cache；本地 DRAM
-  complete-bundle 第一版仍待 NPU 端到端验收；
+- HBM Indexer/dense-MLA 热副本协同命中与 L3 prefix load；LocalDRAM
+  complete-bundle 的 rank0 write-behind 已进入首版 NPU 验收；
 - preemption/resume；
 - 非 MTP speculative method、MTP draft 数不等于 3、非 greedy MTP；
-- KV transfer connector；
+- 除 `DSAL3Connector` store-only 路径外的 KV transfer connector；
 - context parallel 和 pipeline parallel；
 - KV-cache metrics/events；
 - A5 设备算子验收。

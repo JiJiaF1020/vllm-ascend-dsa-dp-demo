@@ -6,6 +6,7 @@ import pytest
 import torch
 from vllm.v1.core.kv_cache_utils import BlockHash
 
+from vllm_ascend.dsa_offload.l3.schema import DSAL3Component
 from vllm_ascend.dsa_offload.scheduler_dram_pool import (
     DSASchedulerDRAMBlockDirectory,
     calculate_dram_capacity_plan,
@@ -159,6 +160,41 @@ def test_complete_layer_adds_indexer_byte_arenas_without_copy() -> None:
         (9, 128 * 128),
         (9, 128 * 4),
     )
+
+
+def test_l3_component_views_use_fixed_arena_addresses() -> None:
+    store = _make_store()
+    resident_packed = torch.empty(4, 128, 1, 656, dtype=torch.int8)
+    indexer_key = torch.empty(12, 128, 1, 128, dtype=torch.int8)
+    indexer_scale = torch.empty(12, 128, 1, 1, dtype=torch.float32)
+    store.add_packed_layer(
+        layer_id=0,
+        resident_packed_cache=resident_packed,
+        indexer_cache=(indexer_key, indexer_scale),
+    )
+
+    regions = store.get_l3_registration_regions()
+    assert len(regions) == 3
+    assert store.get_l3_component_bytes_per_block(
+        DSAL3Component.INDEXER
+    ) == 128 * 128 + 128 * 4
+    assert store.get_l3_component_bytes_per_block(
+        DSAL3Component.MLA
+    ) == 128 * 656
+
+    addresses, sizes = store.build_l3_component_payload(
+        component=DSAL3Component.INDEXER,
+        physical_block_ids=(1, 3),
+    )
+    arenas = store.get_layer_arenas(0)
+    assert sizes == [[128 * 128, 128 * 4]] * 2
+    assert addresses[0] == [
+        int(plane[1].data_ptr()) for plane in arenas.indexer_dram_bytes
+    ]
+    assert addresses[1] == [
+        int(plane[3].data_ptr()) for plane in arenas.indexer_dram_bytes
+    ]
+
 
 
 def test_scheduler_directory_assigns_once_and_reclaims_request() -> None:

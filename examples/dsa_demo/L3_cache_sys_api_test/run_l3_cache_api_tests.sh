@@ -27,6 +27,28 @@ MOONCAKE_TP_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-${ASCEND_VISIBLE_DEVICE
 MOONCAKE_TP_ACTIVE_DEVICES=${MOONCAKE_TP_ACTIVE_DEVICES:-$MOONCAKE_TP_VISIBLE_DEVICES}
 MOONCAKE_TP_COMM_MODE=${MOONCAKE_TP_COMM_MODE:-global_ub_device}
 MOONCAKE_TP_MAX_ACTIVE_CHANNELS=${MOONCAKE_TP_MAX_ACTIVE_CHANNELS:-8}
+MOONCAKE_TP_BUFFER_MODE=${MOONCAKE_TP_BUFFER_MODE:-device}
+MOONCAKE_TP_SOURCE_BUFFER_MODE=${MOONCAKE_TP_SOURCE_BUFFER_MODE:-}
+MOONCAKE_TP_DESTINATION_BUFFER_MODE=${MOONCAKE_TP_DESTINATION_BUFFER_MODE:-}
+MOONCAKE_TP_NUM_BUFFERS=${MOONCAKE_TP_NUM_BUFFERS:-1}
+MOONCAKE_TP_PAYLOAD_BYTES=${MOONCAKE_TP_PAYLOAD_BYTES:-1048576}
+MOONCAKE_TP_PAYLOAD_LAYOUT=${MOONCAKE_TP_PAYLOAD_LAYOUT:-uniform}
+MOONCAKE_TP_SEGMENT_BYTES=${MOONCAKE_TP_SEGMENT_BYTES:-1073741824}
+MOONCAKE_TP_LOCAL_BUFFER_BYTES=${MOONCAKE_TP_LOCAL_BUFFER_BYTES:-1073741824}
+MOONCAKE_TP_ARENA_BLOCKS=${MOONCAKE_TP_ARENA_BLOCKS:-1}
+MOONCAKE_TP_BLOCK_INDEX=${MOONCAKE_TP_BLOCK_INDEX:-0}
+MOONCAKE_TP_IO_THREAD=${MOONCAKE_TP_IO_THREAD:-main}
+MOONCAKE_TP_PLACEMENT_MODE=${MOONCAKE_TP_PLACEMENT_MODE:-preferred}
+MOONCAKE_TP_FORCE_REMOTE_PUT=${MOONCAKE_TP_FORCE_REMOTE_PUT:-false}
+MOONCAKE_TP_PRODUCER_RANK=${MOONCAKE_TP_PRODUCER_RANK:-}
+MOONCAKE_TP_CONSUMER_DEVICE=${MOONCAKE_TP_CONSUMER_DEVICE:-}
+MOONCAKE_TP_TARGET_DEVICE=${MOONCAKE_TP_TARGET_DEVICE:-}
+MOONCAKE_STORE_TCP_DEVICES=${MOONCAKE_STORE_TCP_DEVICES:-0,1}
+MOONCAKE_STORE_TCP_SEGMENT_BYTES=${MOONCAKE_STORE_TCP_SEGMENT_BYTES:-134217728}
+MOONCAKE_STORE_TCP_LOCAL_BUFFER_BYTES=${MOONCAKE_STORE_TCP_LOCAL_BUFFER_BYTES:-67108864}
+MOONCAKE_STORE_TCP_NUM_PLANES=${MOONCAKE_STORE_TCP_NUM_PLANES:-4}
+MOONCAKE_STORE_TCP_PLANE_BYTES=${MOONCAKE_STORE_TCP_PLANE_BYTES:-262144}
+MOONCAKE_STORE_TCP_TIMEOUT=${MOONCAKE_STORE_TCP_TIMEOUT:-90}
 DSA_SWAPPED_COMPONENT=${DSA_SWAPPED_COMPONENT:-all}
 DSA_SWAPPED_SCHEMA_MODE=${DSA_SWAPPED_SCHEMA_MODE:-exact}
 DSA_SWAPPED_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-${ASCEND_VISIBLE_DEVICES:-$DEVICE_ID}}
@@ -52,6 +74,7 @@ Gates:
   memcache-all           Run capabilities, host, NPU and GVA gates in order.
   ascend-store-memcache  Test the real vLLM-Ascend MemcacheBackend.
   ascend-store-mooncake  Test the real vLLM-Ascend MooncakeBackend.
+  ascend-store-mooncake-tcp  Test Store-owned TCP in MooncakeBackend.
   mooncake-capabilities  Check the NPU wheel, Store and TransferEngine APIs.
   mooncake-runtime-import  Check the vLLM-like torch_npu import order.
   mooncake-imports       Isolate store/engine imports and preserve exit codes.
@@ -60,6 +83,10 @@ Gates:
   mooncake-gdb-engine    Capture the engine import abort under GDB.
   mooncake-npu           Run NPU multi-buffer IO only if imports are stable.
   mooncake-tp            Test TP workers' cross-segment NPU round trip.
+  mooncake-store-tcp-inspect  Inspect Store TCP APIs and vLLM protocol locks.
+  mooncake-store-tcp-single   Store-owned TCP with one swapped L2 worker.
+  mooncake-store-tcp-cross    Store-owned TCP ring across 2+ swapped L2 workers.
+  mooncake-store-tcp-all      Run the three Store-owned TCP gates in order.
   dsa-swapped-mooncake   Test one exact A5 DSA block in swapped memory.
   dsa-swapped-memcache   Run the same swapped-memory schema on MemCache.
   hixlep-config          Validate A5 per-device LocalCommRes JSON files.
@@ -75,6 +102,20 @@ Environment overrides:
   MOONCAKE_LOCAL_HOST, MOONCAKE_TP_LOCAL_HOST,
   MOONCAKE_MASTER_ADDRESS, HIXLEP_CONFIG_PATH, MOONCAKE_TP_COMM_MODE,
   MOONCAKE_TP_ACTIVE_DEVICES, MOONCAKE_TP_MAX_ACTIVE_CHANNELS,
+  MOONCAKE_TP_BUFFER_MODE, MOONCAKE_TP_SOURCE_BUFFER_MODE,
+  MOONCAKE_TP_DESTINATION_BUFFER_MODE, MOONCAKE_TP_NUM_BUFFERS,
+  MOONCAKE_TP_PAYLOAD_LAYOUT, MOONCAKE_TP_SEGMENT_BYTES,
+  MOONCAKE_TP_LOCAL_BUFFER_BYTES,
+  MOONCAKE_TP_PAYLOAD_BYTES, MOONCAKE_TP_ARENA_BLOCKS,
+  MOONCAKE_TP_BLOCK_INDEX, MOONCAKE_TP_IO_THREAD,
+  MOONCAKE_TP_PLACEMENT_MODE,
+  MOONCAKE_TP_FORCE_REMOTE_PUT,
+  MOONCAKE_TP_PRODUCER_RANK, MOONCAKE_TP_CONSUMER_DEVICE,
+  MOONCAKE_TP_TARGET_DEVICE,
+  MOONCAKE_STORE_TCP_DEVICES, MOONCAKE_STORE_TCP_SEGMENT_BYTES,
+  MOONCAKE_STORE_TCP_LOCAL_BUFFER_BYTES, MOONCAKE_STORE_TCP_NUM_PLANES,
+  MOONCAKE_STORE_TCP_PLANE_BYTES, MOONCAKE_STORE_TCP_TIMEOUT,
+  ASCEND_BUFFER_POOL,
   DSA_SWAPPED_COMPONENT, DSA_SWAPPED_SCHEMA_MODE, DSA_SWAPPED_VISIBLE_DEVICES,
   DSA_SWAPPED_MAX_ACTIVE_CHANNELS, DSA_SWAPPED_MOONCAKE_COMM_MODE,
   DSA_SWAPPED_MEMCACHE_LOCAL_EID
@@ -153,7 +194,7 @@ collect_recent_hcomm_logs() {
             echo "[l3-gate] scan_root=$root"
             find "$root" -type f "${freshness[@]}" -print0 2>/dev/null \
                 | xargs -0 -r grep -aHnE \
-                    'Hcomm(Channel|Endpoint)|AicpuTsUrmaChannel|DevUbCtpConnection|UbMemTransport|Socket|UBC_CTP|E19999|HCCL_E_' \
+                    'Hcomm(Channel|Endpoint)|HcclCommInit|rank_table|AicpuTsUrmaChannel|DevUbCtpConnection|UbMemTransport|Socket|UBC_CTP|E19999|HCCL_E_' \
                     2>/dev/null || true
         done
     } | tail -n 2000 | tee "$log_file"
@@ -253,13 +294,20 @@ ascend_store_memcache() {
 }
 
 ascend_store_mooncake() {
+    local protocol=${1:-ascend}
+    local buffer_mode=device
+    if [[ $protocol == tcp ]]; then
+        buffer_mode=swapped
+    fi
     mooncake_runtime_import
     maybe_source_cann
-    run_logged ascend_store_mooncake \
+    run_logged "ascend_store_mooncake_${protocol}" \
         "$PYTHON_BIN" "$SCRIPT_DIR/test_ascend_store_backends.py" \
         --backend mooncake \
         --device-id "$DEVICE_ID" \
-        --visible-devices "${ASCEND_RT_VISIBLE_DEVICES:-0}"
+        --visible-devices "${ASCEND_RT_VISIBLE_DEVICES:-0}" \
+        --mooncake-protocol "$protocol" \
+        --mooncake-buffer-mode "$buffer_mode"
 }
 
 mooncake_capabilities() {
@@ -440,16 +488,46 @@ mooncake_tp() {
         hixlep)
             ASCEND_RT_VISIBLE_DEVICES="$MOONCAKE_TP_VISIBLE_DEVICES" hixlep_config
             ;;
-        global_ub|global_ub_device|auto)
+        global_ub|global_ub_device|global_ub_host|auto|tcp)
             ;;
         *)
-            echo "MOONCAKE_TP_COMM_MODE must be global_ub/global_ub_device/hixlep/auto, got: $MOONCAKE_TP_COMM_MODE" >&2
+            echo "MOONCAKE_TP_COMM_MODE must be global_ub/global_ub_device/global_ub_host/hixlep/auto/tcp, got: $MOONCAKE_TP_COMM_MODE" >&2
             return 2
             ;;
     esac
     mooncake_runtime_import "$MOONCAKE_TP_VISIBLE_DEVICES"
     maybe_source_cann
     local status=0
+    local extra_args=(
+        --buffer-mode "$MOONCAKE_TP_BUFFER_MODE"
+        --num-buffers "$MOONCAKE_TP_NUM_BUFFERS"
+        --payload-bytes "$MOONCAKE_TP_PAYLOAD_BYTES"
+        --payload-layout "$MOONCAKE_TP_PAYLOAD_LAYOUT"
+        --segment-bytes "$MOONCAKE_TP_SEGMENT_BYTES"
+        --local-buffer-bytes "$MOONCAKE_TP_LOCAL_BUFFER_BYTES"
+        --arena-blocks "$MOONCAKE_TP_ARENA_BLOCKS"
+        --block-index "$MOONCAKE_TP_BLOCK_INDEX"
+        --io-thread "$MOONCAKE_TP_IO_THREAD"
+        --placement-mode "$MOONCAKE_TP_PLACEMENT_MODE"
+    )
+    if [[ $MOONCAKE_TP_FORCE_REMOTE_PUT == true ]]; then
+        extra_args+=(--force-remote-put)
+    fi
+    if [[ -n $MOONCAKE_TP_PRODUCER_RANK ]]; then
+        extra_args+=(--producer-rank "$MOONCAKE_TP_PRODUCER_RANK")
+    fi
+    if [[ -n $MOONCAKE_TP_CONSUMER_DEVICE ]]; then
+        extra_args+=(--consumer-device "$MOONCAKE_TP_CONSUMER_DEVICE")
+    fi
+    if [[ -n $MOONCAKE_TP_TARGET_DEVICE ]]; then
+        extra_args+=(--target-device "$MOONCAKE_TP_TARGET_DEVICE")
+    fi
+    if [[ -n $MOONCAKE_TP_SOURCE_BUFFER_MODE ]]; then
+        extra_args+=(--source-buffer-mode "$MOONCAKE_TP_SOURCE_BUFFER_MODE")
+    fi
+    if [[ -n $MOONCAKE_TP_DESTINATION_BUFFER_MODE ]]; then
+        extra_args+=(--destination-buffer-mode "$MOONCAKE_TP_DESTINATION_BUFFER_MODE")
+    fi
     run_logged mooncake_tp \
         "$PYTHON_BIN" "$SCRIPT_DIR/test_mooncake_tp.py" \
         --config-path "$HIXLEP_CONFIG_PATH" \
@@ -459,11 +537,28 @@ mooncake_tp() {
         --max-active-channels "$MOONCAKE_TP_MAX_ACTIVE_CHANNELS" \
         --local-host "$MOONCAKE_TP_LOCAL_HOST" \
         --master-address "$MOONCAKE_MASTER_ADDRESS" \
+        "${extra_args[@]}" \
         || status=$?
     if ((status != 0)); then
         collect_recent_hcomm_logs mooncake_tp
     fi
     return "$status"
+}
+
+mooncake_store_tcp() {
+    local mode=$1
+    maybe_source_cann
+    run_logged "mooncake_store_tcp_${mode}" \
+        "$PYTHON_BIN" "$SCRIPT_DIR/test_mooncake_store_tcp.py" \
+        --mode "$mode" \
+        --devices "$MOONCAKE_STORE_TCP_DEVICES" \
+        --local-host "$MOONCAKE_LOCAL_HOST" \
+        --master-address "$MOONCAKE_MASTER_ADDRESS" \
+        --segment-bytes "$MOONCAKE_STORE_TCP_SEGMENT_BYTES" \
+        --local-buffer-bytes "$MOONCAKE_STORE_TCP_LOCAL_BUFFER_BYTES" \
+        --num-planes "$MOONCAKE_STORE_TCP_NUM_PLANES" \
+        --plane-bytes "$MOONCAKE_STORE_TCP_PLANE_BYTES" \
+        --timeout "$MOONCAKE_STORE_TCP_TIMEOUT"
 }
 
 dsa_swapped_mooncake() {
@@ -609,7 +704,10 @@ case "$gate" in
         ascend_store_memcache
         ;;
     ascend-store-mooncake)
-        ascend_store_mooncake
+        ascend_store_mooncake ascend
+        ;;
+    ascend-store-mooncake-tcp)
+        ascend_store_mooncake tcp
         ;;
     mooncake-capabilities)
         mooncake_capabilities
@@ -634,6 +732,20 @@ case "$gate" in
         ;;
     mooncake-tp)
         mooncake_tp
+        ;;
+    mooncake-store-tcp-inspect)
+        mooncake_store_tcp inspect
+        ;;
+    mooncake-store-tcp-single)
+        mooncake_store_tcp single
+        ;;
+    mooncake-store-tcp-cross)
+        mooncake_store_tcp cross
+        ;;
+    mooncake-store-tcp-all)
+        mooncake_store_tcp inspect
+        mooncake_store_tcp single
+        mooncake_store_tcp cross
         ;;
     dsa-swapped-mooncake)
         dsa_swapped_mooncake

@@ -50,7 +50,11 @@ def _disable_preemption_on_prefill_node(vllm_config) -> bool:
     if not vllm_version_is("0.23.0"):
         return False
     kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
-    return getattr(kv_transfer_config, "kv_role", None) == "kv_producer"
+    return (
+        getattr(kv_transfer_config, "kv_role", None) == "kv_producer"
+        and getattr(kv_transfer_config, "kv_connector", None)
+        != "DSAL3Connector"
+    )
 
 
 class BalanceScheduler(Scheduler):

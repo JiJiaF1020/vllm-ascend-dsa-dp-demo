@@ -45,6 +45,15 @@ QUANTIZATION = "ascend"
 ENABLE_EXPERT_PARALLEL = True
 ENABLE_MTP = False
 MTP_NUM_SPECULATIVE_TOKENS = 3
+ENABLE_L3_WRITE_BEHIND = False
+MOONCAKE_CONFIG_PATH = str(
+    Path(__file__).resolve().parent / "L3_cache_sys_api_test/baseline_e2e/configs/mooncake-dsa-tcp.json"
+)
+MOONCAKE_GLOBAL_SEGMENT_SIZE = "4GB"
+DSA_L3_MAX_INFLIGHT_STORE_JOBS = 8
+DSA_L3_MAX_ACTIVE_CHANNELS = 8
+DSA_L3_MAX_DESCRIPTORS_PER_PUT = 128
+DSA_L3_SHUTDOWN_TIMEOUT_SECONDS = 300
 
 # A5/950 上的 DSA 首版只支持 LI C8 与 SFA C8 同时开启；A3/910C 保持 False。
 # disabled 模式也会保留这个 vLLM-Ascend 原生物理布局开关，便于用同一 C8
@@ -79,24 +88,28 @@ NATIVE_RUNTIME_ENV_OVERRIDES = {
     "VLLM_ASCEND_ENABLE_MLAPO": "1",
     "VLLM_LOGGING_LEVEL": LOGGING_LEVEL,
 }
+if ENABLE_L3_WRITE_BEHIND:
+    # Store-owned TCP does not consume global_ub. Avoid inheriting a stale
+    # setting from an earlier AscendDirect probe in the same shell.
+    os.environ.pop("ASCEND_GLOBAL_RESOURCE_CONFIG", None)
+    NATIVE_RUNTIME_ENV_OVERRIDES.update(
+        {
+            "MOONCAKE_CONFIG_PATH": MOONCAKE_CONFIG_PATH,
+            "MOONCAKE_GLOBAL_SEGMENT_SIZE": MOONCAKE_GLOBAL_SEGMENT_SIZE,
+        }
+    )
 
 for key, value in NATIVE_RUNTIME_ENV_OVERRIDES.items():
     os.environ[key] = value
 
 # 环境变量必须在首次导入 vLLM 前设置，平台插件会在 import/LLM 构造期间发现。
 from vllm import LLM, SamplingParams  # noqa: E402
-from vllm.config import ProfilerConfig  # noqa: E402
+from vllm.config import KVTransferConfig, ProfilerConfig  # noqa: E402
 
 
 def build_dsa_config(enable_graph: bool) -> dict[str, Any]:
-    sparse_activation_tokens = (
-        8192 if ENABLE_MTP else DSA_SPARSE_ACTIVATION_TOKENS
-    )
-    resident_budget_tokens = (
-        [8192, 10240, 12288]
-        if ENABLE_MTP
-        else DSA_RESIDENT_BUDGET_TOKENS
-    )
+    sparse_activation_tokens = 8192 if ENABLE_MTP else DSA_SPARSE_ACTIVATION_TOKENS
+    resident_budget_tokens = [8192, 10240, 12288] if ENABLE_MTP else DSA_RESIDENT_BUDGET_TOKENS
     return {
         "enabled": True,
         "split_indexer_cache": True,
@@ -113,13 +126,13 @@ def build_dsa_config(enable_graph: bool) -> dict[str, Any]:
 
 def build_llm_kwargs() -> dict[str, Any]:
     if ENABLE_MTP and not ENABLE_A5_PACKED_C8_DSA:
-        raise ValueError(
-            "DSA compromise MTP3 requires ENABLE_A5_PACKED_C8_DSA=True"
-        )
+        raise ValueError("DSA compromise MTP3 requires ENABLE_A5_PACKED_C8_DSA=True")
     if ENABLE_MTP and MTP_NUM_SPECULATIVE_TOKENS != 3:
-        raise ValueError(
-            "DSA compromise MTP requires MTP_NUM_SPECULATIVE_TOKENS=3"
-        )
+        raise ValueError("DSA compromise MTP requires MTP_NUM_SPECULATIVE_TOKENS=3")
+    if ENABLE_L3_WRITE_BEHIND and ENABLE_MTP:
+        raise ValueError("DSA L3 first version does not support MTP")
+    if ENABLE_L3_WRITE_BEHIND and RUN_MODE == "disabled":
+        raise ValueError("ENABLE_L3_WRITE_BEHIND requires DSA to be enabled")
     graph_enabled = RUN_MODE == "graph"
     kwargs: dict[str, Any] = {
         "model": MODEL_PATH,
@@ -135,6 +148,7 @@ def build_llm_kwargs() -> dict[str, Any]:
         "trust_remote_code": True,
         "enable_prefix_caching": ENABLE_PREFIX_CACHING,
         "enable_chunked_prefill": ENABLE_CHUNKED_PREFILL,
+        "scheduler_reserve_full_isl": ENABLE_CHUNKED_PREFILL,
         "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
         "block_size": 128,
         "async_scheduling": False,
@@ -162,16 +176,23 @@ def build_llm_kwargs() -> dict[str, Any]:
             "method": "mtp",
             "num_speculative_tokens": MTP_NUM_SPECULATIVE_TOKENS,
         }
-    if graph_enabled:
-        decode_query_len = (
-            1 + MTP_NUM_SPECULATIVE_TOKENS if ENABLE_MTP else 1
+    if ENABLE_L3_WRITE_BEHIND:
+        kwargs["shutdown_timeout"] = DSA_L3_SHUTDOWN_TIMEOUT_SECONDS
+        kwargs["kv_transfer_config"] = KVTransferConfig(
+            kv_connector="DSAL3Connector",
+            kv_role="kv_producer",
+            kv_load_failure_policy="fail",
+            kv_connector_extra_config={
+                "backend": "mooncake",
+                "max_inflight_l3_store_jobs": (DSA_L3_MAX_INFLIGHT_STORE_JOBS),
+                "max_active_channels": DSA_L3_MAX_ACTIVE_CHANNELS,
+                "max_descriptors_per_l3_put": (DSA_L3_MAX_DESCRIPTORS_PER_PUT),
+            },
         )
+    if graph_enabled:
+        decode_query_len = 1 + MTP_NUM_SPECULATIVE_TOKENS if ENABLE_MTP else 1
         capture_sizes = sorted(
-            {
-                size * decode_query_len
-                for size in (*DSA_GRAPH_CAPTURE_SIZES, MAX_NUM_SEQS)
-                if size <= MAX_NUM_SEQS
-            }
+            {size * decode_query_len for size in (*DSA_GRAPH_CAPTURE_SIZES, MAX_NUM_SEQS) if size <= MAX_NUM_SEQS}
         )
         kwargs["compilation_config"] = {
             "mode": "VLLM_COMPILE",
@@ -203,6 +224,16 @@ def write_result(payload: dict[str, Any]) -> None:
     print(f"[dsa-smoke] wrote result: {path}")
 
 
+def shutdown_l3_engine(llm: LLM) -> None:
+    """离线 LLM finalizer 不传 timeout，DSA L3 需要显式 drain。"""
+
+    if not ENABLE_L3_WRITE_BEHIND:
+        return
+    engine_core = llm.llm_engine.engine_core
+    print(f"[dsa-smoke] draining pending L3 stores before engine teardown; timeout={DSA_L3_SHUTDOWN_TIMEOUT_SECONDS}s")
+    engine_core.shutdown(timeout=DSA_L3_SHUTDOWN_TIMEOUT_SECONDS)
+
+
 def main() -> None:
     if RUN_MODE not in {"disabled", "cache-init", "eager", "graph"}:
         raise ValueError(f"RUN_MODE must be disabled/cache-init/eager/graph, got {RUN_MODE!r}")
@@ -217,6 +248,7 @@ def main() -> None:
         f"mode={RUN_MODE} model={MODEL_PATH!r} prompts={len(PROMPTS)} "
         f"max_model_len={MAX_MODEL_LEN} max_num_seqs={MAX_NUM_SEQS} "
         f"a5_packed_c8={ENABLE_A5_PACKED_C8_DSA} mtp={ENABLE_MTP} "
+        f"l3_write_behind={ENABLE_L3_WRITE_BEHIND} "
         f"prefix_cache={ENABLE_PREFIX_CACHING} "
         f"replay_rounds={PREFIX_CACHE_REPLAY_ROUNDS}"
     )
@@ -235,6 +267,7 @@ def main() -> None:
                 "validated": ("LLM construction completed with DSA split cache enabled"),
             }
         )
+        shutdown_l3_engine(llm)
         del llm
         return
 
@@ -288,6 +321,7 @@ def main() -> None:
             "outputs": records,
         }
     )
+    shutdown_l3_engine(llm)
     del llm
 
 

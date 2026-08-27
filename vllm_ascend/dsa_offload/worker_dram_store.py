@@ -29,6 +29,7 @@ from vllm_ascend.dsa_offload.contracts import (
     DSA_A5_PACKED_KV_ROW_BYTES,
     DSA_DRAM_NULL_BLOCK_ID,
 )
+from vllm_ascend.dsa_offload.l3.schema import DSAL3Component
 from vllm_ascend.dsa_offload.ops import cache_block_byte_view
 
 ArenaFactory = Callable[
@@ -356,6 +357,106 @@ class DSAWorkerDRAMStore:
             return self._layer_arenas[int(layer_id)]
         except KeyError as exc:
             raise RuntimeError(f"DSA DRAM arenas are not initialized for layer {layer_id}") from exc
+
+    def _l3_component_planes(
+        self,
+        component: DSAL3Component | str,
+    ) -> tuple[torch.Tensor, ...]:
+        """按稳定 layer/plane 顺序返回一个 L3 component 的 byte views。"""
+
+        component = DSAL3Component(component)
+        planes: list[torch.Tensor] = []
+        for layer_id in sorted(self._layer_arenas):
+            arenas = self._layer_arenas[layer_id]
+            if component is DSAL3Component.INDEXER:
+                planes.extend(arenas.indexer_dram_bytes)
+            else:
+                planes.extend(arenas.resident_dram_bytes)
+        if not planes:
+            raise RuntimeError(
+                f"DSA L3 component {component.value!r} has no DRAM planes"
+            )
+        for plane in planes:
+            if (
+                plane.dtype != torch.int8
+                or plane.ndim != 2
+                or int(plane.shape[0]) != self.arena_capacity
+                or not plane.is_contiguous()
+            ):
+                raise RuntimeError(
+                    "DSA L3 requires contiguous [arena, bytes] int8 views, "
+                    f"got shape={tuple(plane.shape)}, dtype={plane.dtype}, "
+                    f"contiguous={plane.is_contiguous()}"
+                )
+        return tuple(planes)
+
+    def get_l3_registration_regions(self) -> tuple[tuple[int, int], ...]:
+        """返回初始化期需向 L3 backend 增量注册的完整 arena 区间。"""
+
+        regions: list[tuple[int, int]] = []
+        seen_ptrs: set[int] = set()
+        for component in DSAL3Component:
+            for plane in self._l3_component_planes(component):
+                pointer = int(plane.data_ptr())
+                size = int(plane.numel()) * plane.element_size()
+                if pointer in seen_ptrs:
+                    continue
+                seen_ptrs.add(pointer)
+                regions.append((pointer, size))
+        return tuple(regions)
+
+    def get_l3_component_bytes_per_block(
+        self,
+        component: DSAL3Component | str,
+    ) -> int:
+        return sum(
+            int(plane.shape[1]) * plane.element_size()
+            for plane in self._l3_component_planes(component)
+        )
+
+    def get_l3_component_plane_count(
+        self,
+        component: DSAL3Component | str,
+    ) -> int:
+        return len(self._l3_component_planes(component))
+
+    def build_l3_component_payload(
+        self,
+        *,
+        component: DSAL3Component | str,
+        physical_block_ids: tuple[int, ...],
+    ) -> tuple[list[list[int]], list[list[int]]]:
+        """把 L2 block IDs 映射为 Mooncake multi-buffer 地址/长度列。"""
+
+        if not physical_block_ids:
+            return [], []
+        block_ids = np.asarray(physical_block_ids, dtype=np.int64)
+        if (
+            block_ids.ndim != 1
+            or int(block_ids.min()) <= DSA_DRAM_NULL_BLOCK_ID
+            or int(block_ids.max()) > self.usable_blocks
+        ):
+            raise ValueError(
+                "DSA L3 payload contains an invalid L2 block ID: "
+                f"ids={physical_block_ids}, capacity={self.usable_blocks}"
+            )
+        planes = self._l3_component_planes(component)
+        plane_sizes = [
+            int(plane.shape[1]) * plane.element_size()
+            for plane in planes
+        ]
+        addresses: list[list[int]] = []
+        sizes: list[list[int]] = []
+        for block_id in block_ids.tolist():
+            addresses.append(
+                [
+                    int(plane.data_ptr())
+                    + int(block_id) * int(plane.stride(0)) * plane.element_size()
+                    for plane in planes
+                ]
+            )
+            sizes.append(list(plane_sizes))
+        return addresses, sizes
 
     def apply_assignment(
         self,

@@ -19,13 +19,14 @@ import json
 import os
 import tempfile
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend import (
     MooncakeStoreConfig,
     _convert_to_bytes,
+    _get_mooncake_client_rank,
     _parse_global_segment_size,
     _ssd_setup_kwargs,
 )
@@ -108,6 +109,25 @@ class TestMooncakeStoreConfig(unittest.TestCase):
             self.assertEqual(cfg.ssd_offload_path, "")
         finally:
             os.unlink(path)
+
+    def test_tcp_protocol_is_supported(self):
+        cfg = _make_mooncake_store_config(protocol="tcp")
+        self.assertEqual(cfg.protocol, "tcp")
+        self.assertFalse(cfg.preferred_segment)
+
+    def test_unknown_protocol_is_rejected(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "protocol must be 'ascend' or 'tcp'",
+        ):
+            _make_mooncake_store_config(protocol="invalid")
+
+    def test_tcp_segment_port_base_is_validated(self):
+        with self.assertRaisesRegex(ValueError, "tcp_segment_port_base"):
+            _make_mooncake_store_config(
+                protocol="tcp",
+                tcp_segment_port_base=0,
+            )
 
     def test_from_file_ssd_offload(self):
         ssd_path = TestMooncakeStoreConfig._writable_ssd_path()
@@ -356,6 +376,8 @@ class TestMooncakeBackendMethods(unittest.TestCase):
             backend._lazy_init = False
             backend._store_initialized = True
             backend._use_fabric_mem = False
+            backend._store_owns_transfer_engine = False
+            backend._store_registered_buffers = {}
             backend._store_init_lock = MagicMock()
             backend.local_seg = None
             return backend
@@ -420,6 +442,148 @@ class TestMooncakeBackendMethods(unittest.TestCase):
         ):
             b.register_buffer([100], [200])
             mock_te.register_buffer.assert_called_once()
+
+    def test_tcp_setup_uses_store_owned_engine(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend import (
+            MooncakeBackend,
+        )
+
+        b = MooncakeBackend.__new__(MooncakeBackend)
+        b.parallel_config = MagicMock()
+        b.config = _make_mooncake_store_config(
+            metadata_server="P2PHANDSHAKE",
+            protocol="tcp",
+            master_server_address="127.0.0.1:50088",
+            global_segment_size=1024,
+            local_buffer_size=512,
+            tcp_segment_port_base=41000,
+        )
+        b._contribute_memory = True
+        b._store_owns_transfer_engine = True
+        b._use_fabric_mem = False
+        store = MagicMock()
+        store.setup.return_value = 0
+        store.get_hostname.return_value = "127.0.0.1:42000"
+        with (
+            patch(
+                "mooncake.store.MooncakeDistributedStore",
+                return_value=store,
+            ),
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend.get_ip",
+                return_value="127.0.0.1",
+            ),
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend.get_global_rank",
+                return_value=0,
+            ),
+        ):
+            result = b._setup_store()
+
+        self.assertIs(result, store)
+        kwargs = store.setup.call_args.kwargs
+        self.assertEqual(kwargs["local_hostname"], "127.0.0.1:41000")
+        self.assertEqual(kwargs["protocol"], "tcp")
+        self.assertEqual(kwargs["rdma_devices"], "")
+        self.assertNotIn("engine", kwargs)
+        self.assertEqual(b.local_seg, "127.0.0.1:42000")
+
+    def test_tcp_client_rank_falls_back_before_world_group_init(self):
+        with (
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend.get_global_rank",
+                side_effect=RuntimeError("world group is not initialized"),
+            ),
+            patch.dict(os.environ, {"LOCAL_RANK": "7"}, clear=False),
+        ):
+            self.assertEqual(_get_mooncake_client_rank(MagicMock()), 7)
+
+    def test_tcp_scheduler_client_uses_disjoint_segment_identity(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend import (
+            MooncakeBackend,
+        )
+
+        b = MooncakeBackend.__new__(MooncakeBackend)
+        b.parallel_config = MagicMock()
+        b.config = _make_mooncake_store_config(
+            metadata_server="P2PHANDSHAKE",
+            protocol="tcp",
+            master_server_address="127.0.0.1:50088",
+            tcp_segment_port_base=41000,
+        )
+        b._contribute_memory = False
+        b._store_owns_transfer_engine = True
+        b._use_fabric_mem = False
+        store = MagicMock()
+        store.setup.return_value = 0
+        store.get_hostname.return_value = "127.0.0.1:51003"
+        with (
+            patch(
+                "mooncake.store.MooncakeDistributedStore",
+                return_value=store,
+            ),
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend.get_ip",
+                return_value="127.0.0.1",
+            ),
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend.get_global_rank",
+                return_value=3,
+            ),
+        ):
+            b._setup_store()
+
+        kwargs = store.setup.call_args.kwargs
+        self.assertEqual(kwargs["local_hostname"], "127.0.0.1:51003")
+        self.assertEqual(kwargs["global_segment_size"], 0)
+        self.assertEqual(kwargs["local_buffer_size"], 0)
+
+    def test_tcp_register_and_unregister_use_store(self):
+        b = self._make_backend()
+        b._store_owns_transfer_engine = True
+        b.config.protocol = "tcp"
+        b.store.register_buffer.return_value = 0
+        b.store.unregister_buffer.return_value = 0
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend.global_te"
+        ) as mock_te:
+            b.register_buffer([100, 300], [50, 75])
+            b.register_buffer([100], [50])
+            b.unregister_buffer([100, 300])
+
+        self.assertEqual(
+            b.store.register_buffer.call_args_list,
+            [call(100, 50), call(300, 75)],
+        )
+        self.assertEqual(
+            b.store.unregister_buffer.call_args_list,
+            [call(300), call(100)],
+        )
+        self.assertEqual(b._store_registered_buffers, {})
+        mock_te.register_buffer.assert_not_called()
+
+    def test_tcp_registration_rolls_back_partial_failure(self):
+        b = self._make_backend()
+        b._store_owns_transfer_engine = True
+        b.config.protocol = "tcp"
+        b.store.register_buffer.side_effect = [0, -1]
+        b.store.unregister_buffer.return_value = 0
+
+        with self.assertRaisesRegex(RuntimeError, "registration failed"):
+            b.register_buffer([100, 300], [50, 75])
+
+        b.store.unregister_buffer.assert_called_once_with(100)
+        self.assertEqual(b._store_registered_buffers, {})
+
+    def test_tcp_registration_rejects_overlap(self):
+        b = self._make_backend()
+        b._store_owns_transfer_engine = True
+        b.config.protocol = "tcp"
+        b.store.register_buffer.return_value = 0
+        b.register_buffer([100], [100])
+
+        with self.assertRaisesRegex(ValueError, "overlapping"):
+            b.register_buffer([150], [100])
 
 
 # =========================================================================

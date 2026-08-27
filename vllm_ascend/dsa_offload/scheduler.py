@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from vllm.logger import logger
 from vllm.sampling_params import SamplingType
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -52,6 +53,29 @@ def _is_prefill_request(request: Request) -> bool:
     return request.num_computed_tokens < request.num_prompt_tokens
 
 
+def _resolve_dsa_l3_store_extender(
+    kv_transfer_config: object | None,
+    connector: object | None,
+) -> Callable[..., None] | None:
+    """让配置名与实际 connector capability 保持双向一致。"""
+
+    configured = (
+        kv_transfer_config is not None
+        and getattr(kv_transfer_config, "kv_connector", None)
+        == "DSAL3Connector"
+    )
+    extender = getattr(connector, "extend_dsa_store_jobs", None)
+    capable = callable(extender)
+    if configured != capable:
+        raise RuntimeError(
+            "DSA L3 config/connector capability mismatch: "
+            f"configured={configured}, capable={capable}, "
+            f"connector_type={type(connector).__name__}, "
+            f"connector_module={type(connector).__module__}"
+        )
+    return extender if capable else None
+
+
 class DSAOffloadScheduler(Scheduler):
     """在 vLLM 基线调度循环外增加 DSA 首版生命周期约束。"""
 
@@ -61,6 +85,19 @@ class DSAOffloadScheduler(Scheduler):
         if not isinstance(coordinator, DSAKVCacheCoordinator):
             raise RuntimeError(f"DSAOffloadScheduler requires DSAKVCacheCoordinator, got {type(coordinator).__name__}")
         self.dsa_coordinator = coordinator
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        extend_store_jobs = _resolve_dsa_l3_store_extender(
+            kv_transfer_config,
+            self.connector,
+        )
+        self.dsa_l3_enabled = extend_store_jobs is not None
+        self._dsa_l3_extend_store_jobs = extend_store_jobs
+        if self.dsa_l3_enabled:
+            logger.info(
+                "DSA L3 scheduler enabled: connector_type=%s module=%s",
+                type(self.connector).__name__,
+                type(self.connector).__module__,
+            )
 
     def add_request(self, request: Request) -> None:
         """首版 MTP 只接受 greedy，避免未验证的随机 rejection 语义。"""
@@ -207,9 +244,10 @@ class DSAOffloadScheduler(Scheduler):
         target_budgets = [0] * row_count
         sparse_budgets = [0] * row_count
         resident_valid_tokens = [-1] * row_count
+        l3_store_enabled = bool(getattr(self, "dsa_l3_enabled", False))
         dram_ready_block_counts = (
             [0] * row_count
-            if self.dsa_coordinator.enable_caching
+            if self.dsa_coordinator.enable_caching or l3_store_enabled
             else []
         )
         resident_replacements: list[DSAResidentBlockTableReplacement] = []
@@ -300,6 +338,12 @@ class DSAOffloadScheduler(Scheduler):
                     )
                 )
 
+        if l3_store_enabled and row_count:
+            logger.info_once(
+                "DSA L3 scheduler projection active: "
+                f"rows={row_count} "
+                f"ready_blocks={tuple(dram_ready_block_counts)}"
+            )
         return DSARequestCacheLayoutProjection(
             request_ids=request_ids,
             stages=tuple(stages),
@@ -317,10 +361,34 @@ class DSAOffloadScheduler(Scheduler):
         scheduler_output: SchedulerOutput,
     ) -> DSAOffloadSchedulerOutput:
         projection = self._build_dsa_cache_layout_projection(scheduler_output)
-        return DSAOffloadSchedulerOutput.from_base(
+        output = DSAOffloadSchedulerOutput.from_base(
             scheduler_output,
             dsa_cache_layout=projection,
         )
+        if bool(getattr(self, "dsa_l3_enabled", False)):
+            extend_store_jobs = getattr(
+                self,
+                "_dsa_l3_extend_store_jobs",
+                None,
+            )
+            if extend_store_jobs is None:
+                connector = getattr(self, "connector", None)
+                extend_store_jobs = getattr(
+                    connector,
+                    "extend_dsa_store_jobs",
+                    None,
+                )
+            if not callable(extend_store_jobs):
+                raise RuntimeError(
+                    "DSA L3 scheduler lost its store-job capability"
+                )
+            extend_store_jobs(
+                scheduler_output=output,
+                projection=projection,
+                coordinator=self.dsa_coordinator,
+                requests=self.requests,
+            )
+        return output
 
     def schedule(self) -> SchedulerOutput:
         # vLLM 基线在每个 chunk 后维护 _inflight_prefills。它为空且两个
@@ -350,6 +418,24 @@ class DSAOffloadScheduler(Scheduler):
             if restore is not None:
                 restore()
         return self._attach_dsa_cache_layout(scheduler_output)
+
+    def has_requests(self) -> bool:
+        """保活零 token connector step，直至异步 L3 store 完成。"""
+
+        if super().has_requests():
+            return True
+        if not bool(getattr(self, "dsa_l3_enabled", False)):
+            return False
+        has_pending = getattr(
+            self.connector,
+            "has_pending_transfers",
+            None,
+        )
+        if not callable(has_pending):
+            raise RuntimeError(
+                "DSA L3 connector lost its pending-transfer capability"
+            )
+        return bool(has_pending())
 
     def _preempt_request(
         self,

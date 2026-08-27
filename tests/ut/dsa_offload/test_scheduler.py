@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 from vllm.sampling_params import SamplingType
+from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import (
@@ -15,12 +16,15 @@ from vllm.v1.core.sched.request_queue import (
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import RequestStatus
 
+from vllm_ascend.dsa_offload.l3.metadata import DSAL3ConnectorMetadata
+from vllm_ascend.dsa_offload.l3.scheduler import DSAL3StoreScheduler
 from vllm_ascend.dsa_offload.request_cache_layout import (
     DSARequestCacheStage,
 )
 from vllm_ascend.dsa_offload.scheduler import (
     DSAOffloadScheduler,
     _is_prefill_request,
+    _resolve_dsa_l3_store_extender,
 )
 from vllm_ascend.dsa_offload.scheduler_output import (
     DSADRAMBlockAssignment,
@@ -68,6 +72,7 @@ def _make_scheduler() -> DSAOffloadScheduler:
     scheduler.waiting = create_request_queue(scheduler.policy)
     scheduler.skipped_waiting = create_request_queue(scheduler.policy)
     scheduler.running = []
+    scheduler.num_waiting_for_streaming_input = 0
     scheduler._inflight_prefills = set()
     scheduler.requests = {}
     scheduler.max_num_running_reqs = 4
@@ -89,6 +94,35 @@ def test_prefill_detection_uses_uncomputed_prompt_tokens() -> None:
 
     assert _is_prefill_request(partial)
     assert not _is_prefill_request(boundary)
+
+
+def test_l3_config_and_scheduler_capability_must_match() -> None:
+    def extender(**_kwargs) -> None:
+        return None
+
+    connector = SimpleNamespace(extend_dsa_store_jobs=extender)
+    config = SimpleNamespace(kv_connector="DSAL3Connector")
+
+    assert _resolve_dsa_l3_store_extender(config, connector) is extender
+    assert _resolve_dsa_l3_store_extender(None, None) is None
+    with pytest.raises(RuntimeError, match="configured=True, capable=False"):
+        _resolve_dsa_l3_store_extender(config, None)
+    with pytest.raises(RuntimeError, match="configured=False, capable=True"):
+        _resolve_dsa_l3_store_extender(None, connector)
+
+
+def test_pending_l3_store_keeps_zero_token_connector_progress_alive() -> None:
+    scheduler = _make_scheduler()
+    scheduler.finished_req_ids = set()
+    scheduler.dsa_l3_enabled = True
+    pending = True
+    scheduler.connector = SimpleNamespace(
+        has_pending_transfers=lambda: pending,
+    )
+
+    assert scheduler.has_requests()
+    pending = False
+    assert not scheduler.has_requests()
 
 
 def test_withhold_decode_restores_original_running_order() -> None:
@@ -454,6 +488,99 @@ def test_mtp_decode_dram_assignment_excludes_provisional_tokens() -> None:
     # floor(255 / 128) == 1。若错误地把本轮 4 个 target query 算进去，
     # 会提前得到 floor(259 / 128) == 2 并为未验证尾块分配 DRAM id。
     assert observed == [1]
+
+
+def test_l3_projection_carries_ready_watermark_without_local_prefix_cache() -> None:
+    scheduler = _make_scheduler()
+    scheduler.dsa_l3_enabled = True
+    request = _Request("l3", 256, 256, 0, 256)
+    scheduler.requests = {request.request_id: request}
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {request.request_id: 256}
+    output.total_num_scheduled_tokens = 256
+    scheduler.dsa_coordinator = SimpleNamespace(
+        enable_caching=False,
+        dram_block_size=128,
+        get_request_cache_state=lambda request_id: SimpleNamespace(
+            stage=DSARequestCacheStage.PREFILL,
+            target_resident_budget_tokens=6144,
+            sparse_budget_tokens=0,
+            resident_valid_tokens=-1,
+        ),
+        ensure_request_dram_blocks=lambda request_id, count: (count, ()),
+        take_unpublished_dram_assignment=lambda request_id: (2, ()),
+        resident_manager=SimpleNamespace(req_to_blocks={}),
+    )
+
+    projection = scheduler._build_dsa_cache_layout_projection(output)
+
+    assert projection.dram_ready_block_counts == (2,)
+
+
+def test_attach_projection_populates_real_l3_connector_metadata() -> None:
+    scheduler = _make_scheduler()
+    schema = SimpleNamespace(
+        bytes_per_logical_block=12,
+        block_keys=lambda block_hash: (
+            f"indexer:{bytes(block_hash).hex()}",
+            f"mla:{bytes(block_hash).hex()}",
+        ),
+    )
+    store_scheduler = DSAL3StoreScheduler(
+        schema,
+        max_inflight_jobs=2,
+    )
+    connector = SimpleNamespace(
+        extend_dsa_store_jobs=(
+            lambda **kwargs: store_scheduler.extend_store_jobs(
+                metadata=kwargs["scheduler_output"].kv_connector_metadata,
+                projection=kwargs["projection"],
+                coordinator=kwargs["coordinator"],
+                requests=kwargs["requests"],
+            )
+        )
+    )
+    scheduler.connector = connector
+    scheduler.dsa_l3_enabled = True
+    scheduler._dsa_l3_extend_store_jobs = connector.extend_dsa_store_jobs
+    request = _Request("l3", 256, 256, 0, 256)
+    request.block_hashes = [
+        BlockHash(b"hash-0"),
+        BlockHash(b"hash-1"),
+    ]
+    scheduler.requests = {request.request_id: request}
+    scheduler.dsa_coordinator = SimpleNamespace(
+        enable_caching=False,
+        dram_block_size=128,
+        get_request_cache_state=lambda request_id: SimpleNamespace(
+            stage=DSARequestCacheStage.PREFILL,
+            target_resident_budget_tokens=6144,
+            sparse_budget_tokens=0,
+            resident_valid_tokens=-1,
+        ),
+        ensure_request_dram_blocks=lambda request_id, count: (0, (7, 8)),
+        take_unpublished_dram_assignment=lambda request_id: (0, (7, 8)),
+        take_prefix_restore_plan=lambda request_id: None,
+        dram_directory=SimpleNamespace(
+            get_request_blocks=lambda request_id: (7, 8),
+        ),
+        resident_manager=SimpleNamespace(req_to_blocks={}),
+    )
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {request.request_id: 256}
+    output.total_num_scheduled_tokens = 256
+    output.kv_connector_metadata = DSAL3ConnectorMetadata()
+
+    wrapped = scheduler._attach_dsa_cache_layout(output)
+
+    assert isinstance(wrapped, DSAOffloadSchedulerOutput)
+    assert isinstance(
+        wrapped.kv_connector_metadata,
+        DSAL3ConnectorMetadata,
+    )
+    jobs = wrapped.kv_connector_metadata.store_jobs
+    assert tuple(jobs) == (0,)
+    assert len(jobs[0].blocks) == 2
 
 
 def test_mtp_prefill_dram_assignment_includes_current_chunk() -> None:

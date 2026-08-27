@@ -9,14 +9,18 @@
 - 当前 DSA custom 分支；
 - 单机 8 x Ascend 950DT；
 - GLM-5.1/GLM-5.2 W4A4C8 为首要验收模型；
-- Mooncake `0.3.11.post1` + `global_ub_device` 为第一后端；
+- Mooncake `0.3.11.post1` + Store-owned TCP 为第一后端；
 - MemCache `1.2.0` 临时 local-EID 版本为第二后端。
 
 主 DSA 架构、模型执行和算子 ABI 仍以
 {doc}`dsa_offload_design` 为总设计。本文只展开 L1/L2/L3 分层缓存、
 Connector 生命周期、异步上传和后续 HBM 热层复用。
 
-当前状态：**设计已收敛，进入 P0 介质/schema 门禁，尚未宣称 DSA+L3 功能完成。**
+当前状态：**P0 Store-owned TCP 的单卡、跨 NUMA 与 TP8 120-plane 门禁已通过；
+P1-W rank0 异步 write-behind 已完成 TCP 框架适配、UT，以及 TP8 离线单 40K
+长请求的 eager/graph、5K+8K+40K+70K 混合长度多请求 graph/chunked prefill
+和在线 graph 单 40K 流式请求的完整闭环验收，首版正确性阶段已经关闭。
+L3 prefix lookup/loadback 尚未实现，下一阶段进入 P1-R。**
 
 ## 2. 目标与非目标
 
@@ -26,8 +30,8 @@ Connector 生命周期、异步上传和后续 HBM 热层复用。
    block manager。
 2. 新请求按唯一 `Request.block_hashes` 查询本地 L2 与远端 L3。
 3. L3 只补充 L2 之后的连续 prefix suffix，不重复加载 L2 已命中的部分。
-4. L3-only suffix 优先直接恢复到 HBM；同一 forward 再通过现有 full-block
-   dump 物化到 rank-local L2。
+4. TCP 首版将 L3-only suffix 恢复到各 rank 已注册的 L2，再复用现有
+   L2->HBM restore；不为 TCP 另建 HBM staging 或第二套 read metadata。
 5. prefill/decode 新 durable 满块完成同步 L1->L2 dump 后，由 TP rank0
    异步执行 L2->L3 write-behind。
 6. 请求完成不等待 L3 put；块即将被复用时才使用基线风格 reuse fence。
@@ -139,14 +143,53 @@ schema adapter。
 - 每 rank 单次恢复 304,742,400 bytes；
 - warm replay token/logprobs 稳定；
 - 零 HBM prefix hit 下发生真实 L3->HBM load。
+- `empty_with_swapped_memory` 的完整 A5 DSA schema 可通过 Mooncake
+  `global_ub` 直接 put/get，无需 staging ring；
+- 单卡 exact schema 包含 42 个 Indexer plane、78 个 MLA plane、242 个
+  registration region，总注册 110,477,312 bytes；
+- 两个 component 的 put/get、interior block 地址和逐字节 digest 均通过；
+- 同一 TransferEngine 同时注册普通 HBM 与 swapped LocalDRAM 可行。
+
+`global_ub_device` 只创建 device endpoint。它会把 host memory 再次执行
+`aclrtHostRegister` 后映射到 device 链路；而
+`empty_with_swapped_memory` 在 torch_npu 分配期已经完成该注册，二次注册会以
+`halHostRegister drvRetCode=12` 失败。`global_ub` 同时创建 device/host
+endpoint，使 HBM 走 device、DSA L2 走 host，是当前正向合同。
 
 尚未验证：
 
 - DSA split HBM schema 的 AscendStore load；
-- swapped-memory arena 直接作为 `global_ub_device` put/get 地址；
-- HBM 与 swapped arena 在同一 worker/TransferEngine 中的增量注册；
 - rank0-only DSA store + 全 rank DSA load；
 - DSA L3 正常 shutdown/drain。
+
+### 3.5 vLLM、vLLM-Ascend 与 DSA 的复用边界
+
+当前实现不是让 `DSAL3Connector` 与 `AscendStoreConnector` 同时运行，而是按
+职责做三层组合：
+
+| 层次 | 复用内容 | 当前所有者 |
+|---|---|---|
+| vLLM Connector 规范 | Factory、`KVConnectorBase_V1`、scheduler metadata、worker hooks、`KVConnectorOutput` 聚合、shutdown | vLLM |
+| Ascend L3 数据面 | `Backend`、Mooncake Store-owned TCP；可选 GlobalTE/HIXL AscendDirect | vLLM-Ascend |
+| DSA 策略适配 | split schema/key、scheduler-owned L2 IDs、rank0-only store、dump event、reuse fence | DSA |
+
+`AscendStoreConnector` 本身同样继承 vLLM `KVConnectorBase_V1`，因此
+vLLM-Ascend 并未抛弃 vLLM 生命周期；它是在接口内部增加
+`KVPoolScheduler/KVPoolWorker/Backend`。DSA 也应遵循同一个外层接口，但不能
+直接复用两类 pool 对象，因为它们假定 store source 是普通 HBM block table、
+各 group block identity 可按基线解释，并按 worker/rank 保存。DSA 的 durable
+source 则是完整 LocalDRAM bundle，resident HBM 是 budget+tail，且首版只允许
+rank0 写。强行套用会把错误的 HBM block 语义隐藏在“复用”名义下。
+
+因此当前选择是组合 `MooncakeBackend`，而不是复制 Mooncake/HIXL 实现，也不是
+继承后覆盖大部分 `AscendStoreConnector`。同一进程只配置一个 connector；DSA
+配置校验拒绝 `AscendStoreConnector`、`MultiConnector` 等并行组合，避免双
+scheduler 状态机和重复注册。
+
+对 vLLM-Ascend 公共模块的修改限制为可独立回归的通用增强：GlobalTE 增量幂等
+注册/解注册、Mooncake put 返回原始逐 key 结果、显式 close。未来若
+AscendStore 抽象出可插拔 source schema、rank policy 和成功结果合同，DSA
+应继续下沉复用这些公共能力，使 `DSAL3Connector` 收敛为薄策略层。
 
 ## 4. 不变量
 
@@ -246,6 +289,153 @@ GLM/DeepSeek MLA 与 Indexer target payload 当前按 TP 副本处理：
 - L3->HBM：每个 rank 分别加载到自己的 HBM block；
 - key 不包含 TP rank。
 
+Mooncake 的“贡献池容量”和“写入 DSA 副本”是两个独立维度，不能都按
+rank0-only 处理。当前 vLLM-Ascend AscendStore 采用 Mooncake 内嵌 client
+模式：每个 TP worker 都以 `contribute_memory=True` 创建 backend，并向全局池
+挂载一段 `global_segment_size`；只有 scheduler 查询客户端使用
+`contribute_memory=False`。因此单机 TP8 配置每 rank 4 GiB 时，名义全局池容量
+为 32 GiB，而不是 4 GiB。
+
+DSA 应按同一基线范式划分角色：
+
+- 所有 TP rank：创建可贡献存储的 Mooncake backend/TransferEngine，将各自的
+  segment 汇入全局池，并在 load 时注册本 rank HBM destination；
+- TP rank0：作为当前副本型 Indexer/MLA payload 的唯一 producer，发起一次
+  L2->L3 put，避免把相同 KV 数据按 TP 数重复写入；Mooncake Master 可把该次
+  put 的对象分配到任一可用 segment；
+- 其他 TP rank：不重复发起相同 put，但其贡献的 segment 仍是池容量的一部分，
+  并在 load 时从全局池读取到自己的 HBM；
+- scheduler：只拥有 lookup/admission 决策。远端 exists 可沿用 AscendStore 的
+  rank0 lookup service/RPC 范式，不能让所有 rank 重复查询同一组 key；
+- store completion 的 expected producer count 为 1，load completion 的
+  expected worker count 为参与 TP load 的 rank 数。
+
+Mooncake 也支持“每个 rank 为 dummy client、每个推理实例仅一个 real client
+贡献整机内存”的部署方式，但这要求单独的 dummy-real/store-service 架构，
+不是当前 vLLM-Ascend AscendStore backend 的执行方式。P1-W 初版曾只有 TP0
+初始化 Mooncake，会把名义池容量从 `TP * per_rank_segment` 缩成一个 rank 的
+segment；现已改为 all-rank segment contribution、rank0-only put。P1-W 验收
+必须同时检查每个 rank 的 backend 初始化日志和唯一 producer 的 store 日志。
+
+两卡 swapped Host 跨 segment 基础门禁已通过：TP0 的 1 MiB swapped buffer
+可强制定向写入 TP1 segment，并由 TP0 从全局池完整读回。Mooncake/HIXL 基础
+H2H 池化能力成立。120-buffer、6,904,320-byte 小 arena scatter/gather 也已
+通过；每个 plane 使用 4,353-block swapped arena、TP0 注册总量约 30 GiB 并从
+非零 block offset 读取的门禁同样通过。Mooncake API 从主线程移至 background
+thread 后，put/get 与逐 buffer 校验仍通过，因此真实 write-behind 的线程设备/
+通信上下文也已排除。真实 GLM-5.2 A5 双 key 布局同样通过：Indexer key 含
+42 个 16,384/512-byte 交错 plane，MLA key 含 78 个 83,968-byte packed
+plane，put/get 分别返回 `[0,0]` 与 `[354816,6549504]`。
+
+TP8 框架日志暴露了两卡门禁没有覆盖的拓扑风险。TP0 producer 对由 Mooncake
+Master 自动选择的 TP1/TP2/TP3 segment 可以继续推进，而对 TP4/TP5/TP7
+segment 的 120-descriptor Host write 均在 30 秒后失败；NPU0-3 与 NPU4-7
+恰好位于不同 NUMA/卡组。因而“all-rank contribution + rank0-only put”目前只
+是待验证方案，不能再视作已完成设计。下一门禁必须依次覆盖：
+
+1. TP2 进程、物理 NPU0->NPU4；
+2. TP8 进程、显式 NPU0->NPU4；
+3. TP8 进程、`preferred_segment=false` 的 Master automatic placement；
+4. 与框架相同的 host IP、4 GiB global segment、1 GiB local buffer。
+
+其中第一项已经复现失败：仅创建 NPU0/NPU4 两个 probe worker，固定 loopback
+控制地址并将双 key 显式放到 NPU4 segment 后，TransferEngine 建链、segment
+mount 和 source arena 注册均成功，但 Host put 在
+`HcommChannelFenceOnThread` 返回 `hccl_ret=19 (HCCL_E_NETWORK)`。因此当前
+问题不是 TP8 数量、模型通信并发、Master 放置或 DSA payload，而是 NPU0/NPU4
+之间这条 `global_ub` Host endpoint direct data path。该结果仍不能证明硬件本身
+不支持跨 NUMA；CANN/HComm/HIXL endpoint 选择、路由配置或当前 wheel 实现均
+可能是根因。
+
+同一 NPU0/NPU4 目标下，将 source/destination 改为 HBM tensor，并改用
+`global_ub_device` 后完整往返通过：put 为 `[0,0]`，remote get 为
+`[354816,6549504]`，逐 plane 内容一致。这条路径实际覆盖
+`NPU0 HBM -> NPU4 进程 Host L3 segment -> NPU0 HBM`，说明跨 NUMA/卡组的
+Device-to-remote-Host 与 remote-Host-to-Device 能力可用；故障不能归因于
+Mooncake 全局池或跨卡组网络整体不可达，而应严格限定为 swapped Host source
+与 Host endpoint 参与的 direct Host-to-Host 路径。
+
+Mooncake/HIXL 源码进一步显示该失败路径不是唯一实现。HIXL 正式接口提供
+`OPTION_BUFFER_POOL`，用于 Host direct 不可用、Host registration 受限或大量
+小块传输时的中转模式；未注册地址会按 Host memory 处理。Mooncake Ascend
+TransferEngine 却在初始化时显式设置 `adxl.BufferPool=0:0`，只有环境变量
+`ASCEND_BUFFER_POOL` 非零时才重新启用。启用后，Mooncake 对 Host region 的
+`registerMem` 会直接返回，不再把 30 GiB swapped arena 注册为 direct Host
+memory，而由固定 staging pool 负责传输。当前 GLM-5.2 DSA 逻辑块为 6.59 MiB，
+`ASCEND_BUFFER_POOL=4:8` 的单 buffer 为 8 MiB；HIXL 当前创建两组 device
+pool，每组 `4 * 8 MiB`，合计约 64 MiB HBM/进程。对象大于单 buffer 时会按
+8 MiB 切片循环复用，因此 staging 容量与 L2 总容量无关。该路径需先完成功能
+诊断，但额外 H2D/D2H、跨卡 Device 带宽和 HBM 占用使其不作为 DSA 正式
+fallback。
+
+需要注意 HIXL 当前存在两条 engine 路由：设置 `GlobalResourceConfig`/
+`protocol_desc`（包括 `global_ub`）时，`EngineFactory` 选择新版
+`HixlEngine`，该实现明确只允许 `BufferPool=0:0`；不设置 protocol desc 时选择
+兼容 `CommEngine/AdxlInnerEngine`，后者才实现上述 staging pool。实测
+`global_ub + ASCEND_BUFFER_POOL=4:8` 在 TransferEngine 初始化期即以
+`PARAM_INVALID` 拒绝，未进入数据传输。buffer pool 能力门禁因此必须先用
+`comm_mode=auto`，后续若成立，再评估如何在正式 backend 中显式选择兼容 engine
+而不是依赖模糊的环境默认值。
+
+`auto + BufferPool` 已确认能进入 `CommEngine/AdxlInnerEngine`：两端 staging
+pool 初始化成功，Host segment 与 swapped buffer registration 均被正确跳过。
+当前失败推进到 `HcclCommInitClusterInfoMemConfig(ret=1)`，属于兼容 engine 生成的
+rank-table/通信参数错误。HIXL 仓内所有同机双卡 CommEngine 样例均显式设置
+`HCCL_INTRA_ROCE_ENABLE=1`，下一门禁补齐该变量，并在失败收集中保留
+`rank_table` 与 `HcclCommInit` 日志。
+
+补齐 `HCCL_INTRA_ROCE_ENABLE=1` 后，同卡组 NPU0/NPU1 与跨卡组 NPU0/NPU6
+仍以相同方式失败。诊断日志给出确定根因：HIXL v1 generator 输出
+`server_count/server_list/status/version`，但没有当前 HCCL parser 必需的顶层
+`rank_count`。该问题位于 HIXL/HCCL 兼容层，不属于本项目允许修改的边界；本地
+HIXL 私有补丁已撤销，也不把修通旧 CommEngine staging 作为 DSA L3 交付前提。
+同步检查 HIXL `origin/master`（2026-08-28 拉取到 `61a2ee4`）后，主线 v1/v2
+generator 仍未输出 `rank_count`，简单升级到 master 也不能消除该诊断缺口。
+
+当前 `mooncake-transfer-engine-npu` wheel 以 `USE_ASCEND` 构建，会无条件安装
+AscendDirectTransport；传入 `protocol=tcp|rdma` 不会选择通用 Host transport，
+仍会进入 HIXL/HCCL。因此 NPU 探针撤销 TCP/RDMA 选项；在不重新构建或修改
+Mooncake 的边界下，不能把通用 Mooncake Host transport 视为可用方案。
+
+NPU wheel 已有的 direct Host 路径已分别用 `global_ub+pinned` 隔离 swapped SVM
+地址、用 `global_ub_host+pinned` 隔离 mixed endpoint 选路。pinned 始终只是诊断
+介质，不能替换 KSC、dump 和 restore 共用的 `empty_with_swapped_memory` L2 arena。
+
+`global_ub+pinned` 的 NPU0/NPU6 单 descriptor 门禁仍以
+`HcommChannelFenceOnThread: HCCL_E_NETWORK` 失败；allocation、Host registration
+与 segment connect 均成功。因此 swapped SVM、scatter/gather 数量和大 arena
+均已排除。
+
+`global_ub_host+pinned` 的相同门禁也失败。日志确认协议只包含
+`ub_ctp:host`，两端均由 `aclrtMallocHost` 分配并按 Host memory 注册，segment
+连接成功，最终仍在 NPU0 到 NPU6 的 `HcommChannelFenceOnThread` 返回
+`HCCL_E_NETWORK`。因此 mixed Device/Host endpoint 选路也已排除。当前
+Mooncake NPU wheel/HIXL/CANN 组合不能证明跨卡组 direct Host-to-Host 可用；除非
+通信侧提供经过验证的显式 HiXLEP route，否则停止继续排列组合 transport 参数。
+
+该结论不否定 Mooncake 整体能力：基线 HBM KV Connector、
+`global_ub_device` TP8 以及同组门禁仍然有效。阻塞边界仅是 DSA 所需的“任意
+rank-local swapped Host L2 直接发布到全局 L3，并可跨组恢复”的数据面合同。
+
+源码也不能被解读为“明确拒绝 H2H”。Mooncake Ascend Direct 可以注册
+`MEM_HOST`，其 HIXL 依赖会把 Host/Host 描述符分类为 `COMM_TYPE_UB_H2H`，A5
+接口样例也列出了 `ub_ctp:host`。但 Mooncake 的 Ascend Direct 文档只明确承诺
+H2D、D2H、D2D；Mooncake 与 HIXL 都没有进一步承诺 A5 单机跨 NUMA/跨卡组
+H2H。通用 Transfer Engine 的 NUMA-aware NIC 选择也没有在该 Ascend Direct
+远端路径中实现；Mooncake 只选择 ADXL endpoint 并把传输交给 HIXL。因此当前
+结果应定性为“抽象层支持 H2H，但目标拓扑在当前依赖和配置下未实现或未打通”，
+而不是上层主动拒绝。
+
+跨卡组 preferred put 失败后，不能把 NUMA/rank 拓扑直接写进 DSA scheduler。
+DSA 对 L3 的合同仍应是任意合法 L2 source 可发布为全局对象、任意 consumer 可
+恢复；direct、staging、relay、replica 和本地 ingest 都属于 L3 backend/transport
+实现。**唯一对象、分片本地 producer**只能作为 backend 内部优化或临时诊断，
+不能改变 key/schema 或让 scheduler 依赖物理 NPU 编号。HBM staging/relay 不作为
+本项目可接受的生产 fallback。Mooncake AscendDirect 路径继续作为外部依赖阻塞；
+Store-owned TCP 已通过 swapped Host、跨进程、跨 NUMA、TP8 与 120-plane 门禁，
+因此成为 P1-W 正式 fallback。其他 L3 后端也必须先通过相同门禁，才能进入完整
+框架集成。
+
 P0 必须通过 TP8 逐字节比较证明 DSA payload 确实可按副本处理；未通过时不得
 使用 rank0-only store。
 
@@ -277,7 +467,7 @@ flowchart TB
         end
     end
 
-    LEGEND["① Prefix load: L2 hit + L3-only suffix -> L1<br/>② Durable full block: L1 -> L2 sync; rank0 L2 -> L3 async<br/>③ Sparse decode: KSC token-wise L2 -> resident L1<br/>Future P3-HOT: component-wise HBM -> L2 -> L3 lookup"]:::legend
+    LEGEND["① TCP prefix load: L3-only suffix -> L2 -> L1<br/>② Durable full block: L1 -> L2 sync; rank0 L2 -> L3 async<br/>③ Sparse decode: KSC token-wise L2 -> resident L1<br/>Future P3-HOT: component-wise HBM -> L2 -> L3 lookup"]:::legend
 
     P -. "compute Request.block_hashes" .-> S
     S -. "L3 block-hash lookup" .-> L3
@@ -288,8 +478,8 @@ flowchart TB
 
     D0 -->|"① local prefix restore, sync"| H0
     DN -->|"① local prefix restore, sync"| HN
-    L3 -->|"① L3-only suffix load, sync"| H0
-    L3 -->|"① L3-only suffix load, sync"| HN
+    L3 -->|"① L3-only suffix to local L2, sync"| D0
+    L3 -->|"① L3-only suffix to local L2, sync"| DN
 
     H0 -->|"② full-block dump, sync"| D0
     HN -->|"② full-block dump, sync"| DN
@@ -316,10 +506,25 @@ flowchart TB
 ```
 
 图中虚线是 scheduler/worker/L3 lookup 的控制信息，红、蓝、黄实线分别对应
-① prefix load、② full-block 下沉、③ decode KSC miss IO。L3->L1 红线只传
-L2 最长命中之后的 L3-only suffix；L2->L3 蓝线初版只有 rank0 提交。
+① prefix load、② full-block 下沉、③ decode KSC miss IO。L3->L2 红线只传
+本地最长命中之后的 L3-only suffix，再复用现有 L2->L1 restore；L2->L3 蓝线
+初版只有 rank0 提交。
 
 ## 7. Prefix lookup 与 load path
+
+### 7.0 当前实施顺序
+
+为先闭合 durable source 生命周期，代码实施顺序调整为：
+
+1. **P1-W store-only**：同轮 projection 规划 durable blocks，TP rank0 在
+   forward/dump 后记录预分配 event，后台执行 L2->L3 put；scheduler 通过
+   `KVConnectorOutput` 接收显式结果，并在 L2 physical ID 复用前 flush 相关
+   job。request finish 不等待。
+2. **P1-R sync-read**：write-behind 稳定后，再开放 L2 hit 之后的 L3 suffix
+   lookup、L2/HBM 联合 admission、all-rank `L3->local L2` 与既有
+   `L2->HBM` restore。
+
+两阶段共用 `DSAL3Connector`、key/schema 与 completion 通道，不建立临时旁路。
 
 ### 7.1 第一版顺序
 
@@ -327,44 +532,41 @@ L2 最长命中之后的 L3-only suffix；L2->L3 蓝线初版只有 rank0 提交
 2. vLLM 基线继续调用 Connector，传入 L2 hit token count。
 3. Connector 只查询 L2 之后的 L3 suffix。
 4. Indexer/MLA L3 component hit 取公共连续前缀。
-5. scheduler 对 `L2 hit + L3-only hit + 本轮 compute` 做 component-wise
-   HBM admission。
-6. worker 在 `_update_states()` 后先执行现有 L2->HBM restore。
-7. Connector 将 L3-only suffix 写入剩余 Indexer/MLA HBM blocks。
-8. forward 只计算未命中部分。
-9. 当前 full-block dump 将 L3 suffix 与新满块同步物化到 L2。
-10. worker 成功返回后 scheduler 发布新增 L2 hash。
+5. scheduler 为 L3-only suffix 分配完整 Indexer+MLA L2 bundle，并对
+   `L2 hit + L3-only hit + 本轮 compute` 一次完成 HBM admission。
+6. Connector metadata 携带 L3 component keys 与每 rank local L2 destination。
+7. all-rank worker 在 forward 前用 Store-owned TCP 将 L3 suffix 写入各自 L2。
+8. L3 get 全部成功后发布本轮 L2 ready watermark，并执行既有 L2->HBM restore。
+9. forward 只计算未命中部分；已恢复 suffix 不重复执行 HBM->L2 dump。
+10. 任一 rank/component load 失败则 fail-fast，不发布 L2 hash。
 
-### 7.2 为什么第一版选择 L3->HBM direct
+### 7.2 为什么 TCP 第一版选择 L3->L2->HBM
 
 优点：
 
-- 少一次 L3->L2->HBM copy；
-- 复用已经通过完整模型验证的 AscendStore HBM load；
-- L2 hit 与 L3 suffix 写入不重叠 HBM block；
-- 一个 forward 后 L3 数据自然进入 L2；
-- 不需要为 load 新建 scheduler promotion 状态。
+- 对齐已通过的 Store-owned TCP swapped Host 数据面；
+- 对齐 LMCache 的“注册固定 L2，get into 预分配 L2”模式；
+- 不要求 TCP transport 识别或直接写 NPU HBM；
+- L3 suffix 在 forward 前已经成为完整 L2 bundle，可直接供后续 KSC、prefix
+  reuse 与 L2 eviction 使用；
+- 只执行必要的 L2->HBM restore，不再在 forward 后增加 HBM->L2 回写。
 
 代价：
 
-- DSA allocator 必须接受 `num_external_computed_tokens`；
-- Connector 必须理解 DSA split HBM groups；
-- load 成功但 forward 失败时，L2 不会发布对应副本；
+- scheduler 必须联合预留 L2 bundle 与 split HBM blocks；
+- pending L3 load 期间 L2 destination 不可被复用；
+- all-rank get 完成后才能原子发布 Indexer+MLA 公共前缀；
 - 初版必须 fail-fast，不能静默 recompute。
 
-### 7.3 L3->L2 promotion 备选路径
+### 7.3 L3->HBM direct 后续路径
 
-若 swapped-memory get 验证通过，未来可借鉴 vLLM
-`TieringOffloadingManager`：L3 miss 在 L2 时先异步 promotion 到 L2，request
-返回 `None` 延迟调度，promotion 完成后复用现有 L2->HBM restore。
+AscendDirect 修复跨 NUMA Host H2H、或未来后端能可靠直接写 split HBM 后，可在
+不改变 lookup/schema 的前提下增加 direct destination capability。它必须复用同一
+scheduler source plan，不能另建一套 eager/graph metadata。该优化保留给：
 
-该路径更接近通用 CPU-primary tier，但多一次 copy 和 scheduler round-trip。
-第一版不采用，保留给：
-
-- preemption/resume；
-- L3 预取；
-- P/D decode 实例 first-fill；
-- 无法直接 L3->HBM 的后端。
+- 不要求 L2 常驻副本的 P/D consumer；
+- 大容量只读 prefix；
+- 已证明 direct load 后无需立刻物化 L2 的场景。
 
 ## 8. DSA allocator 改造
 
@@ -482,8 +684,15 @@ request finish 不调用 `join()`，客户端响应不等待 L3。pending job �
 - reuse fence。
 
 请求对象不再是 L3 object 的身份。所有请求完成但仍有 pending job 时，Connector
-通过 zero-token control step flush/collect completion；shutdown 则按配置执行
-drain。
+通过 `has_pending_transfers()` 让 `DSAOffloadScheduler.has_requests()` 保持为真，
+复用 vLLM 的 zero-token connector progress step 收集 completion。客户端响应不
+等待该 control step；但 EngineCore shutdown 必须等 pending job 清零后，才能
+关闭各 TP rank 贡献的 Mooncake segment，避免 rank0 put 访问已退出的远端
+segment owner。vLLM 外层 process manager 默认只等待 5 秒，无法覆盖 Mooncake
+首次跨 segment 懒建链，因此 DSA L3 要求配置 `shutdown_timeout>0`；示例使用
+300 秒上限，稳态通常会更早退出。vLLM 离线 `LLM` 的 finalizer 当前不向
+MPClient 传递该 timeout，DSA 离线 demo 需显式调用 engine-core shutdown；在线
+launcher 已按基线传递该配置。
 
 ## 10. job 与状态机
 
@@ -531,6 +740,13 @@ worker 主线程在正常或 zero-token Connector `get_finished()` 中清空队�
 `KVConnectorOutput.kv_connector_worker_meta`。scheduler 在
 `connector.update_connector_output()` 中消费。
 
+P1-W 验收期间 scheduler 与 TP0 worker 分别维护 planned/submitted/finished/
+failed/bytes 计数，并在 shutdown 打印汇总。普通 poll 与 reuse/shutdown flush
+必须共用同一 completion 记录函数，避免“future 已完成但无 completed 日志”。
+scheduler shutdown 若仍有 unacknowledged job 必须失败，不能清空账本后静默退出。
+DSA L3 模块复用 `vllm.logger.logger`，与当前大多数 vLLM-Ascend 热路径一致；不能
+使用只落到 `vllm_ascend` file handler 的独立 logger 后再凭 console 判断状态。
+
 不创建 scheduler 接收线程；即使未来增加 IPC receiver，receiver 也只能入队，
 不能直接修改 BlockPool。
 
@@ -565,11 +781,8 @@ MLA:     keys, list[list[address]], list[list[size]]
 
 ### 11.2 registration 顺序问题
 
-当前 Mooncake `GlobalTE.register_buffer()` 使用单个
-`is_register_buffer: bool`，第一次注册后后续调用直接返回。若 Connector 先注册
-HBM，再注册 DSA L2 arena，L2 实际不会被注册。
-
-必须改为：
+Mooncake `GlobalTE.register_buffer()` 已从单个 `is_register_buffer` 改为增量
+interval 账本：
 
 - 维护已注册 interval 集合，而不是全局 bool；
 - 支持 HBM/L2 分阶段增量注册；
@@ -583,24 +796,15 @@ GLM-5.2 A5 L2 当前约有 78 个 MLA arena 和 42 个 Indexer plane arena；P0
 
 ### 11.3 swapped-memory P0
 
-必须分别验证：
+当前结果：
 
-1. swapped arena `register_memory`；
-2. swapped -> Mooncake put；
-3. Mooncake -> swapped get；
-4. NPU op 将 restored swapped bytes 读回 HBM；
-5. 逐字节一致；
-6. HBM 与 swapped 两批 buffer 在同一 TransferEngine 中同时注册；
-7. TP8 rank0 put、所有 rank get；
-8. unregister 和 shutdown。
+以下单卡项已经通过：swapped arena registration、swapped put/get、NPU 回读、
+逐字节一致、HBM+swapped 同引擎注册。仍待验证 TP8 rank0 put/all-rank get 与
+正式 connector shutdown/drain。
 
-若 direct swapped put 不支持，P2 使用初始化期固定 staging ring：
-
-- ring slot 在启动期预分配；
-- slot 生命周期由 job 管理；
-- overwrite 前等待 slot job 完成；
-- 禁止 forward 热路径分配；
-- 评估 L2->staging 额外 copy 性能。
+固定 device staging ring 仅保留为能力定位手段，不进入正式 DSA 设计。若未来
+某个 L3 backend 在其内部透明使用 staging，它仍必须满足框架可见的 Host H2H
+合同和性能门槛，DSA 不自行维护 ring slot 或拓扑路由。
 
 ## 12. 各模型阶段
 
@@ -711,7 +915,7 @@ Mooncake/MemCache 自主管理容量和淘汰。DSA 不修改后端源码，也�
 ```text
 max_inflight_l3_store_jobs
 max_inflight_l3_store_bytes
-l3_store_batch_blocks
+max_descriptors_per_l3_put
 l3_completion_poll_interval
 l3_connection_warmup
 ```
@@ -737,8 +941,51 @@ exists(keys)
 register_buffer(ptrs, sizes)
 put(keys, addrs, sizes)
 get(keys, addrs, sizes)
-shutdown/close（需补齐）
+shutdown/close/drain
 ```
+
+### 17.1 LMCache Mooncake 对照
+
+LMCache 主线的 `MooncakestoreConnector` 为 DSA 的 L2/L3 边界提供了直接参考：
+
+- 配置默认 `protocol=tcp`；
+- 调用 `MooncakeDistributedStore.setup()` 时不注入外部 TransferEngine，由 Store
+  自己创建对应协议的 engine；
+- 初始化期把 LocalCPUBackend allocator 的整块固定 CPU buffer 通过
+  `store.register_buffer()` 注册；
+- put 直接使用该 L2 MemoryObj 的地址，get 先从 LocalCPUBackend 分配目标对象，
+  再用 `batch_get_into()` 写回同一注册 arena；
+- connector 关闭时先 unregister，再关闭 Store；
+- NUMA 绑定发生在 Store setup 之前，但 block 分配、引用计数和淘汰仍由
+  LocalCPUBackend 管理，Mooncake 不接管 L2 ownership。
+
+因此“把 DSA L2 地址注册给 Mooncake”不构成层级耦合。注册仅是 transport 的
+memory-region 合同；DSA scheduler 继续独占 L2 block 生命周期，Mooncake 只拥有
+自己的 L3 segment 和 object。Store-owned TCP 真实介质门禁已经通过：原始
+`mooncake-transfer-engine-npu==0.3.11.post1` 可直接注册 swapped L2，并在
+NPU0↔1、跨 NUMA NPU0↔6 两组 worker 间完成双向逐字节往返。因此 TCP 首版确定为
+`TP0 L2 -> L3` 写入、`L3 -> all-rank local L2 -> HBM` 读取。它仍需与本文前述
+AscendDirect `L3->HBM` 方案统一收敛，不能同时维护两套 scheduler/read metadata。
+无论最终选择哪条数据面，schema、job、reuse fence 与 L2 ownership 均不得因
+transport 分叉。
+
+TP8 放大门禁也已经通过：4-plane/1 MiB 与 120-plane/6,904,320-byte 两组均由
+8 个 rank 同时贡献 segment、注册 source/destination L2 regions，并完成环形
+remote get。每 rank 结果均为 put=`[0]`、get 等于完整 payload bytes。该结果
+覆盖进程数、region 数与单逻辑块 descriptor/payload，但测试 arena 只有 2 个
+physical blocks；正式 scheduler 规划的几十 GiB L2 MR 注册仍属于框架 E2E 门禁。
+
+当前 vLLM-Ascend `MooncakeBackend` 仍拒绝非 `ascend` 配置，并向 Store 注入由
+`GlobalTE` 以 `ascend` 初始化的外部 engine。这是 Store-owned TCP 不可达的框架
+约束，不是 wheel 能力缺失。TCP 模式必须让 Store 自建 engine，并把
+register/unregister 转发给 Store；Ascend 模式继续复用现有外部 `GlobalTE`。
+
+NPU wheel 的 TransferEngine 会同时安装 AscendDirect 和 TCP，且普通 memory
+registration 会遍历全部已安装 transport，所以 TCP 日志仍可能出现 HIXL 初始化和
+Host registration。实际 payload transport 由目标 segment descriptor 的
+`protocol` 决定；TCP cross 门禁已证明跨 NUMA payload 不经过 HComm。首版可接受
+未使用 AscendDirect 的初始化开销，后续再评估 TCP-only wheel 或 Mooncake 上游
+按需安装 transport，不能为消除日志而修改 DSA scheduler。
 
 需要统一返回合同：
 
@@ -748,6 +995,23 @@ len(result) == len(keys)
 nonzero     == explicit failure
 exception   == transport/backend failure
 ```
+
+Mooncake multi-buffer 调用仍受 descriptor 数量和单次同步时延影响。A5 GLM-5.2
+一个逻辑块当前包含 42 个 Indexer plane 与 78 个 MLA plane；若把 64 个块一次
+交给 `batch_put_from_multi_buffers()`，会形成 7,680 个 descriptor。
+`DSAL3BackendAdapter` 因此按 `max_descriptors_per_l3_put` 对 key 批次做贪心切分，
+默认预算 128。Store-owned TCP 的 TP8 120-plane 单块门禁已通过；多块合批上限
+仍应由 P1-W profiling 决定。该切分只改变
+一次 backend 调用包含多少 key，不改变 L3 object key、component schema、job
+完成语义或 scheduler 元数据。该 128 上限也与 Mooncake HiCache 文档的经验
+batch page 上限一致。仅 AscendDirect 模式补齐 `ASCEND_CONNECT_TIMEOUT` 与
+`ASCEND_TRANSFER_TIMEOUT`；TCP 不设置 HComm/HIXL timeout。
+
+该预算是跨 key 合批的软限制，不是模型结构上限。若未来单个 Indexer 或 MLA
+component 自身超过 128 个 descriptor，它仍保持一个完整 Mooncake key，由
+Mooncake transport 在该 key 内部分 chunk；backend 只将其隔离成 single-key
+put 并告警。scheduler
+始终只接收逻辑 component/job 的最终完成状态，不跟踪 HIXL packet。
 
 Mooncake 优先实现。MemCache 后续复用相同 DSA key/schema/job 状态机，只保留：
 
@@ -787,14 +1051,14 @@ MTP:     HBM
 
 ```python
 KVTransferConfig(
-    kv_connector="DSAOffloadingConnector",
-    kv_role="kv_both",
+    kv_connector="DSAL3Connector",
+    kv_role="kv_producer",  # P1-W；开放 load 后改为 kv_both
     kv_load_failure_policy="fail",
     kv_connector_extra_config={
         "backend": "mooncake",
-        "load_async": False,
-        "use_layerwise": False,
         "max_inflight_l3_store_jobs": 8,
+        "max_active_channels": 8,
+        "max_descriptors_per_l3_put": 128,
     },
 )
 ```
@@ -862,24 +1126,73 @@ vllm_ascend/dsa_offload/l3/
 - rank0 put/all-rank get；
 - strict status 与 teardown。
 
-### P1：同步只读
+### P1-W：rank0 异步 write-behind
+
+- Store-owned TCP engine 与 per-rank segment identity；
+- TCP L2 registration 转发给 Store，Ascend 路径继续使用 GlobalTE；
+- all-rank Mooncake segment contribution；
+- store job 和 dump-ready event；
+- rank0-only Mooncake put；
+- reuse fence；
+- request finish 不等待；
+- pending store 通过 zero-token control step 推进；
+- EngineCore shutdown 在 all-rank segment teardown 前完成 drain；
+- 显式 success/error result；
+- prefill/chunk/decode durable block。
+
+当前代码项与服务器 UT 已完成。2026-08-29 的 TP8 离线 eager 单 40K 验收中，
+TP0 成功注册 120 个 LocalDRAM region、30,054,504,960 bytes（约 27.99 GiB），
+scheduler 按 `64 + 64 + 64 + 64 + 64 + 5` 增量规划 325 个 durable block；
+TP0 提交并完成 6 个任务，累计 2,243,904,000 bytes，失败数和残留任务均为 0。
+scheduler 最终发布 650 个 remote-ready key，恰好等于 325 个 block 的
+Indexer/MLA 两个 component。其他 TP rank 的提交数均为 0，符合 rank0-only put。
+
+该结果关闭了“真实几十 GiB L2 MR + 单请求离线 eager/graph + chunked prefill
+write-behind”门禁：`max_num_batched_tokens=8192`、`block_size=128`，所以前五个
+chunk 各推进 64 个 durable block，最后推进 5 个，且没有重复上传已经发布的块。
+graph 复测的 block/job/key/byte 计数与 eager 完全一致，输出 token 也逐个一致；
+真实请求阶段出现 ACL graph replay，未因 PAD 或 replay 额外创建 store job，8 个
+worker 均正常退出。
+
+混合长度 graph/chunked 复测最终 durable watermark 为 `(60, 39, 574, 325)`，
+合计 998 个逻辑满块；其中 5K 请求在 decode 阶段跨过块边界，新增的第 39 块被
+独立规划。scheduler 按内容寻址规划 944 个唯一块、1,888 个 component key、
+6,517,678,080 bytes（约 6.07 GiB），相对逻辑块少 54 个，符合请求间公共
+block hash 复用。16 个异步任务全部成功，最后两个任务在请求输出后由 shutdown
+drain 完成，未阻塞请求 finish；所有 worker 正常退出。该轮 `planner_calls=1856`
+暴露出等待异步 IO 时存在较多 zero-token polling，作为 P1-W 正确性关闭后的性能
+收敛项，不影响本轮数据闭环结论。
+
+在线 TP8 graph 服务使用 `max_num_batched_tokens=16384`，40K 请求的 prefill
+按 `128 + 128 + 69` 规划 325 个块；生成阶段又形成第 326、327 个 durable 满块。
+5 个 job 全部返回 `success=True`，累计 327 blocks、654 component keys、
+2,257,712,640 bytes。ACL graph replay、流式 HTTP 服务与异步 write-behind 并行
+工作正常；服务持续运行，因此该轮没有 shutdown summary，外部 prefix hit 为 0
+符合 producer-only 边界。由此关闭 P1-W 首版正确性阶段，在线多请求 continuous
+batching 与长稳转入 P2 统一回归。
+
+已知但不阻塞关闭的事项：eager 轮退出时曾出现 6 个 worker 超过
+executor grace period 后被发送 SIGTERM，但该提示发生在 6 个 store job 全部完成、
+各 rank summary 输出及 Mooncake segment 解注册之后；暂归类为 teardown 时延问题，
+不计作数据写失败，后续长稳测试继续观察。混合请求轮的 `planner_calls=1856`
+表明 zero-token polling 尚有性能收敛空间，同样不影响 P1-W 正确性结论。
+
+### P1-R：同步只读
 
 - DSA connector 注册；
 - L2 hit 后 L3 suffix lookup；
-- external HBM admission；
-- L2 restore + L3 direct load；
-- forward 后 L2 materialization；
+- external L2/HBM 联合 admission；
+- all-rank `L3 -> local L2` Store get；
+- 复用现有 L2->HBM restore 后进入 forward；
 - no-MTP、fail-fast、Mooncake only。
 
-### P2：rank0 异步 write-behind
+### P2：读写闭环与稳态
 
-- store job 和 dump-ready event；
-- store deferral；
-- reuse fence；
-- request finish 不等待；
-- zero-token completion；
-- failure/result/shutdown；
-- prefill/chunk/decode durable block。
+- load/store completion 联合 drain；
+- L3 object lookup 与连续公共前缀；
+- store/load failure policy；
+- TP8 rank0 store/all-rank load；
+- 在线 continuous batching 与长稳。
 
 ### P3-HOT：HBM target prefix
 
@@ -947,7 +1260,8 @@ L3 验收应继续对照 HBM-prefix warm 结果，不能只比较 cold/warm toke
 
 | 风险 | 当前处理 |
 |---|---|
-| swapped memory 不可直接注册 | P0 gate；固定 staging ring 回退 |
+| AscendDirect swapped H2H 跨 NUMA 失败 | P1-W 改用已通过 TP8 的 Store-owned TCP；保留 direct 结果作历史门禁 |
+| 正式几十 GiB L2 MR 尚未以 TCP 注册 | cache-init/P1-W E2E 必测，独立 2-block probe 不替代 |
 | Backend put 吞错误 | 严格结果 adapter |
 | completion 把异常当成功 | 显式 JobResult |
 | physical id 在上传中复用 | upstream-style jobs_to_flush fence |
@@ -965,8 +1279,8 @@ L3 验收应继续对照 HBM-prefix warm 结果，不能只比较 cold/warm toke
 
 1. L2 block id 继续绑定完整 Indexer+MLA bundle。
 2. L3 按 Indexer/MLA component 分对象，以 hash 为身份。
-3. 第一版 read 为 L2 hit + L3-only suffix direct-to-HBM。
-4. 同一 forward 把 L3 suffix 物化到 L2。
+3. TCP 第一版 read 为 L2 hit + `L3-only suffix -> local L2 -> HBM`。
+4. L3 suffix 在 forward 前已物化到 L2，不再执行一次 HBM->L2 回写。
 5. L2->L3 只由 rank0 异步写。
 6. 不在 request finish 等待。
 7. 优先复用 vLLM OffloadingConnector job/reuse-fence/no-forward 模型。

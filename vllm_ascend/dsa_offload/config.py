@@ -489,8 +489,39 @@ class DSAOffloadConfig:
                     f"{DSA_NOMTP_SUPPORTED_RESIDENT_BUDGETS}; unsupported="
                     f"{unsupported_nomtp_budgets}"
                 )
-        if vllm_config.kv_transfer_config is not None:
-            raise ValueError("DSA sparse offload does not yet support KV transfer connectors")
+        kv_transfer_config = vllm_config.kv_transfer_config
+        if kv_transfer_config is not None:
+            connector_name = str(kv_transfer_config.kv_connector)
+            if connector_name != "DSAL3Connector":
+                raise ValueError(
+                    "DSA sparse offload only supports the validated "
+                    "DSAL3Connector, got "
+                    f"{connector_name!r}"
+                )
+            if speculative_config is not None:
+                raise ValueError(
+                    "DSA L3 first version does not yet support MTP"
+                )
+            if str(kv_transfer_config.kv_role) != "kv_producer":
+                raise ValueError(
+                    "DSA L3 store-only first version requires "
+                    "kv_role='kv_producer'"
+                )
+            extra = kv_transfer_config.kv_connector_extra_config or {}
+            if str(extra.get("backend", "mooncake")) != "mooncake":
+                raise ValueError(
+                    "DSA L3 first version supports backend='mooncake' only"
+                )
+            if int(getattr(parallel_config, "data_parallel_size", 1)) != 1:
+                raise ValueError(
+                    "DSA L3 first version requires data_parallel_size=1"
+                )
+            if int(getattr(vllm_config, "shutdown_timeout", 0)) <= 0:
+                raise ValueError(
+                    "DSA L3 asynchronous write-behind requires "
+                    "shutdown_timeout>0 so pending stores can drain before "
+                    "Mooncake segment teardown"
+                )
         if parallel_config.decode_context_parallel_size != 1 or parallel_config.prefill_context_parallel_size != 1:
             raise ValueError("DSA split Indexer/MLA cache does not yet support decode or prefill context parallelism")
         if parallel_config.pipeline_parallel_size != 1:

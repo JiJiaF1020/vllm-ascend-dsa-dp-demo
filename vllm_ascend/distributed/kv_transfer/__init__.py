@@ -49,6 +49,12 @@ def register_connector():
     )
 
     KVConnectorFactory.register_connector(
+        "DSAL3Connector",
+        "vllm_ascend.dsa_offload.l3.connector",
+        "DSAL3Connector",
+    )
+
+    KVConnectorFactory.register_connector(
         "MooncakeLayerwiseConnector",
         "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector",
         "MooncakeLayerwiseConnector",

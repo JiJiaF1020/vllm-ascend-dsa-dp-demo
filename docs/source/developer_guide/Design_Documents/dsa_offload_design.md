@@ -955,27 +955,30 @@ component 之间取公共前缀。当前接口已把 Indexer/MLA restore 分列�
 {doc}`dsa_l2_l3_cache_design`。本节只保留总览。
 
 RoadMap 中的 scheduler-owned DRAM pool 和完整 Indexer+MLA 本地 prefix bundle
-已经落地；Mooncake `global_ub_device` 也已经通过 TP8 逐字节探针及 DSA-disabled
-完整模型 external-hit。下一阶段不再重新设计 L2，而是在现有两级命中上增加
-AscendStore L3。
+已经落地；Mooncake Store-owned TCP 已通过 swapped L2 单卡、跨 NUMA、TP8
+120-plane 逐字节门禁。下一阶段不再重新设计 L2，而是在现有两级命中上增加
+AscendStore L3。AscendDirect HBM 基线仍保留回归，但不作为 DSA Host H2H
+P1-W 数据面。
 
 第一版采用以下读路径：
 
 ```text
 scheduler 查询 rank-local L2 完整 bundle
     -> AscendStore 查询 L3 中更长的公共 Indexer/MLA 前缀
+    -> 为 L3-only suffix 分配各 rank local L2 bundle
+    -> Store-owned TCP 将 suffix 恢复到各 rank L2
     -> 为 L2 hit + L3-only suffix + 本轮新 token 一次完成 HBM admission
-    -> worker 先执行既有 L2 -> HBM restore
-    -> Connector 将不重叠的 L3-only suffix 直接恢复到 HBM
+    -> worker 执行既有 L2 -> HBM restore
     -> model forward
-    -> 既有 full-block dump 将 L3 suffix 和本轮新满块物化到 rank-local L2
+    -> 既有 full-block dump 只物化本轮新满块
     -> worker 成功返回后发布新增 L2 hash
 ```
 
-L3 不先落 L2 再二次回 HBM。这样可以复用 vLLM 的“本地命中后继续查询
-connector”语义和 AscendStore 的 HBM load 生命周期；L2 restore 与 L3 load
-写入互不重叠的 HBM block 区间。外部 IO、L2 restore 都位于 model forward / graph
-replay 之前，eager 与 graph 继续消费同一份最终 HBM block table 和 DSA metadata。
+TCP 首版显式采用 `L3 -> L2 -> HBM`。这样对齐 LMCache 的固定 L2 registration
+模式，不要求 TCP 识别 NPU HBM，并保证 L3 suffix 在 forward 前已经成为可供
+KSC/prefix reuse 使用的完整 L2 bundle。外部 IO、L2 restore 都位于 model
+forward / graph replay 之前，eager 与 graph 继续消费同一份最终 HBM block table
+和 DSA metadata。
 chunked prefill 也沿用同一流程：首个有 external hit 的 chunk 完成恢复，后续 chunk
 继续按当前 durable watermark 增量 dump。
 

@@ -24,6 +24,10 @@
 | `CURRENT_TEST_CHECKLIST.md` | 当前环境应执行的最短门禁顺序、停止条件和回传日志 |
 | `test_mooncake.py` | Mooncake A5 TransferEngine 与 multi-buffer IO 探针 |
 | `test_mooncake_tp.py` | 8 个 A5 worker 的跨 segment HIXL 往返探针 |
+| `test_mooncake_store_tcp.py` | Mooncake Store 自管 TCP engine 与真实 swapped L2 往返探针 |
+| `build_install_mooncake_npu_tcp.sh` | 隔离构建并安装 TCP+AscendDirect NPU wheel |
+| `test_mooncake_transport_dispatch.py` | 验证 staged wheel 的 TCP/Ascend transport 分派 |
+| `README_mooncake_npu_tcp_build.md` | 构建、激活和真实 TCP Host 往返步骤 |
 | `test_dsa_swapped_l3_io.py` | 真实 21 Indexer + 78 MLA DSA swapped-memory L3 往返门禁 |
 | `MOONCAKE_A5_TP_BLOCKER.md` | Mooncake A5 TP 历史问题、兼容路径与 TP8 通过结论 |
 | `test_memcache.py` | MemCache 探针统一入口 |
@@ -40,6 +44,115 @@
 | `run_l3_cache_api_tests.sh` | 分 Gate 执行、记录日志并保留真实退出码 |
 | `README_memcache_a5_probe.md` | MemCache 分阶段命令和故障定位 |
 | `baseline_e2e/` | DSA disabled 的配置模板、L3 服务和在线/离线双轮验证 |
+| `baseline_e2e/configs/mooncake-dsa-tcp.json` | DSA P1-W Store-owned TCP 独立配置 |
+
+## Mooncake Store-owned TCP 门禁
+
+该门禁用于区分三件事：
+
+1. NPU wheel 是否包含 Mooncake Store 所需的 TCP 数据面；
+2. `MooncakeDistributedStore.setup(protocol="tcp", engine=None)` 是否可以自己
+   创建 TCP TransferEngine；
+3. 当前 vLLM-Ascend 是否只是因为 `MooncakeBackend/GlobalTE` 写死 `ascend` 而
+   让已有 TCP 能力不可达。
+
+它不 import `mooncake.engine.TransferEngine`，而是对齐 LMCache 的用法：Store
+自己创建 engine，初始化期把 LocalCPU/L2 arena 交给 `store.register_buffer()`，
+随后直接以这些已注册地址执行 put/get。
+
+保持 Mooncake Master 运行。先检查原始 wheel 与框架锁定情况：
+
+```bash
+bash run_l3_cache_api_tests.sh mooncake-store-tcp-inspect
+```
+
+单 worker 使用真实 `empty_with_swapped_memory` arena：
+
+```bash
+ASCEND_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+MOONCAKE_STORE_TCP_DEVICES=0,1 \
+bash run_l3_cache_api_tests.sh mooncake-store-tcp-single
+```
+
+同 NUMA 两 worker 双向远端读取：
+
+```bash
+ASCEND_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+MOONCAKE_STORE_TCP_DEVICES=0,1 \
+bash run_l3_cache_api_tests.sh mooncake-store-tcp-cross
+```
+
+跨 NUMA 对照只改设备：
+
+```bash
+ASCEND_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+MOONCAKE_STORE_TCP_DEVICES=0,6 \
+bash run_l3_cache_api_tests.sh mooncake-store-tcp-cross
+```
+
+最后验证 TP8 并发初始化、segment contribution 和环形远端读取：
+
+```bash
+ASCEND_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+MOONCAKE_STORE_TCP_DEVICES=0,1,2,3,4,5,6,7 \
+MOONCAKE_STORE_TCP_TIMEOUT=180 \
+bash run_l3_cache_api_tests.sh mooncake-store-tcp-cross
+```
+
+轻量 TP8 通过后，用 120 个 descriptor 和 6,904,320-byte 总 payload 模拟
+GLM-5.2 A5 一个完整 DSA logical block。测试同时注册 source/destination，因此
+注册 region 数约为正式单向 L2 arena 的两倍。每个测试 arena 只有 2 blocks，
+该门禁不替代正式几十 GiB L2 arena 的大 MR 注册验收：
+
+```bash
+ASCEND_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+MOONCAKE_STORE_TCP_DEVICES=0,1,2,3,4,5,6,7 \
+MOONCAKE_STORE_TCP_NUM_PLANES=120 \
+MOONCAKE_STORE_TCP_PLANE_BYTES=57536 \
+MOONCAKE_STORE_TCP_TIMEOUT=300 \
+bash run_l3_cache_api_tests.sh mooncake-store-tcp-cross
+```
+
+每个 worker 都会贡献独立 Mooncake segment、注册自己的 source/destination L2
+arena、把本地对象定向放入自身 segment，再读取对端对象。成功日志为：
+
+```text
+[store-tcp] SINGLE PASSED
+[store-tcp] CROSS PASSED devices=(0, 1)
+[store-tcp] CROSS PASSED devices=(0, 6)
+[store-tcp] CROSS PASSED devices=(0, 1, 2, 3, 4, 5, 6, 7)
+```
+
+原始 `mooncake-transfer-engine-npu==0.3.11.post1` 已在 2026-08-29 完成以上
+单 worker、双 worker、跨 NUMA、TP8 轻量及 TP8 120-plane 验证。虽然日志会显示
+NPU wheel 同时安装 AscendDirect，并把 registered
+buffer 登记到所有 transport，但 Mooncake 按目标 segment descriptor 中的
+`protocol=tcp` 选择实际 payload transport；跨 NUMA NPU0↔6 的成功结果证明该
+数据面绕开了 HComm。
+
+测试应先在未激活自定义 wheel 的新 shell 中运行一遍，再执行
+`source ~/.cache/dsa-mooncake-npu-tcp/activate.sh` 重复运行。若原始 wheel 已通过，
+后续框架适配不依赖自编 wheel。
+
+### TCP 门禁通过后的框架 UT
+
+只有上述真实介质实验通过后，才修改 `MooncakeBackend/DSAL3BackendAdapter` 并补
+以下 mock UT，避免用 mock 提前“证明”底层能力：
+
+1. `protocol=ascend` 保持现有外部 `GlobalTE` 初始化和注册路径；
+2. `protocol=tcp` 不创建 `GlobalTE`，`store.setup()` 的 `engine` 保持为空；
+3. TCP `register_buffer/unregister_buffer` 转发给 Store-owned client；
+4. DSA write-only 阶段仅 TP0 注册 source L2、仅 TP0 put；
+5. 开放 load 后所有 TP rank 注册 local L2 destination，但仍只有 TP0 put；
+6. TCP/Ascend 两种路径复用相同 keys/addrs/sizes、异步完成和 reuse-fence 状态机；
+7. shutdown 顺序固定为 drain -> unregister -> Store close；
+8. TCP 初始化失败不得静默回退 AscendDirect，AscendDirect 失败也不得在单个 job
+   内临时改走 TCP。
 
 ## DSA swapped-memory 第一门禁
 
@@ -342,6 +455,57 @@ MOONCAKE_TP_COMM_MODE=global_ub \
 bash run_l3_cache_api_tests.sh mooncake-tp
 ```
 
+DSA LocalDRAM 跨 segment 路径使用下面的两卡精确门禁。它让 TP0 从 120 个
+swapped Host buffer 读取一个 6,904,320-byte 逻辑块，并强制写入 TP1 的
+Mooncake segment；TP1 只提供 segment，不重复写数据：
+
+```bash
+ASCEND_VISIBLE_DEVICES=0,1 \
+ASCEND_RT_VISIBLE_DEVICES=0,1 \
+MOONCAKE_TP_ACTIVE_DEVICES=0,1 \
+MOONCAKE_TP_COMM_MODE=global_ub \
+MOONCAKE_TP_BUFFER_MODE=swapped \
+MOONCAKE_TP_PAYLOAD_LAYOUT=dsa_a5_glm52 \
+MOONCAKE_TP_ARENA_BLOCKS=4353 \
+MOONCAKE_TP_BLOCK_INDEX=1 \
+MOONCAKE_TP_IO_THREAD=background \
+MOONCAKE_TP_FORCE_REMOTE_PUT=true \
+MOONCAKE_TP_PRODUCER_RANK=0 \
+bash run_l3_cache_api_tests.sh mooncake-tp
+```
+
+1-buffer、120-buffer 小 arena、4,353-block 大 arena interior-address，以及
+background Python 线程跨 segment 均已通过。`dsa_a5_glm52` 进一步把同样的
+6,904,320-byte 逻辑块恢复为框架真实布局：42 个 Indexer plane 组成一个 key，
+78 个 MLA plane 组成另一个 key；其中 Indexer cache/scale 分别为 16,384/512
+bytes，MLA packed plane 为 83,968 bytes。该门禁用于判断剩余故障是否与非等长
+descriptor 或同一次 API 的双 key 事务有关；当前该精确门禁已经通过。
+
+TP8 框架失败呈现 NPU0-3 与 NPU4-7 的目标 segment 分界，下一轮使用
+`MOONCAKE_TP_TARGET_DEVICE` 指定物理目标卡，使用
+`MOONCAKE_TP_PLACEMENT_MODE=automatic` 复刻 Master 自动放置，并可分别通过
+`MOONCAKE_TP_SEGMENT_BYTES`、`MOONCAKE_TP_LOCAL_BUFFER_BYTES` 对齐框架的
+global/local pool 大小。按顺序执行的命令记录在
+`CURRENT_TEST_CHECKLIST.md`，不要直接跳到完整模型复测。
+
+探针还支持独立的 producer/consumer 与内存类型：
+`MOONCAKE_TP_SOURCE_BUFFER_MODE`、`MOONCAKE_TP_DESTINATION_BUFFER_MODE`
+可取 `device`、`swapped` 或 `pinned`，`MOONCAKE_TP_CONSUMER_DEVICE` 指定独立
+get 进程。Mooncake 默认关闭 HIXL staging；设置 `ASCEND_BUFFER_POOL=4:8`
+会让 HIXL 创建两组 device pool，每组 4 个 8 MiB 中转 buffer，约占 64 MiB
+HBM/进程，并跳过 Host arena 的 direct registration。大对象按 8 MiB 切片复用，
+不会按 L2 总容量预留。该能力当前只能先配合
+`MOONCAKE_TP_COMM_MODE=auto` 验证；`global_ub` 会选择只接受
+`BufferPool=0:0` 的新版 `HixlEngine`。该项只用于定位底层能力；device staging
+带来的额外 H2D/D2H 与 HBM 占用不作为 DSA 正式 fallback。
+
+`auto + BufferPool` 还暴露了一项 HIXL/HCCL 版本兼容问题：兼容 CommEngine
+生成的 rank table 缺少新 HCCL 要求的 `rank_count`。该依赖层问题只做记录，
+本项目不维护 HIXL 私有补丁。
+
+当前 NPU wheel 会无条件安装 AscendDirectTransport，`protocol=tcp|rdma` 仍进入
+HIXL/HCCL，因此 `mooncake-tp` 不暴露这两个无效选项。
+
 门禁默认把 `comm_resource_config.max_active_channels` 限制为 8，避免为了单条测试
 链路预留过多 HComm Thread/Stream/Notify。可通过
 `MOONCAKE_TP_MAX_ACTIVE_CHANNELS` 覆盖；该值只服务环境诊断，不代表正式推理的
@@ -568,6 +732,9 @@ DEVICE_ID=0 DEVICE_PROTOCOL=device_urma \
 
 DEVICE_ID=0 \
   bash run_l3_cache_api_tests.sh ascend-store-mooncake
+
+DEVICE_ID=0 \
+  bash run_l3_cache_api_tests.sh ascend-store-mooncake-tcp
 ```
 
 通过标志：
@@ -581,6 +748,9 @@ DEVICE_ID=0 \
 这一级验证 `MemcacheBackend/MooncakeBackend` 的真实配置加载、scheduler 零容量
 client、worker buffer 注册、返回码归一化与跨进程 key 可见性。通过后再进入
 DSA disabled 的完整 `AscendStoreConnector + 模型` 冷/热两轮测试。
+TCP gate 还会确认 Store 自建 engine、worker 与 scheduler-only client 的 segment
+identity 不冲突，以及 register/unregister 不经过 `GlobalTE`。Ascend gate 必须
+同时保留，用于证明公共 Backend 改造没有改变社区默认路径。
 
 完整基线验证入口见
 [baseline_e2e/README.md](baseline_e2e/README.md)。外部 Master/MetaService 由用户

@@ -19,9 +19,9 @@ import tempfile
 import time
 import traceback
 import uuid
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
-
 
 NUM_KEYS = 2
 NUM_LAYERS = 3
@@ -105,19 +105,14 @@ def _cleanup_backend(
                     if result != 0:
                         errors.append(f"memcache unregister ret={result} ptr=0x{pointer:x}")
         else:
-            from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
-
-            engine = global_te.transfer_engine
-            if engine is not None:
-                for pointer, _ in reversed(registered):
-                    result = int(engine.unregister_memory(pointer))
-                    if result != 0:
-                        errors.append(f"mooncake unregister ret={result} ptr=0x{pointer:x}")
+            backend.unregister_buffer([pointer for pointer, _ in registered])
     except Exception as exc:
         errors.append(f"buffer cleanup failed: {exc!r}")
 
     try:
-        if backend.store is not None:
+        if config["backend"] == "mooncake":
+            backend.close()
+        elif backend.store is not None:
             backend.store.close()
     except Exception as exc:
         errors.append(f"store.close failed: {exc!r}")
@@ -127,7 +122,7 @@ def _cleanup_backend(
             from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 
             global_te.transfer_engine = None
-            global_te.is_register_buffer = False
+            global_te.registered_buffers.clear()
         except Exception as exc:
             errors.append(f"transfer engine cleanup failed: {exc!r}")
 
@@ -137,10 +132,8 @@ def _cleanup_backend(
 
 
 def _send(connection, message: dict[str, Any]) -> None:
-    try:
+    with suppress(BrokenPipeError, EOFError, OSError):
         connection.send(message)
-    except (BrokenPipeError, EOFError, OSError):
-        pass
 
 
 def _worker_process(connection, config: dict[str, Any], keys: list[str]) -> None:
@@ -161,13 +154,29 @@ def _worker_process(connection, config: dict[str, Any], keys: list[str]) -> None
         total_bytes = NUM_KEYS * NUM_LAYERS * BYTES_PER_LAYER
         cpu_pattern = torch.arange(total_bytes, dtype=torch.int64) % 251
         device = torch.device(f"npu:{config['device_id']}")
-        source = (
-            cpu_pattern.to(torch.uint8)
-            .reshape(NUM_KEYS, NUM_LAYERS, BYTES_PER_LAYER)
-            .to(device)
-            .contiguous()
+        source_pattern = cpu_pattern.to(torch.uint8).reshape(
+            NUM_KEYS,
+            NUM_LAYERS,
+            BYTES_PER_LAYER,
         )
-        destination = torch.zeros_like(source)
+        if config["backend"] == "mooncake" and config["mooncake_buffer_mode"] == "swapped":
+            import torch_npu
+
+            source = torch_npu.empty_with_swapped_memory(
+                source_pattern.shape,
+                dtype=torch.uint8,
+                device=device,
+            )
+            destination = torch_npu.empty_with_swapped_memory(
+                source_pattern.shape,
+                dtype=torch.uint8,
+                device=device,
+            )
+            source.copy_(source_pattern.to(device))
+            destination.zero_()
+        else:
+            source = source_pattern.to(device).contiguous()
+            destination = torch.zeros_like(source)
         torch.npu.synchronize()
 
         for tensor in (source, destination):
@@ -179,8 +188,7 @@ def _worker_process(connection, config: dict[str, Any], keys: list[str]) -> None
 
         sizes = [[BYTES_PER_LAYER] * NUM_LAYERS for _ in range(NUM_KEYS)]
         source_addresses = [
-            [int(source[key_index, layer].data_ptr()) for layer in range(NUM_LAYERS)]
-            for key_index in range(NUM_KEYS)
+            [int(source[key_index, layer].data_ptr()) for layer in range(NUM_LAYERS)] for key_index in range(NUM_KEYS)
         ]
         destination_addresses = [
             [int(destination[key_index, layer].data_ptr()) for layer in range(NUM_LAYERS)]
@@ -308,11 +316,12 @@ def _write_mooncake_config(path: Path, config: dict[str, Any]) -> None:
         "metadata_server": "P2PHANDSHAKE",
         "global_segment_size": config["mooncake_segment_bytes"],
         "local_buffer_size": config["mooncake_buffer_bytes"],
-        "protocol": "ascend",
+        "protocol": config["mooncake_protocol"],
         "device_name": "",
         "master_server_address": config["master_address"],
         "preferred_segment": False,
-        "prefer_alloc_in_same_node": True,
+        "prefer_alloc_in_same_node": (config["mooncake_protocol"] == "ascend"),
+        "tcp_segment_port_base": config["mooncake_tcp_segment_port_base"],
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -413,9 +422,7 @@ def run(config: dict[str, Any]) -> None:
             if not worker_result.get("ok"):
                 raise RuntimeError(f"worker backend round trip failed: {worker_result}")
             if scheduler.exitcode != 0 or worker.exitcode != 0:
-                raise RuntimeError(
-                    f"child exit failure: scheduler={scheduler.exitcode} worker={worker.exitcode}"
-                )
+                raise RuntimeError(f"child exit failure: scheduler={scheduler.exitcode} worker={worker.exitcode}")
             print(
                 "[ascend-store-backend] PASSED "
                 f"backend={config['backend']} keys={NUM_KEYS} "
@@ -442,6 +449,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--world-size", type=int, default=256)
     parser.add_argument("--mooncake-segment-bytes", type=int, default=1 << 30)
     parser.add_argument("--mooncake-buffer-bytes", type=int, default=1 << 30)
+    parser.add_argument(
+        "--mooncake-protocol",
+        choices=("ascend", "tcp"),
+        default="ascend",
+    )
+    parser.add_argument(
+        "--mooncake-buffer-mode",
+        choices=("device", "swapped"),
+        default="device",
+    )
+    parser.add_argument(
+        "--mooncake-tcp-segment-port-base",
+        type=int,
+        default=40000,
+    )
     parser.add_argument("--startup-timeout", type=float, default=30.0)
     parser.add_argument("--operation-timeout", type=float, default=60.0)
     parser.add_argument("--process-timeout", type=float, default=120.0)

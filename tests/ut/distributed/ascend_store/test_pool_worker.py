@@ -212,6 +212,7 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         worker.group_block_len = {}
         worker.group_block_stride = {}
         worker.group_num_layers = {}
+        worker.group_kv_cache_families = {0: "mla"}
 
         worker._infer_cache_group_metadata(0, list(worker.kv_caches))
         self.assertEqual(worker.group_kv_caches_base_addr[0], [1000, 2000, 3000])
@@ -703,7 +704,8 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         self.assertEqual(summary_calls[0].args[1], "success")
         self.assertEqual(summary_calls[0].args[2], "mooncake")
         self.assertEqual(summary_calls[0].args[4], "r1")
-        self.assertEqual(summary_calls[0].args[7:11], (1, 1, 0, 160))
+        # The request has one key backed by two 160-byte cache buffers.
+        self.assertEqual(summary_calls[0].args[7:11], (1, 1, 0, 320))
 
     def test_start_load_kv_sync_uses_tail_block_id(self):
         worker = self._make_worker()

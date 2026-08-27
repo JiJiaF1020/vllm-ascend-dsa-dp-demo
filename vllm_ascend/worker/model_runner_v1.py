@@ -5033,6 +5033,28 @@ class NPUModelRunner(GPUModelRunner):
 
         store.finalize_payload_layout()
 
+        if has_kv_transfer_group():
+            connector = get_kv_transfer_group()
+            bind_dram_store = getattr(
+                connector,
+                "bind_dsa_dram_store",
+                None,
+            )
+            kv_transfer_config = self.vllm_config.kv_transfer_config
+            dsa_l3_enabled = (
+                kv_transfer_config is not None
+                and kv_transfer_config.kv_connector == "DSAL3Connector"
+            )
+            if dsa_l3_enabled and not callable(bind_dram_store):
+                raise RuntimeError(
+                    "DSAL3Connector is configured but worker connector "
+                    "does not expose bind_dsa_dram_store: "
+                    f"type={type(connector).__name__}, "
+                    f"module={type(connector).__module__}"
+                )
+            if dsa_l3_enabled:
+                bind_dram_store(store)
+
         runtime.bind_dram_store(store)
         cache_layout.set_pool_release_callback(
             runtime.release_pool_index
@@ -5088,7 +5110,7 @@ class NPUModelRunner(GPUModelRunner):
         if numel <= 0:
             raise ValueError(f"Invalid cache tensor size: {numel}")
 
-        if self.vllm_config.kv_transfer_config is None:
+        if not self._kv_connector_requires_hbm_registration():
             return torch.zeros(numel, dtype=torch.int8, device=self.device)
 
         raw_tensor = torch.zeros(
@@ -5097,6 +5119,12 @@ class NPUModelRunner(GPUModelRunner):
             device=self.device,
         )
         return self._align_memory(raw_tensor, alignment)[:numel]
+
+    def _kv_connector_requires_hbm_registration(self) -> bool:
+        """当前 Connector 是否会把原生 HBM KV tensor 注册到远端。"""
+
+        config = self.vllm_config.kv_transfer_config
+        return config is not None and config.kv_connector != "DSAL3Connector"
 
     def _allocate_sparse_c8_indexer_tensors(
         self,
@@ -5261,7 +5289,7 @@ class NPUModelRunner(GPUModelRunner):
                     or is_hidden_state_cache_spec(layer_kv_cache_spec.get(layer_name))
                 ) and layer_name not in kv_cache_raw_tensors:
                     # for mamba linear attention, attn-linear hybrid, or cache_only_layers (extract_hidden_states)
-                    if self.vllm_config.kv_transfer_config is None:
+                    if not self._kv_connector_requires_hbm_registration():
                         tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=self.device)
                     else:
                         cache_size_aligned = kv_cache_tensor.size + alignment
@@ -5272,7 +5300,7 @@ class NPUModelRunner(GPUModelRunner):
                         # shared the kvcache for all shared layers
                         kv_cache_raw_tensors[layer_name_inner] = tensor
                 elif "attn" in layer_name and self.use_compress and layer_name not in kv_cache_raw_tensors:
-                    if self.vllm_config.kv_transfer_config is None:
+                    if not self._kv_connector_requires_hbm_registration():
                         tensor = torch.zeros(kv_cache_tensor.size,
                                                 dtype=torch.int8,
                                                 device=self.device)

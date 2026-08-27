@@ -44,6 +44,21 @@ def test_disable_preemption_is_limited_to_v023():
         assert not _disable_preemption_on_prefill_node(vllm_config)
 
 
+def test_dsa_l3_producer_is_not_misclassified_as_pd_prefill() -> None:
+    vllm_config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_role="kv_producer",
+            kv_connector="DSAL3Connector",
+        )
+    )
+
+    with patch(
+        "vllm_ascend.patch.platform.patch_balance_schedule.vllm_version_is",
+        return_value=True,
+    ):
+        assert not _disable_preemption_on_prefill_node(vllm_config)
+
+
 @pytest.mark.parametrize("scheduler_name", ["default", "profiling_chunk"])
 def test_prefill_node_keeps_running_request_when_allocation_fails(
     scheduler_name,
