@@ -125,6 +125,35 @@ def test_pending_l3_store_keeps_zero_token_connector_progress_alive() -> None:
     assert not scheduler.has_requests()
 
 
+def test_external_reset_does_not_mutate_local_cache_while_store_is_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = _make_scheduler()
+    scheduler.dsa_l3_enabled = True
+    pending = True
+    scheduler.connector = SimpleNamespace(
+        has_pending_transfers=lambda: pending,
+    )
+    base_calls: list[tuple[bool, bool]] = []
+
+    def base_reset(
+        _self,
+        reset_running_requests=False,
+        reset_connector=False,
+    ) -> bool:
+        base_calls.append((reset_running_requests, reset_connector))
+        return True
+
+    monkeypatch.setattr(Scheduler, "reset_prefix_cache", base_reset)
+
+    assert not scheduler.reset_prefix_cache(reset_connector=True)
+    assert not base_calls
+
+    pending = False
+    assert scheduler.reset_prefix_cache(reset_connector=True)
+    assert base_calls == [(False, True)]
+
+
 def test_withhold_decode_restores_original_running_order() -> None:
     scheduler = _make_scheduler()
     decode_a = _Request("decode-a", 1000, 1000, 1, 1001)

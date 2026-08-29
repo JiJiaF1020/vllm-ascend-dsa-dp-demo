@@ -93,6 +93,16 @@ class DSAOffloadScheduler(Scheduler):
         self.dsa_l3_enabled = extend_store_jobs is not None
         self._dsa_l3_extend_store_jobs = extend_store_jobs
         if self.dsa_l3_enabled:
+            bind_coordinator = getattr(
+                self.connector,
+                "bind_dsa_coordinator",
+                None,
+            )
+            if not callable(bind_coordinator):
+                raise RuntimeError(
+                    "DSA L3 connector lost its coordinator binding capability"
+                )
+            bind_coordinator(self.dsa_coordinator)
             logger.info(
                 "DSA L3 scheduler enabled: connector_type=%s module=%s",
                 type(self.connector).__name__,
@@ -436,6 +446,32 @@ class DSAOffloadScheduler(Scheduler):
                 "DSA L3 connector lost its pending-transfer capability"
             )
         return bool(has_pending())
+
+    def reset_prefix_cache(
+        self,
+        reset_running_requests: bool = False,
+        reset_connector: bool = False,
+    ) -> bool:
+        if reset_connector and bool(getattr(self, "dsa_l3_enabled", False)):
+            has_pending = getattr(
+                self.connector,
+                "has_pending_transfers",
+                None,
+            )
+            if not callable(has_pending):
+                raise RuntimeError(
+                    "DSA L3 connector lost its pending-transfer capability"
+                )
+            if has_pending():
+                logger.warning(
+                    "DSA prefix reset rejected before local mutation because "
+                    "L3 store jobs are still pending"
+                )
+                return False
+        return super().reset_prefix_cache(
+            reset_running_requests=reset_running_requests,
+            reset_connector=reset_connector,
+        )
 
     def _preempt_request(
         self,

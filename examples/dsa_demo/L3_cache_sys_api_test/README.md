@@ -708,14 +708,16 @@ Mooncake 的 `--local-host` 最终应换成容器内实际可达 IP；`127.0.0.1
 
 ## 后续框架级门禁
 
-当前仅以 Mooncake 为后端，独立 API 通过后依次增加：
+Mooncake P1-W 已完成。P1-R 同步读路径使用 `kv_role=kv_both`，按以下顺序验收：
 
-1. DSA disabled、单实例 `kv_both`、相同 prompt 两轮 external hit；
-2. eager 后 graph；
-3. DSA enabled、MTP disabled、Indexer/MLA component key；
-4. chunked prefill 每个 chunk 只发布新增 hash-ready 完整块；
-5. 受控清理 L1/L2、保留 L3，证明真实 L3 loadback；
-6. bsz/mixed stage、多 TP rank owner、容量压力和异步 IO。
+1. DSA enabled、MTP disabled、`enable_prefix_caching=True`；
+2. 首轮长 prompt 通过 rank0-only write-behind 写入 Indexer/MLA component key；
+3. `reset_prefix_cache(reset_connector=False)` 只清本地 HBM/L2，保留 L3；
+4. 第二轮相同 prompt 由 scheduler client 查询 paired-key 最长前缀；
+5. 所有 TP rank 同步执行 `L3 -> rank-local L2`，再复用 DSA `L2 -> HBM`
+   restore；
+6. eager 通过后回归 graph，确认 load/restore 在 replay 前完成；
+7. bsz/mixed stage、容量压力、失败注入和异步 IO 留给 P2。
 
 所有脚本必须打印实际 backend、key 数、传输方向、字节数和完成状态，避免只凭
 聚合 Prefix Cache hit rate 判断路径。

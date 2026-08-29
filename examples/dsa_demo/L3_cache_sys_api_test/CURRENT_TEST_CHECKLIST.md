@@ -158,8 +158,42 @@ Store-owned TCP 单卡/跨 NUMA/TP8 精确介质门禁已经通过。当前进�
   ACL graph replay 与服务持续运行正常；无 shutdown summary 属于常驻服务预期，
   `External prefix cache hit rate=0` 符合 producer-only 边界。
 - [x] P1-W 首版正确性阶段关闭：可以开始 P1-R lookup/loadback。
+- [x] P1-R UT：`test_l3.py` 覆盖 paired-key 最长前缀、L2+L3 metadata、
+  all-rank worker get 与 component failure；`test_kv_cache_layout.py` 覆盖 external
+  L2/HBM 联合 admission 和 combined restore；随后跑完整 `tests/ut/dsa_offload`。
+- [x] P1-R cache-init：配置 `kv_role=kv_both`、`enable_prefix_caching=True`，确认
+  scheduler-only Mooncake client 不贡献容量，所有 TP worker 注册本 rank 完整 L2
+  arena；P1-W 的 all-rank segment/rank0-only put 保持不变。
+- [ ] P1-R 离线 eager：先用单 8K 降低首轮调试成本，再扩到单 40K；均运行三轮
+  相同 prompt：cold、local-L2 replay、L3 replay。第二轮后只执行
+  `reset_prefix_cache(reset_connector=False)` 清本地 HBM/L2，第三轮必须出现
+  `prefix lookup -> load planned -> TP0..TP7 get/load completed -> prefix restore`
+  且 `external_tokens>0`。local-L2 与 L3 replay 的 greedy token IDs 必须一致；
+  cold 与 prefix replay 仅记录差异，不作为 L3 IO 精度断言。
+  - [x] 2026-08-29 单 8K eager：cold 为 0 hit，TP0 写入 60 blocks/120 keys/
+    414,259,200 bytes；第二轮 Local-L2 命中 60 blocks；reset 后第三轮 L3 命中
+    60 blocks、`external_tokens=7680`。TP0-TP7 均完成 414,259,200-byte get 和
+    60-block/78-layer restore，Local-L2 与 L3 replay token IDs 完全一致。
+    scheduler/worker 均为 0 failed/inflight/pending。
+  - [ ] 单 40K eager。
+- [x] P1-R 离线 graph：单 5K 三轮中 Local-L2/L3 对 38 blocks、
+  262,364,160 bytes/rank 与 32 个生成 token 严格一致。混合 bsz=4 的 5K 请求
+  在第 5 token 出现分叉，但关闭 L3 loadback 后 Local-L2/Local-L2 在相同位置
+  复现同一分叉；启用/禁用 L3 的输出按 replay 轮次逐条相同，确认不是 L3
+  数据差异。多请求 graph 门禁改用双方首个分歧 token 互在 top-k 的数值等价
+  规则，bsz=1/eager 仍保持严格 token 一致。
+- [ ] P1-R fail-fast：破坏任一 Indexer/MLA key 或让任一 rank get 失败，必须在
+  TP success all-reduce 后让所有 rank 在 forward 前明确失败，不能发布 L2 hash、
+  不能让成功 rank 提前进入 HCCL forward，也不能静默 recompute。
+- [ ] P1-R 阶段关闭后进入 P2 读写闭环、online continuous batching 与长稳。
+- [ ] P2-LAYERWISE：先复用基线 attention `wait_for_layer_load()` 将 L2->HBM
+  restore 按层流水；确认收益后再评估 per-layer L3 key/schema，避免当前整组件
+  Mooncake object 冒充逐层异步。GLM-5.2 shared Indexer 按 physical source layer
+  映射。
 - [ ] P2 在线 continuous batching 与长稳：在读写闭环后统一回归多请求进入/完成
-  交错、store/load completion、zero-token polling 与 teardown 时延。
+  交错、store/load completion、zero-token polling 与 teardown 时延。在线三轮门禁
+  先调用 `/pause?mode=wait&clear_cache=false`，利用 scheduler pending-transfer
+  状态确定性 drain，再 reset 本地 prefix 并 resume；不再用固定 sleep 猜测上传完成。
 - [x] `global_ub + pinned` 的 NPU0→NPU6 1 MiB/单 descriptor 门禁失败：pinned
   allocation、Host registration、segment connect 均成功，最终仍在
   `HcommChannelFenceOnThread` 返回 `HCCL_E_NETWORK`。故障与 swapped SVM、
@@ -192,7 +226,7 @@ Store-owned TCP 单卡/跨 NUMA/TP8 精确介质门禁已经通过。当前进�
 5. 开启 chunked prefill，核对每 chunk 增量 durable block；
 6. eager 稳定后再跑 graph 和在线服务。
 
-任一阶段失败即停止，不提前实现 P1-R lookup/loadback。
+该顺序是 P1-W 的历史验收记录；P1-W 已关闭，当前执行上面的 P1-R 门禁。
 
 Mooncake AscendDirect 的 DSA Host H2H 路径因跨 NUMA 失败而暂停；以下条目保留
 为历史证据。P1-W 正式路线已经切换到 Store-owned TCP：

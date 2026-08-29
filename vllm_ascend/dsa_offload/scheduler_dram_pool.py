@@ -338,6 +338,26 @@ class DSASchedulerDRAMBlockDirectory:
         self._ready_block_counts[request_id] = len(blocks)
         self._worker_published_block_counts[request_id] = 0
 
+    def can_attach_cached_prefix(
+        self,
+        blocks: tuple[KVCacheBlock, ...],
+        *,
+        new_block_count: int = 0,
+    ) -> bool:
+        """检查 touch 本地 hit 与分配 L3 suffix 后仍不透支 free queue。"""
+
+        new_block_count = int(new_block_count)
+        if new_block_count < 0:
+            raise ValueError("DSA DRAM new block count cannot be negative")
+        evictable_hits = sum(
+            block.ref_cnt == 0 and not block.is_null
+            for block in blocks
+        )
+        return (
+            evictable_hits + new_block_count
+            <= self.block_pool.get_num_free_blocks()
+        )
+
     def mark_ready_prefix(
         self,
         request: Request,

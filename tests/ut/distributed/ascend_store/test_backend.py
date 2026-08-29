@@ -412,9 +412,14 @@ class TestMooncakeBackendMethods(unittest.TestCase):
 
     def test_get(self):
         b = self._make_backend()
-        b.store.batch_get_into_multi_buffers.return_value = [0]
-        b.get(["k1"], [[100]], [[10]])
-        b.store.batch_get_into_multi_buffers.assert_called_once()
+        b.store.batch_get_into_multi_buffers.return_value = [10]
+
+        self.assertEqual(b.get_with_sizes(["k1"], [[100]], [[10]]), [10])
+        self.assertEqual(b.get(["k1"], [[100]], [[10]]), [0])
+        self.assertEqual(
+            b.store.batch_get_into_multi_buffers.call_count,
+            2,
+        )
 
     def test_get_error(self):
         b = self._make_backend()

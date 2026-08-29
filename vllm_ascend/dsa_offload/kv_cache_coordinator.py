@@ -130,6 +130,44 @@ class DSAPrefixCacheHitPlan:
     num_computed_tokens: int
     dram_blocks: tuple[KVCacheBlock, ...]
     mtp_blocks: tuple[KVCacheBlock, ...] = ()
+    external_computed_tokens: int = 0
+    external_block_hashes: tuple[bytes, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.num_computed_tokens < 0:
+            raise ValueError("DSA prefix token count cannot be negative")
+        if not 0 <= self.external_computed_tokens <= self.num_computed_tokens:
+            raise ValueError("DSA external prefix token count is invalid")
+
+    @property
+    def local_computed_tokens(self) -> int:
+        return self.num_computed_tokens - self.external_computed_tokens
+
+
+@dataclass(frozen=True, slots=True)
+class DSAExternalPrefixLoadPlan:
+    """已完成 admission、等待 Connector 下发的 L3-only suffix。"""
+
+    request_id: str
+    logical_block_start: int
+    block_hashes: tuple[bytes, ...]
+    destination_dram_block_ids: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if not self.request_id:
+            raise ValueError("DSA external prefix load requires a request ID")
+        if self.logical_block_start < 0:
+            raise ValueError("DSA external prefix load start must be non-negative")
+        if not self.block_hashes:
+            raise ValueError("DSA external prefix load cannot be empty")
+        if len(self.block_hashes) != len(self.destination_dram_block_ids):
+            raise ValueError(
+                "DSA external prefix hash/destination columns disagree"
+            )
+        if any(block_id <= 0 for block_id in self.destination_dram_block_ids):
+            raise ValueError(
+                "DSA external prefix destinations must be positive"
+            )
 
 
 class DSAKVCacheCoordinator(KVCacheCoordinator):
@@ -252,6 +290,10 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
         self._pending_prefix_restores: dict[
             str,
             DSADRAMBlockRestore,
+        ] = {}
+        self._pending_external_prefix_loads: dict[
+            str,
+            DSAExternalPrefixLoadPlan,
         ] = {}
         self.eagle_group_ids = (
             {self.group_ids.mtp_full}
@@ -418,37 +460,195 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
     ) -> DSAPrefixCacheHitPlan | None:
         return self._pending_prefix_hits.get(request_id)
 
+    def prepare_external_prefix_cache_hit(
+        self,
+        request: Request,
+        *,
+        local_computed_tokens: int,
+        external_block_count: int,
+    ) -> int:
+        """把 Connector 的 L3-only 连续命中并入本地零引用候选。"""
+
+        request_id = request.request_id
+        local_computed_tokens = int(local_computed_tokens)
+        external_block_count = int(external_block_count)
+        if local_computed_tokens < 0 or (
+            local_computed_tokens % self.dram_block_size
+        ):
+            raise ValueError(
+                "DSA local prefix tokens must be non-negative and block aligned"
+            )
+        if external_block_count < 0:
+            raise ValueError("DSA external prefix block count cannot be negative")
+        local_plan = self._pending_prefix_hits.get(request_id)
+        if local_computed_tokens:
+            if (
+                local_plan is None
+                or local_plan.num_computed_tokens != local_computed_tokens
+                or local_plan.external_computed_tokens
+            ):
+                raise RuntimeError(
+                    "DSA local prefix plan changed before external lookup: "
+                    f"request_id={request_id!r}, local={local_computed_tokens}, "
+                    f"plan={local_plan}"
+                )
+        elif local_plan is not None:
+            raise RuntimeError(
+                "DSA found an unexpected local prefix plan for a zero local hit"
+            )
+        if not external_block_count:
+            return 0
+        if self.mtp_full_manager is not None:
+            raise RuntimeError("DSA L3 prefix load does not yet support MTP")
+        logical_start = local_computed_tokens // self.dram_block_size
+        logical_end = logical_start + external_block_count
+        if logical_end > len(request.block_hashes):
+            raise RuntimeError(
+                "DSA external prefix exceeds request block hashes: "
+                f"request_id={request_id!r}, end={logical_end}, "
+                f"hashes={len(request.block_hashes)}"
+            )
+        external_hashes = tuple(
+            bytes(block_hash)
+            for block_hash in request.block_hashes[
+                logical_start:logical_end
+            ]
+        )
+        external_tokens = external_block_count * self.dram_block_size
+        self._pending_prefix_hits[request_id] = DSAPrefixCacheHitPlan(
+            request_id=request_id,
+            num_computed_tokens=local_computed_tokens + external_tokens,
+            dram_blocks=(
+                local_plan.dram_blocks if local_plan is not None else ()
+            ),
+            mtp_blocks=(
+                local_plan.mtp_blocks if local_plan is not None else ()
+            ),
+            external_computed_tokens=external_tokens,
+            external_block_hashes=external_hashes,
+        )
+        return external_tokens
+
+    def can_commit_prefix_cache_hit(
+        self,
+        request_id: str,
+        *,
+        local_computed_tokens: int,
+        external_computed_tokens: int,
+        required_dram_block_count: int,
+    ) -> bool:
+        plan = self._pending_prefix_hits.get(request_id)
+        if (
+            int(local_computed_tokens) % self.dram_block_size
+            or int(external_computed_tokens) % self.dram_block_size
+        ):
+            raise ValueError("DSA prefix admission requires block-aligned tokens")
+        total = int(local_computed_tokens) + int(external_computed_tokens)
+        if total <= 0:
+            return True
+        if (
+            plan is None
+            or plan.num_computed_tokens != total
+            or plan.local_computed_tokens != int(local_computed_tokens)
+            or plan.external_computed_tokens
+            != int(external_computed_tokens)
+        ):
+            raise RuntimeError(
+                "DSA prefix plan disagrees with allocation admission: "
+                f"request_id={request_id!r}, local={local_computed_tokens}, "
+                f"external={external_computed_tokens}, plan={plan}"
+            )
+        external_blocks = (
+            int(external_computed_tokens) // self.dram_block_size
+        )
+        prefix_blocks = (
+            int(local_computed_tokens) // self.dram_block_size
+            + external_blocks
+        )
+        required_dram_block_count = int(required_dram_block_count)
+        if required_dram_block_count < prefix_blocks:
+            raise ValueError(
+                "DSA required DRAM width cannot be shorter than its prefix"
+            )
+        return self.dram_directory.can_attach_cached_prefix(
+            plan.dram_blocks,
+            new_block_count=(
+                required_dram_block_count - len(plan.dram_blocks)
+            ),
+        )
+
     def commit_prefix_cache_hit(
         self,
         request_id: str,
-        num_computed_tokens: int,
+        local_computed_tokens: int,
+        external_computed_tokens: int = 0,
+        required_dram_block_count: int | None = None,
     ) -> None:
-        """分物理池 admission 成功后提交 DRAM 引用和 restore 映射。"""
+        """联合 admission 成功后提交 L2 引用、load 与 restore 映射。"""
 
-        if num_computed_tokens <= 0:
+        local_computed_tokens = int(local_computed_tokens)
+        external_computed_tokens = int(external_computed_tokens)
+        if (
+            local_computed_tokens % self.dram_block_size
+            or external_computed_tokens % self.dram_block_size
+        ):
+            raise ValueError("DSA prefix commit requires block-aligned tokens")
+        total_computed_tokens = (
+            local_computed_tokens + external_computed_tokens
+        )
+        if total_computed_tokens <= 0:
             self._pending_prefix_hits.pop(request_id, None)
             return
         plan = self._pending_prefix_hits.pop(request_id, None)
-        if plan is None or plan.num_computed_tokens != int(
-            num_computed_tokens
+        if (
+            plan is None
+            or plan.num_computed_tokens != total_computed_tokens
+            or plan.local_computed_tokens != local_computed_tokens
+            or plan.external_computed_tokens
+            != external_computed_tokens
         ):
             raise RuntimeError(
                 "DSA prefix hit plan is missing or changed before commit: "
-                f"request_id={request_id!r}, expected={num_computed_tokens}, "
+                f"request_id={request_id!r}, local={local_computed_tokens}, "
+                f"external={external_computed_tokens}, "
                 f"plan={plan}"
             )
-        block_count = int(num_computed_tokens) // self.dram_block_size
+        local_block_count = (
+            local_computed_tokens // self.dram_block_size
+        )
+        external_block_count = (
+            external_computed_tokens // self.dram_block_size
+        )
+        block_count = total_computed_tokens // self.dram_block_size
+        if required_dram_block_count is None:
+            required_dram_block_count = block_count
+        required_dram_block_count = int(required_dram_block_count)
+        if required_dram_block_count < block_count:
+            raise ValueError(
+                "DSA committed DRAM width cannot be shorter than its prefix"
+            )
+        if not self.dram_directory.can_attach_cached_prefix(
+            plan.dram_blocks,
+            new_block_count=(
+                required_dram_block_count - local_block_count
+            ),
+        ):
+            raise RuntimeError(
+                "DSA DRAM prefix capacity changed after admission"
+            )
         indexer_blocks = self.indexer_manager.req_to_blocks[request_id]
         resident_blocks = self.resident_manager.req_to_blocks[request_id]
         if (
-            len(plan.dram_blocks) != block_count
+            len(plan.dram_blocks) != local_block_count
+            or len(plan.external_block_hashes) != external_block_count
             or len(indexer_blocks) < block_count
             or len(resident_blocks) < block_count
         ):
             raise RuntimeError(
                 "DSA prefix restore block tables do not cover the common "
                 f"hit: request_id={request_id!r}, hit={block_count}, "
-                f"dram={len(plan.dram_blocks)}, "
+                f"local_dram={len(plan.dram_blocks)}, "
+                f"external={len(plan.external_block_hashes)}, "
                 f"indexer={len(indexer_blocks)}, "
                 f"resident={len(resident_blocks)}"
             )
@@ -463,11 +663,38 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
             request_id,
             plan.dram_blocks,
         )
+        self.dram_directory.ensure_request_blocks(
+            request_id,
+            required_dram_block_count,
+        )
+        all_dram_block_ids = self.dram_directory.get_request_blocks(
+            request_id
+        )
+        if len(all_dram_block_ids) != required_dram_block_count:
+            raise RuntimeError(
+                "DSA DRAM prefix allocation produced an incomplete row: "
+                f"request_id={request_id!r}, "
+                f"expected={required_dram_block_count}, "
+                f"actual={len(all_dram_block_ids)}"
+            )
+        prefix_dram_block_ids = tuple(all_dram_block_ids[:block_count])
+        if external_block_count:
+            external_destinations = tuple(
+                prefix_dram_block_ids[
+                    local_block_count:block_count
+                ]
+            )
+            self._pending_external_prefix_loads[request_id] = (
+                DSAExternalPrefixLoadPlan(
+                    request_id=request_id,
+                    logical_block_start=local_block_count,
+                    block_hashes=plan.external_block_hashes,
+                    destination_dram_block_ids=external_destinations,
+                )
+            )
         self._pending_prefix_restores[request_id] = DSADRAMBlockRestore(
             request_id=request_id,
-            source_dram_block_ids=tuple(
-                block.block_id for block in plan.dram_blocks
-            ),
+            source_dram_block_ids=prefix_dram_block_ids,
             destination_indexer_block_ids=tuple(
                 block.block_id for block in indexer_blocks[:block_count]
             ),
@@ -481,6 +708,12 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
         request_id: str,
     ) -> DSADRAMBlockRestore | None:
         return self._pending_prefix_restores.pop(request_id, None)
+
+    def take_external_prefix_load_plan(
+        self,
+        request_id: str,
+    ) -> DSAExternalPrefixLoadPlan | None:
+        return self._pending_external_prefix_loads.pop(request_id, None)
 
     def cache_blocks(
         self,
@@ -677,6 +910,7 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
     def free(self, request_id: str) -> None:
         self._pending_prefix_hits.pop(request_id, None)
         self._pending_prefix_restores.pop(request_id, None)
+        self._pending_external_prefix_loads.pop(request_id, None)
         super().free(request_id)
         self.dram_directory.free_request(request_id)
         self.request_cache_layout.free(request_id)

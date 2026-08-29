@@ -20,7 +20,11 @@ Connector 生命周期、异步上传和后续 HBM 热层复用。
 P1-W rank0 异步 write-behind 已完成 TCP 框架适配、UT，以及 TP8 离线单 40K
 长请求的 eager/graph、5K+8K+40K+70K 混合长度多请求 graph/chunked prefill
 和在线 graph 单 40K 流式请求的完整闭环验收，首版正确性阶段已经关闭。
-L3 prefix lookup/loadback 尚未实现，下一阶段进入 P1-R。**
+P1-R 同步 L3 suffix lookup、all-rank `L3 -> L2` 与既有 `L2 -> HBM`
+restore 已完成代码接入并补齐 CPU UT 覆盖；A5 TP8 单 8K eager 的三轮
+cold/Local-L2/L3、单 5K graph 严格精度门禁，以及混合 bsz=4 graph 的
+Local-L2/L3 与 Local-L2/Local-L2 对照均已通过。多请求 graph 已确认存在与
+L3 无关的 replay 数值变化；在线 P1-R 与长稳仍待回归。**
 
 ## 2. 目标与非目标
 
@@ -289,6 +293,13 @@ GLM/DeepSeek MLA 与 Indexer target payload 当前按 TP 副本处理：
 - L3->HBM：每个 rank 分别加载到自己的 HBM block；
 - key 不包含 TP rank。
 
+因此 L3 中每个 `(schema fingerprint, component, block hash)` 只有一个逻辑对象，
+不会像 L2/HBM 那样按 TP rank 保存八份。所有 rank 的 segment 组成一个容量池，
+Mooncake 只为该 key 选择一个物理落点；当前 `ReplicateConfig()` 没有请求额外
+框架副本。P1-R 的 all-rank get 是从同一池化对象向 8 个 rank-local L2 做读出
+扇出，重复的是网络读流量和 L2/HBM 副本，不是 L3 存储对象。若 Mooncake 未来
+启用自身容灾副本，那属于 backend-managed replication，不改变 DSA key 数量。
+
 Mooncake 的“贡献池容量”和“写入 DSA 副本”是两个独立维度，不能都按
 rank0-only 处理。当前 vLLM-Ascend AscendStore 采用 Mooncake 内嵌 client
 模式：每个 TP worker 都以 `contribute_memory=True` 创建 backend，并向全局池
@@ -536,9 +547,17 @@ flowchart TB
    `L2 hit + L3-only hit + 本轮 compute` 一次完成 HBM admission。
 6. Connector metadata 携带 L3 component keys 与每 rank local L2 destination。
 7. all-rank worker 在 forward 前用 Store-owned TCP 将 L3 suffix 写入各自 L2。
-8. L3 get 全部成功后发布本轮 L2 ready watermark，并执行既有 L2->HBM restore。
+8. 各 rank 捕获本地 get 结果，并通过预分配 NPU 状态 tensor 做一次 TP all-reduce；
+   只有全员成功才发布本轮 L2 ready watermark 并执行既有 L2->HBM restore。
 9. forward 只计算未命中部分；已恢复 suffix 不重复执行 HBM->L2 dump。
 10. 任一 rank/component load 失败则 fail-fast，不发布 L2 hash。
+
+这里的 `enable_prefix_caching=True` 只是当前 vLLM 公共入口，同时启用 DSA L2
+directory 的 hash/refcount/restore。P1-R **不查询 target HBM Indexer/MLA**：
+`prepare_prefix_cache_hit()` 只查询完整 LocalDRAM bundle，target HBM group 返回
+空列表；分配边界也拒绝把 target HBM hit block 当成 prefix。MTP full-HBM 是唯一
+已有的 HBM hash 候选，但 DSA+L3 首版明确拒绝 MTP。因此当前 tier 顺序严格为
+`L2 -> L3`，HBM target prefix 仍属于 P3-HOT。
 
 ### 7.2 为什么 TCP 第一版选择 L3->L2->HBM
 
@@ -568,12 +587,33 @@ scheduler source plan，不能另建一套 eager/graph metadata。该优化保�
 - 大容量只读 prefix；
 - 已证明 direct load 后无需立刻物化 L2 的场景。
 
+### 7.4 P2-LAYERWISE：TTFT 流水优化
+
+vLLM-Ascend 基线 `AscendStoreConnector` 已提供 `use_layerwise`、`load_async`、
+`num_prefetch_layers` 和 attention-side `wait_for_layer_load()`：worker 为每层构造
+transfer task，提前提交后续层，并在该层 attention 前等待完成。
+
+P1-R 暂不直接复用，原因是 DSA 当前每个 block 只有一个跨层 Indexer key 和一个
+跨层 MLA key，Mooncake object 分别包含 42/78 个 plane descriptor；本地
+`L2 -> HBM` restore 也在 prefill 前一次遍历全部 target layer。仅打开基线开关
+无法得到可靠的逐层完成事件，还会让 eager/graph 合同变得含糊。
+
+后续分两步：
+
+1. 保持现有远端 schema，先把已完整落入 L2 的数据按 layer 执行 H2D restore，
+   复用 attention `wait_for_layer_load()` 与固定 prefetch window，重叠 H2D 和 prefill
+   计算；
+2. 若 L3 网络 IO 仍是主要 TTFT 瓶颈，再将 schema 版本升级为 per-layer object，
+   让 `L3 -> L2 -> HBM` 真正逐层流水。GLM-5.2 的 shared Indexer 必须按 21 个
+   physical source layer 建映射，不能机械按 78 层重复存取。
+
+该优化在 P1-R 同步精度门禁通过后进入 P2，不改变首版正确性范围。
+
 ## 8. DSA allocator 改造
 
-当前 `allocate_dsa_slots()` 显式拒绝：
+当前 `allocate_dsa_slots()` 仍显式拒绝：
 
 ```text
-num_external_computed_tokens
 delay_cache_blocks
 reserved_blocks
 ```
@@ -593,8 +633,9 @@ request.num_computed_tokens
 + external_l3_hit_tokens
 ```
 
-HBM target block 分配覆盖全部 local+external prefix；local 部分由 DSA restore
-写入，external 部分由 Connector 写入。不能调用基线
+HBM target block 分配覆盖全部 local+external prefix；local 与 external 最终都由
+同一 DSA restore 从 L2 写入 HBM，Connector 只先把 external suffix 写入 L2。
+不能调用基线
 `allocate_new_computed_blocks()` 并假设 local hit 已经是 HBM block，因为 DSA
 local target hit 实际来自 L2。
 
@@ -699,7 +740,7 @@ launcher 已按基线传递该配置。
 ### 10.1 scheduler job
 
 ```text
-job_id
+job_id（异步 STORE）
 direction: LOAD / STORE
 request_id（诊断与 load resume 使用）
 block_hashes
@@ -710,8 +751,10 @@ status
 bytes
 ```
 
-store job 的 `expected_worker_acks=1`，因为只有 rank0 写。load job 若走所有 TP
-worker，则 expected count 等于参与 load 的本地 worker 数。
+store job 的 `expected_worker_acks=1`，因为只有 rank0 写。P1-R load 是随本轮
+metadata 下发的 request-scoped 同步任务：所有 TP worker 在 pre-update hook 中
+完成 get，任一 worker 抛错都会让整次 execute-model RPC fail-fast，因此首版不再
+额外维护异步 ack 计数。P2 若改为异步 load，再增加 all-rank completion 聚合。
 
 ### 10.2 状态
 
@@ -735,7 +778,7 @@ REMOTE_READY
 
 ### 10.3 完成回报
 
-worker 后台线程完成阻塞式 Backend `put/get` 后，将结果写入本地线程安全队列。
+worker 后台线程完成阻塞式 Backend `put` 后，将结果写入本地线程安全队列。
 worker 主线程在正常或 zero-token Connector `get_finished()` 中清空队列，生成
 `KVConnectorOutput.kv_connector_worker_meta`。scheduler 在
 `connector.update_connector_output()` 中消费。
@@ -746,6 +789,12 @@ failed/bytes 计数，并在 shutdown 打印汇总。普通 poll 与 reuse/shutd
 scheduler shutdown 若仍有 unacknowledged job 必须失败，不能清空账本后静默退出。
 DSA L3 模块复用 `vllm.logger.logger`，与当前大多数 vLLM-Ascend 热路径一致；不能
 使用只落到 `vllm_ascend` file handler 的独立 logger 后再凭 console 判断状态。
+
+P1-R `get` 在 `model_runner._update_states()` 之前同步执行。成功后同轮 projection
+应用 L2 assignment 并调用既有 prefix restore；失败则在任何 HBM forward/graph
+replay 前抛错。该顺序复用 Connector 的 pre-update `handle_preemptions(metadata)`
+hook，因为标准 `start_load_kv()` 晚于 `_update_states()`，不能满足
+`L3 -> L2 -> HBM` 的依赖关系。
 
 不创建 scheduler 接收线程；即使未来增加 IPC receiver，receiver 也只能入队，
 不能直接修改 BlockPool。
@@ -1052,7 +1101,7 @@ MTP:     HBM
 ```python
 KVTransferConfig(
     kv_connector="DSAL3Connector",
-    kv_role="kv_producer",  # P1-W；开放 load 后改为 kv_both
+    kv_role="kv_both",  # P1-W-only 使用 kv_producer
     kv_load_failure_policy="fail",
     kv_connector_extra_config={
         "backend": "mooncake",
@@ -1186,6 +1235,32 @@ executor grace period 后被发送 SIGTERM，但该提示发生在 6 个 store j
 - 复用现有 L2->HBM restore 后进入 forward；
 - no-MTP、fail-fast、Mooncake only。
 
+上述代码项已完成。scheduler 使用不贡献 segment 的 Mooncake client 查询本地 L2
+命中后的 paired Indexer/MLA key；allocator 在修改任一 pool 前联合检查 split HBM
+与 L2 free queue，并为 L3-only suffix 分配完整 L2 bundle。所有 TP worker 在
+assignment 前同步 get 到相同 rank-local block IDs，再用 TP success consensus
+阻止任一失败 rank 的同伴提前进入 restore/forward，随后统一 projection 执行现有
+restore。`kv_role=kv_producer` 保持 P1-W 行为，只有
+`kv_role=kv_both + enable_prefix_caching=True` 开启 P1-R。服务器 UT、三轮
+same-prompt（cold、local-L2、清本地后的 L3）和 A5 TP8 eager/graph 收缩门禁
+已经完成；cold/full-prefill 只作参考，避免不同 query chunk 数值路径形成误报。
+在线 continuous batching、FD/连接长稳、physical-id reuse 与 load/store
+completion 联合 drain 归入 P2，不再描述成 P1-R 代码缺口。
+
+2026-08-29 的 A5 TP8 graph 收缩结果进一步确定了精度门禁边界：单 5K 请求
+Local-L2 与 L3 replay 的 38 个块、262,364,160 bytes/rank 和 32 个输出 token
+完全一致。混合 `8K+5K+70K+40K` bsz=4 中，5K 请求在第 5 个生成 token 出现
+Local-L2/L3 分叉；关闭 L3 loadback 后，连续两轮 Local-L2 在相同请求、相同
+位置复现相同 token 与 top-logprobs 分布。启用和禁用 L3 loadback 的四条输出又
+按 replay 轮次逐条相同，因此该差异属于多请求 graph 的既有执行数值变化，而非
+L3 数据恢复错误。
+
+最终门禁分层如下：bsz=1/eager 继续要求 token 完全一致；bsz>1 graph 只有在
+首个分歧前存在公共生成前缀，且双方选中 token 都位于对方同位置 top-k 时，才
+记录为数值等价。其余情况仍失败。该放宽必须同时满足 component bitwise UT、
+all-rank get 成功、命中 block 数一致、restore 完成和无 transport failure，不能
+以文本可读性或请求通过比例代替。
+
 ### P2：读写闭环与稳态
 
 - load/store completion 联合 drain；
@@ -1261,15 +1336,21 @@ L3 验收应继续对照 HBM-prefix warm 结果，不能只比较 cold/warm toke
 | 风险 | 当前处理 |
 |---|---|
 | AscendDirect swapped H2H 跨 NUMA 失败 | P1-W 改用已通过 TP8 的 Store-owned TCP；保留 direct 结果作历史门禁 |
-| 正式几十 GiB L2 MR 尚未以 TCP 注册 | cache-init/P1-W E2E 必测，独立 2-block probe 不替代 |
+| 正式几十 GiB L2 MR 注册 | TP8 P1-W/P1-R 已通过；容量计划先扣除每 rank Mooncake global segment 与 local buffer |
 | Backend put 吞错误 | 严格结果 adapter |
 | completion 把异常当成功 | 显式 JobResult |
 | physical id 在上传中复用 | upstream-style jobs_to_flush fence |
 | base Connector metadata 早于 DSA projection | DSA 类型化后置 metadata 扩展钩子 |
 | split pool 裸 block id 冲突 | job/component/group-qualified identity |
 | rank0-only store 误按 world size 等待 | per-job expected ack count |
-| DSA target key 与基线 key 冲突 | schema namespace/fingerprint |
+| DSA target key 与基线/异配置 key 冲突 | schema namespace + model-config/TP/cache-spec fingerprint |
 | 首次 Mooncake 建链过慢 | connection warmup 与稳态指标分离 |
+| TCP 短连接耗尽临时端口 | DSA TCP 初始化强制连接池开启，离线/在线入口显式导出 |
+| 当前 Mooncake TCP pool 的 idle cleanup/FD 长稳风险 | 在线长稳监控 worker FD/ESTAB；升级或回合上游修复前不宣称生产长稳关闭 |
+| 同一 Master 上多实例 segment 名冲突 | 每个实例显式使用不同 `MOONCAKE_TCP_SEGMENT_PORT_BASE`；禁止新旧实例同 base 交叠 |
+| remote-ready 历史 key 无界增长 | hint set 按本地 L2 最大 component key 数清理；后端 exists 仍为最终真值 |
+| lookup 后、get 前对象被 L3 淘汰 | P1-R 保持 all-rank fail-fast；P2 需 lease 或可回滚 recompute，不能把 exists 当永久承诺 |
+| 权重更新/reset 后命中旧远端 KV | external reset 仅在 transfer drain 后轮换 DSA L3 namespace generation；旧对象不再命中并交给后端淘汰。该操作暂不物理 GC，重复测试默认不得轮换 namespace |
 | Connector teardown 泄漏 | stop/join/unregister/close/drain |
 | sparse resident 被通用 save 错读 | store source 固定为 DSA L2 component view |
 | MTP provisional block 提前发布 | durable watermark + 初版拒绝 MTP |

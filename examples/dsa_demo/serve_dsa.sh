@@ -22,8 +22,12 @@ RUN_MODE="eager"  # eager / graph
 ENABLE_A5_PACKED_C8_DSA="false"
 ENABLE_MTP="false"
 ENABLE_L3_WRITE_BEHIND="false"
+ENABLE_L3_PREFIX_LOADBACK="false"
 MOONCAKE_CONFIG_PATH="${SCRIPT_DIR}/L3_cache_sys_api_test/baseline_e2e/configs/mooncake-dsa-tcp.json"
 MOONCAKE_GLOBAL_SEGMENT_SIZE="4GB"
+MC_TCP_ENABLE_CONNECTION_POOL="${MC_TCP_ENABLE_CONNECTION_POOL:-1}"
+# 同一 Mooncake Master 上的并行服务必须使用不同 base。
+MOONCAKE_TCP_SEGMENT_PORT_BASE="${MOONCAKE_TCP_SEGMENT_PORT_BASE:-45000}"
 DSA_L3_MAX_INFLIGHT_STORE_JOBS="8"
 DSA_L3_MAX_ACTIVE_CHANNELS="8"
 DSA_L3_MAX_DESCRIPTORS_PER_PUT="128"
@@ -106,6 +110,21 @@ case "${ENABLE_MTP}" in
         ;;
 esac
 
+case "${ENABLE_L3_PREFIX_LOADBACK}" in
+    true)
+        if [[ "${ENABLE_L3_WRITE_BEHIND}" != "true" ]]; then
+            echo "ENABLE_L3_PREFIX_LOADBACK requires ENABLE_L3_WRITE_BEHIND=true" >&2
+            exit 2
+        fi
+        ;;
+    false)
+        ;;
+    *)
+        echo "ENABLE_L3_PREFIX_LOADBACK must be true or false, got: ${ENABLE_L3_PREFIX_LOADBACK}" >&2
+        exit 2
+        ;;
+esac
+
 case "${ENABLE_L3_WRITE_BEHIND}" in
     true)
         if [[ "${ENABLE_MTP}" == "true" ]]; then
@@ -116,14 +135,27 @@ case "${ENABLE_L3_WRITE_BEHIND}" in
             echo "Mooncake config does not exist: ${MOONCAKE_CONFIG_PATH}" >&2
             exit 2
         fi
+        if [[ "${ENABLE_L3_PREFIX_LOADBACK}" == "true" && "${ENABLE_PREFIX_CACHING}" != "true" ]]; then
+            echo "ENABLE_L3_PREFIX_LOADBACK requires ENABLE_PREFIX_CACHING=true" >&2
+            exit 2
+        fi
+        if [[ "${ENABLE_L3_PREFIX_LOADBACK}" == "true" ]]; then
+            DSA_L3_KV_ROLE="kv_both"
+            # 仅测试环境启用 vLLM 原生 cache reset endpoint。生产部署应关闭。
+            export VLLM_SERVER_DEV_MODE=1
+        else
+            DSA_L3_KV_ROLE="kv_producer"
+        fi
         export MOONCAKE_CONFIG_PATH
         export MOONCAKE_GLOBAL_SEGMENT_SIZE
+        export MC_TCP_ENABLE_CONNECTION_POOL
+        export MOONCAKE_TCP_SEGMENT_PORT_BASE
         unset ASCEND_GLOBAL_RESOURCE_CONFIG || true
         KV_TRANSFER_ARGS=(
             --shutdown-timeout
             "${DSA_L3_SHUTDOWN_TIMEOUT_SECONDS}"
             --kv-transfer-config
-            "{\"kv_connector\":\"DSAL3Connector\",\"kv_role\":\"kv_producer\",\"kv_load_failure_policy\":\"fail\",\"kv_connector_extra_config\":{\"backend\":\"mooncake\",\"max_inflight_l3_store_jobs\":${DSA_L3_MAX_INFLIGHT_STORE_JOBS},\"max_active_channels\":${DSA_L3_MAX_ACTIVE_CHANNELS},\"max_descriptors_per_l3_put\":${DSA_L3_MAX_DESCRIPTORS_PER_PUT}}}"
+            "{\"kv_connector\":\"DSAL3Connector\",\"kv_role\":\"${DSA_L3_KV_ROLE}\",\"kv_load_failure_policy\":\"fail\",\"kv_connector_extra_config\":{\"backend\":\"mooncake\",\"max_inflight_l3_store_jobs\":${DSA_L3_MAX_INFLIGHT_STORE_JOBS},\"max_active_channels\":${DSA_L3_MAX_ACTIVE_CHANNELS},\"max_descriptors_per_l3_put\":${DSA_L3_MAX_DESCRIPTORS_PER_PUT}}}"
         )
         ;;
     false)
@@ -181,6 +213,11 @@ JSON
 echo "[dsa-online] mode=${RUN_MODE} model=${MODEL_PATH}"
 echo "[dsa-online] a5_packed_c8=${ENABLE_A5_PACKED_C8_DSA} mtp3=${ENABLE_MTP} safetensors=${SAFETENSORS_LOAD_STRATEGY}"
 echo "[dsa-online] l3_write_behind=${ENABLE_L3_WRITE_BEHIND} mooncake_config=${MOONCAKE_CONFIG_PATH}"
+echo "[dsa-online] l3_prefix_loadback=${ENABLE_L3_PREFIX_LOADBACK}"
+if [[ "${ENABLE_L3_WRITE_BEHIND}" == "true" ]]; then
+    echo "[dsa-online] mooncake_tcp_connection_pool=${MC_TCP_ENABLE_CONNECTION_POOL}"
+    echo "[dsa-online] mooncake_tcp_segment_port_base=${MOONCAKE_TCP_SEGMENT_PORT_BASE}"
+fi
 echo "[dsa-online] endpoint=http://${HOST}:${PORT}/v1"
 
 exec vllm serve "${MODEL_PATH}" \

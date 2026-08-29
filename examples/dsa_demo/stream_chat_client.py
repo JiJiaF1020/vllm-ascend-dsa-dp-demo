@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import urllib.request
 from pathlib import Path
 
 from openai import OpenAI
@@ -29,6 +30,7 @@ CONTINUATION_PROMPT: str | None = None
 MAX_TOKENS = 512
 TEMPERATURE = 0.0
 PRINT_REASONING = True
+L3_PREFIX_REPLAY_ROUNDS = 1  # P1-R 验收时设为 3
 
 
 def build_initial_messages() -> list[dict[str, str]]:
@@ -145,6 +147,37 @@ def stream_continuation(
     return "".join(text_parts)
 
 
+def _post_dev_api(path: str, *, timeout: float = 300.0) -> None:
+    server_root = API_BASE.removesuffix("/v1").rstrip("/")
+    request = urllib.request.Request(
+        f"{server_root}{path}",
+        method="POST",
+        headers={"Authorization": f"Bearer {API_KEY}"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        if response.status != 200:
+            raise RuntimeError(
+                f"dev API failed: path={path!r}, status={response.status}"
+            )
+
+
+def drain_stores_and_reset_local_prefix_cache() -> None:
+    """Drain async stores, clear local prefix, then resume generation."""
+
+    _post_dev_api("/pause?mode=wait&clear_cache=false")
+    try:
+        _post_dev_api(
+            "/reset_prefix_cache?reset_external=false",
+            timeout=30,
+        )
+    finally:
+        _post_dev_api("/resume", timeout=30)
+    print(
+        "[dsa-client] pending L3 stores drained; local HBM/L2 prefix reset; "
+        "Mooncake objects retained"
+    )
+
+
 def main() -> None:
     client = OpenAI(api_key=API_KEY, base_url=API_BASE)
     available_models = [model.id for model in client.models.list().data]
@@ -159,7 +192,36 @@ def main() -> None:
             "[dsa-client] raw continuation "
             f"chars={len(CONTINUATION_PROMPT)}"
         )
-        stream_continuation(client, CONTINUATION_PROMPT)
+        if L3_PREFIX_REPLAY_ROUNDS not in (1, 3):
+            raise ValueError(
+                "L3_PREFIX_REPLAY_ROUNDS must be 1 or 3"
+            )
+        outputs: list[str] = []
+        for round_index in range(L3_PREFIX_REPLAY_ROUNDS):
+            print(
+                f"[dsa-client] continuation round "
+                f"{round_index + 1}/{L3_PREFIX_REPLAY_ROUNDS}"
+            )
+            outputs.append(
+                stream_continuation(client, CONTINUATION_PROMPT)
+            )
+            if L3_PREFIX_REPLAY_ROUNDS == 3 and round_index == 1:
+                drain_stores_and_reset_local_prefix_cache()
+        if L3_PREFIX_REPLAY_ROUNDS == 3:
+            if outputs[1] != outputs[2]:
+                raise AssertionError(
+                    "local-L2/L3 online replay text differs: "
+                    f"local_l2={outputs[1]!r}, l3={outputs[2]!r}"
+                )
+            if outputs[0] != outputs[1]:
+                print(
+                    "[dsa-client] cold/prefix text differs; recorded as "
+                    "full-prefill versus prefix-suffix numerical path "
+                    "difference"
+                )
+            print(
+                "[dsa-client] local-L2/L3 online replay consistency passed"
+            )
         return
 
     messages = build_initial_messages()

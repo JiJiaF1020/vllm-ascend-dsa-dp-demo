@@ -6,12 +6,16 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from collections.abc import Sequence
 from typing import Any
 
 from vllm.logger import logger
 
-from vllm_ascend.dsa_offload.l3.metadata import DSAL3StoreJob
+from vllm_ascend.dsa_offload.l3.metadata import (
+    DSAL3LoadJob,
+    DSAL3StoreJob,
+)
 from vllm_ascend.dsa_offload.l3.schema import (
     DSAL3Component,
     DSAL3KeySchema,
@@ -55,6 +59,28 @@ def configure_dsa_mooncake_global_ub(max_active_channels: int) -> None:
     )
 
 
+def configure_dsa_mooncake_tcp() -> None:
+    """Require connection reuse before Mooncake constructs TCP transport."""
+
+    name = "MC_TCP_ENABLE_CONNECTION_POOL"
+    raw = os.getenv(name)
+    if raw is None:
+        os.environ[name] = "1"
+        return
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return
+    if value in {"0", "false", "no", "off"}:
+        raise ValueError(
+            "DSA L3 Store-owned TCP requires MC_TCP_ENABLE_CONNECTION_POOL=1; "
+            "without connection reuse, multi-plane TP loadback exhausts the "
+            "host ephemeral port range"
+        )
+    raise ValueError(
+        f"{name} must be a boolean value, got {raw!r}"
+    )
+
+
 class DSAL3BackendAdapter:
     """把宽松 Backend API 收敛为 DSA 可判定成败的合同。"""
 
@@ -72,6 +98,7 @@ class DSAL3BackendAdapter:
             raise ValueError("DSA L3 max_descriptors_per_put must be positive")
         self._registered = False
         self._registered_regions: tuple[tuple[int, int], ...] = ()
+        self._io_lock = threading.Lock()
 
     @classmethod
     def create_mooncake(
@@ -81,6 +108,7 @@ class DSAL3BackendAdapter:
         schema: DSAL3KeySchema,
         max_active_channels: int,
         max_descriptors_per_put: int,
+        contribute_memory: bool = True,
     ) -> DSAL3BackendAdapter:
         from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend import (
             MooncakeBackend,
@@ -90,14 +118,25 @@ class DSAL3BackendAdapter:
         config = MooncakeStoreConfig.load_from_env()
         if config.protocol == "ascend":
             configure_dsa_mooncake_global_ub(max_active_channels)
-        backend = MooncakeBackend(
-            vllm_config.parallel_config,
-            config=config,
+        elif config.protocol == "tcp":
+            configure_dsa_mooncake_tcp()
+        backend = (
+            MooncakeBackend(
+                vllm_config.parallel_config,
+                contribute_memory=True,
+                config=config,
+            )
+            if contribute_memory
+            else MooncakeBackend.create_scheduler_client(
+                vllm_config.parallel_config
+            )
         )
         logger.info(
-            "DSA L3 Mooncake backend created: protocol=%s store_owned_engine=%s",
+            "DSA L3 Mooncake backend created: protocol=%s "
+            "store_owned_engine=%s contribute_memory=%s",
             config.protocol,
             config.protocol == "tcp",
+            contribute_memory,
         )
         return cls(
             backend=backend,
@@ -165,6 +204,65 @@ class DSAL3BackendAdapter:
             raise RuntimeError(f"DSA L3 {operation} failed with codes={tuple(failed)}")
         return values
 
+    def lookup_prefix_blocks(
+        self,
+        block_hashes: Sequence[bytes],
+    ) -> int:
+        """返回 Indexer/MLA 均存在的最长连续 block 数。"""
+
+        if not block_hashes:
+            return 0
+        keys: list[str] = []
+        for block_hash in block_hashes:
+            keys.extend(self.schema.block_keys(bytes(block_hash)))
+        with self._io_lock:
+            result = self.backend.exists(keys)
+        exists = self._validate_result(
+            result,
+            expected_count=len(keys),
+            operation="exists",
+        )
+        hit_blocks = 0
+        for offset in range(0, len(exists), 2):
+            if exists[offset] <= 0 or exists[offset + 1] <= 0:
+                break
+            hit_blocks += 1
+        return hit_blocks
+
+    def _descriptor_batches(
+        self,
+        addresses: Sequence[Sequence[int]],
+    ) -> list[tuple[int, int]]:
+        descriptor_counts = [len(parts) for parts in addresses]
+        batches: list[tuple[int, int]] = []
+        batch_start = 0
+        batch_descriptors = 0
+        for index, descriptor_count in enumerate(descriptor_counts):
+            if batch_descriptors and (
+                batch_descriptors + descriptor_count
+                > self.max_descriptors_per_put
+            ):
+                batches.append((batch_start, index))
+                batch_start = index
+                batch_descriptors = 0
+            if descriptor_count > self.max_descriptors_per_put:
+                logger.warning_once(
+                    "DSA L3 component exceeds the soft descriptor budget; "
+                    "sending it as one Mooncake key and relying on the "
+                    "Mooncake transport's internal chunking: "
+                    "descriptors=%d budget=%d",
+                    descriptor_count,
+                    self.max_descriptors_per_put,
+                )
+                batches.append((index, index + 1))
+                batch_start = index + 1
+                batch_descriptors = 0
+                continue
+            batch_descriptors += descriptor_count
+        if batch_start < len(addresses):
+            batches.append((batch_start, len(addresses)))
+        return batches
+
     def put_store_job(
         self,
         *,
@@ -189,8 +287,10 @@ class DSAL3BackendAdapter:
             keys.extend((block.indexer_key, block.mla_key))
             addresses.extend((indexer_addrs[index], mla_addrs[index]))
             sizes.extend((indexer_sizes[index], mla_sizes[index]))
+        with self._io_lock:
+            result = self.backend.exists(keys)
         exists_result = self._validate_result(
-            self.backend.exists(keys),
+            result,
             expected_count=len(keys),
             operation="exists",
         )
@@ -206,30 +306,7 @@ class DSAL3BackendAdapter:
         missing_addresses = [addresses[index] for index in missing_indices]
         missing_sizes = [sizes[index] for index in missing_indices]
         descriptor_counts = [len(parts) for parts in missing_addresses]
-        batches: list[tuple[int, int]] = []
-        batch_start = 0
-        batch_descriptors = 0
-        for index, descriptor_count in enumerate(descriptor_counts):
-            if batch_descriptors and (batch_descriptors + descriptor_count > self.max_descriptors_per_put):
-                batches.append((batch_start, index))
-                batch_start = index
-                batch_descriptors = 0
-            if descriptor_count > self.max_descriptors_per_put:
-                logger.warning_once(
-                    "DSA L3 component exceeds the soft descriptor budget; "
-                    "sending it as one Mooncake key and relying on the "
-                    "Mooncake transport's internal chunking: "
-                    "descriptors=%d budget=%d",
-                    descriptor_count,
-                    self.max_descriptors_per_put,
-                )
-                batches.append((index, index + 1))
-                batch_start = index + 1
-                batch_descriptors = 0
-                continue
-            batch_descriptors += descriptor_count
-        if batch_start < len(missing_keys):
-            batches.append((batch_start, len(missing_keys)))
+        batches = self._descriptor_batches(missing_addresses)
         if len(batches) > 1:
             logger.info(
                 "DSA L3 put split by descriptor budget: keys=%d descriptors=%d batches=%d budget=%d",
@@ -248,11 +325,12 @@ class DSAL3BackendAdapter:
             sum(sum(parts) for parts in missing_sizes),
         )
         for start, end in batches:
-            result = self.backend.put(
-                missing_keys[start:end],
-                missing_addresses[start:end],
-                missing_sizes[start:end],
-            )
+            with self._io_lock:
+                result = self.backend.put(
+                    missing_keys[start:end],
+                    missing_addresses[start:end],
+                    missing_sizes[start:end],
+                )
             self._validate_result(
                 result,
                 expected_count=end - start,
@@ -262,6 +340,94 @@ class DSAL3BackendAdapter:
         logger.info(
             "DSA L3 store backend put finished: job=%d bytes=%d",
             job.job_id,
+            transferred_bytes,
+        )
+        return transferred_bytes
+
+    def get_load_job(
+        self,
+        *,
+        job: DSAL3LoadJob,
+        store: DSAWorkerDRAMStore,
+    ) -> int:
+        """同步恢复一个请求的 L3-only suffix 到本 rank L2。"""
+
+        if not self._registered:
+            raise RuntimeError("DSA L3 backend is not bound to its DRAM store")
+        block_ids = job.destination_l2_block_ids
+        indexer_addrs, indexer_sizes = store.build_l3_component_payload(
+            component=DSAL3Component.INDEXER,
+            physical_block_ids=block_ids,
+        )
+        mla_addrs, mla_sizes = store.build_l3_component_payload(
+            component=DSAL3Component.MLA,
+            physical_block_ids=block_ids,
+        )
+        keys: list[str] = []
+        addresses: list[list[int]] = []
+        sizes: list[list[int]] = []
+        for index, block in enumerate(job.blocks):
+            keys.extend((block.indexer_key, block.mla_key))
+            addresses.extend((indexer_addrs[index], mla_addrs[index]))
+            sizes.extend((indexer_sizes[index], mla_sizes[index]))
+        batches = self._descriptor_batches(addresses)
+        logger.info(
+            "DSA L3 load backend get: request=%s blocks=%d keys=%d "
+            "descriptors=%d batches=%d bytes=%d",
+            job.request_id,
+            len(job.blocks),
+            len(keys),
+            sum(len(parts) for parts in addresses),
+            len(batches),
+            sum(sum(parts) for parts in sizes),
+        )
+        for start, end in batches:
+            with self._io_lock:
+                get_with_sizes = getattr(
+                    self.backend,
+                    "get_with_sizes",
+                    None,
+                )
+                result = (
+                    get_with_sizes(
+                        keys[start:end],
+                        addresses[start:end],
+                        sizes[start:end],
+                    )
+                    if callable(get_with_sizes)
+                    else self.backend.get(
+                        keys[start:end],
+                        addresses[start:end],
+                        sizes[start:end],
+                    )
+                )
+            values = self._validate_result(
+                result,
+                expected_count=end - start,
+                operation="get",
+            )
+            if callable(get_with_sizes):
+                expected_bytes = [
+                    sum(parts) for parts in sizes[start:end]
+                ]
+                incomplete = [
+                    (index, actual, expected)
+                    for index, (actual, expected) in enumerate(
+                        zip(values, expected_bytes, strict=True),
+                        start=start,
+                    )
+                    if actual != expected
+                ]
+                if incomplete:
+                    raise RuntimeError(
+                        "DSA L3 get returned incomplete payloads: "
+                        f"{incomplete}"
+                    )
+        transferred_bytes = sum(sum(parts) for parts in sizes)
+        logger.info(
+            "DSA L3 load backend get finished: request=%s blocks=%d bytes=%d",
+            job.request_id,
+            len(job.blocks),
             transferred_bytes,
         )
         return transferred_bytes

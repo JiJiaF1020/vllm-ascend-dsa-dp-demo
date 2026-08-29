@@ -442,6 +442,33 @@ def dsa_dram_bytes_per_logical_block(
     return total
 
 
+def _dsa_l3_host_reservation_bytes(
+    vllm_config: VllmConfig,
+    tensor_parallel_size: int,
+) -> int:
+    """Return host bytes created after the DSA L2 capacity plan."""
+
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    if (
+        kv_transfer_config is None
+        or kv_transfer_config.kv_connector != "DSAL3Connector"
+    ):
+        return 0
+    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend import (
+        MooncakeStoreConfig,
+    )
+
+    config = MooncakeStoreConfig.load_from_env()
+    if config.protocol != "tcp":
+        return 0
+    global_segment_size = int(config.global_segment_size)
+    local_buffer_size = int(config.local_buffer_size)
+    if global_segment_size < 0 or local_buffer_size < 0:
+        raise ValueError("Mooncake host reservation cannot be negative")
+    per_rank = global_segment_size + local_buffer_size
+    return per_rank * int(tensor_parallel_size)
+
+
 def finalize_dsa_dram_capacity(
     vllm_config: VllmConfig,
     kv_cache_configs: list[KVCacheConfig],
@@ -506,6 +533,17 @@ def finalize_dsa_dram_capacity(
         if host_available_bytes is None
         else int(host_available_bytes)
     )
+    l3_host_reservation = _dsa_l3_host_reservation_bytes(
+        vllm_config,
+        tp_size,
+    )
+    planning_available = observed_available - l3_host_reservation
+    if planning_available <= 0:
+        raise RuntimeError(
+            "DSA host DRAM is exhausted by the configured L3 client pools: "
+            f"host_available={observed_available}, "
+            f"l3_reservation={l3_host_reservation}"
+        )
     plan = calculate_dram_capacity_plan(
         indexer_num_blocks=indexer_block_counts.pop(),
         block_multiple=(
@@ -513,7 +551,7 @@ def finalize_dsa_dram_capacity(
         ),
         bytes_per_logical_block=bundle_sizes.pop(),
         tensor_parallel_size=tp_size,
-        host_available_bytes=observed_available,
+        host_available_bytes=planning_available,
     )
     for config in dsa_configs:
         assert isinstance(config, DSAKVCacheConfig)
@@ -539,7 +577,9 @@ def finalize_dsa_dram_capacity(
     logger.info_once(
         "\n"
         "================ DSA DRAM CAPACITY REPORT ====================\n"
-        "  Host available bytes      : %s bytes (%s GiB)\n"
+        "  Host observed available   : %s bytes (%s GiB)\n"
+        "  L3 host reservation       : %s bytes (%s GiB)\n"
+        "  DSA planning bytes        : %s bytes (%s GiB)\n"
         "  Local TP workers          : %s\n"
         "  Per-rank available bytes  : %s bytes (%s GiB)\n"
         "  Complete block payload    : %s bytes (target Indexer + MLA)\n"
@@ -551,6 +591,10 @@ def finalize_dsa_dram_capacity(
         "  Capacity downsized        : %s\n"
         "  Prefix cache              : %s\n"
         "=================================================================",
+        f"{observed_available:,}",
+        format_gib(observed_available),
+        f"{l3_host_reservation:,}",
+        format_gib(l3_host_reservation),
         f"{plan.host_available_bytes:,}",
         format_gib(plan.host_available_bytes),
         f"{plan.tensor_parallel_size:,}",

@@ -73,7 +73,6 @@ def _require_initial_runtime_contract(
         )
 
     unsupported = {
-        "num_external_computed_tokens": num_external_computed_tokens,
         "delay_cache_blocks": delay_cache_blocks,
         "num_encoder_tokens": num_encoder_tokens,
         "reserved_blocks": reserved_blocks,
@@ -87,15 +86,28 @@ def _require_initial_runtime_contract(
     else:
         blocks = new_computed_blocks.blocks
     prefix_plan = coordinator.get_pending_prefix_hit(request.request_id)
-    expected_prefix_tokens = (
-        prefix_plan.num_computed_tokens if prefix_plan is not None else 0
+    expected_local_tokens = (
+        prefix_plan.local_computed_tokens
+        if prefix_plan is not None
+        else 0
     )
-    if int(num_new_computed_tokens) != expected_prefix_tokens:
+    expected_external_tokens = (
+        prefix_plan.external_computed_tokens
+        if prefix_plan is not None
+        else 0
+    )
+    if (
+        int(num_new_computed_tokens) != expected_local_tokens
+        or int(num_external_computed_tokens)
+        != expected_external_tokens
+    ):
         raise RuntimeError(
             "DSA prefix-hit token count disagrees with its scheduler plan: "
             f"request_id={request.request_id!r}, "
-            f"allocated={num_new_computed_tokens}, "
-            f"planned={expected_prefix_tokens}"
+            f"allocated_local={num_new_computed_tokens}, "
+            f"allocated_external={num_external_computed_tokens}, "
+            f"planned_local={expected_local_tokens}, "
+            f"planned_external={expected_external_tokens}"
         )
     for group_id, group_blocks in enumerate(blocks):
         if group_id == coordinator.group_ids.mtp_full:
@@ -190,25 +202,43 @@ def _allocate_dense_plan(
     plan: DSARequestCachePlan,
     empty_blocks: tuple[Sequence[KVCacheBlock], ...],
     num_new_computed_tokens: int,
+    num_external_computed_tokens: int,
 ) -> KVCacheBlocks | None:
+    total_prefix_tokens = (
+        int(num_new_computed_tokens)
+        + int(num_external_computed_tokens)
+    )
     requirements = coordinator.get_num_blocks_to_allocate_by_group(
         request_id=request.request_id,
         num_tokens=plan.indexer_tokens_need_slot,
         new_computed_blocks=empty_blocks,
         num_encoder_tokens=0,
         total_computed_tokens=(
-            request.num_computed_tokens + num_new_computed_tokens
+            request.num_computed_tokens + total_prefix_tokens
         ),
         num_tokens_main_model=plan.indexer_tokens_need_slot,
     )
-    if not coordinator.can_allocate(requirements):
+    if not coordinator.can_allocate(requirements) or not (
+        coordinator.can_commit_prefix_cache_hit(
+            request.request_id,
+            local_computed_tokens=num_new_computed_tokens,
+            external_computed_tokens=num_external_computed_tokens,
+            required_dram_block_count=(
+                plan.indexer_tokens_need_slot
+                // coordinator.dram_block_size
+            ),
+        )
+    ):
         return None
 
-    if num_new_computed_tokens:
+    if total_prefix_tokens:
         coordinator.allocate_new_computed_blocks(
             request_id=request.request_id,
             new_computed_blocks=empty_blocks,
-            num_local_computed_tokens=num_new_computed_tokens,
+            # DSA target 的 local/external prefix 都来自 L2，不把任何
+            # HBM hit block 交给 single-type manager；统一按已计算长度
+            # 建账，随后由 allocate_new_blocks 分配 split HBM 目的块。
+            num_local_computed_tokens=total_prefix_tokens,
             num_external_computed_tokens=0,
         )
 
@@ -220,6 +250,8 @@ def _allocate_dense_plan(
     coordinator.commit_prefix_cache_hit(
         request.request_id,
         num_new_computed_tokens,
+        num_external_computed_tokens,
+        plan.indexer_tokens_need_slot // coordinator.dram_block_size,
     )
     coordinator.request_cache_layout.commit(plan)
     return manager.create_kv_cache_blocks(new_blocks)
@@ -464,7 +496,9 @@ def allocate_dsa_slots(
             new_computed_blocks=new_computed_block_list,
             num_encoder_tokens=0,
             total_computed_tokens=(
-                request.num_computed_tokens + num_new_computed_tokens
+                request.num_computed_tokens
+                + num_new_computed_tokens
+                + num_external_computed_tokens
             ),
             num_tokens_main_model=full_num_tokens,
             apply_admission_cap=True,
@@ -477,7 +511,9 @@ def allocate_dsa_slots(
         num_new_tokens=num_new_tokens,
         num_lookahead_tokens=num_lookahead_tokens,
         num_computed_tokens=(
-            request.num_computed_tokens + num_new_computed_tokens
+            request.num_computed_tokens
+            + num_new_computed_tokens
+            + num_external_computed_tokens
         ),
         max_model_len=manager.max_model_len,
     )
@@ -492,6 +528,7 @@ def allocate_dsa_slots(
             plan,
             new_computed_block_list,
             num_new_computed_tokens,
+            num_external_computed_tokens,
         )
     else:
         allocated = _allocate_sparse_plan(
@@ -504,6 +541,7 @@ def allocate_dsa_slots(
         num_tokens_to_cache = min(
             request.num_computed_tokens
             + num_new_computed_tokens
+            + num_external_computed_tokens
             + num_new_tokens,
             request.num_tokens,
         )

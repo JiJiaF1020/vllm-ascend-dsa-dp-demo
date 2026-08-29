@@ -502,10 +502,25 @@ class DSAOffloadConfig:
                 raise ValueError(
                     "DSA L3 first version does not yet support MTP"
                 )
-            if str(kv_transfer_config.kv_role) != "kv_producer":
+            kv_role = str(kv_transfer_config.kv_role)
+            if kv_role not in ("kv_producer", "kv_both"):
                 raise ValueError(
-                    "DSA L3 store-only first version requires "
-                    "kv_role='kv_producer'"
+                    "DSA L3 supports kv_role='kv_producer' for P1-W or "
+                    "kv_role='kv_both' for P1-R"
+                )
+            if (
+                kv_role == "kv_both"
+                and not bool(vllm_config.cache_config.enable_prefix_caching)
+            ):
+                raise ValueError(
+                    "DSA L3 prefix load requires enable_prefix_caching=True"
+                )
+            if (
+                kv_role == "kv_both"
+                and str(kv_transfer_config.kv_load_failure_policy) != "fail"
+            ):
+                raise ValueError(
+                    "DSA L3 prefix load requires kv_load_failure_policy='fail'"
                 )
             extra = kv_transfer_config.kv_connector_extra_config or {}
             if str(extra.get("backend", "mooncake")) != "mooncake":

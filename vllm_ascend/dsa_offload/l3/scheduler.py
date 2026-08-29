@@ -1,17 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DSA L3 scheduler 侧 write-behind job 与 L2 reuse fence。"""
+"""DSA L3 scheduler 侧 prefix lookup、load plan 与 write-behind。"""
 
 from __future__ import annotations
 
+import hashlib
 from collections import defaultdict
+from dataclasses import replace
 from typing import Any
 
 from vllm.logger import logger
 from vllm.v1.outputs import KVConnectorOutput
 
+from vllm_ascend.dsa_offload.l3.backend_adapter import (
+    DSAL3BackendAdapter,
+)
 from vllm_ascend.dsa_offload.l3.metadata import (
     DSAL3ConnectorMetadata,
+    DSAL3LoadBlock,
+    DSAL3LoadJob,
     DSAL3StoreBlock,
     DSAL3StoreJob,
     DSAL3WorkerMetadata,
@@ -20,21 +27,33 @@ from vllm_ascend.dsa_offload.l3.schema import DSAL3KeySchema
 
 
 class DSAL3StoreScheduler:
-    """scheduler 主线程持有的远端发布与 source-lifetime 状态。"""
+    """scheduler 主线程持有的远端查询、发布与 source-lifetime 状态。"""
 
     def __init__(
         self,
         schema: DSAL3KeySchema,
         max_inflight_jobs: int,
+        *,
+        lookup_backend: DSAL3BackendAdapter | None = None,
+        enable_load: bool = False,
     ) -> None:
         self.schema = schema
+        self._base_schema = schema
+        self._namespace_generation = 0
         self.max_inflight_jobs = int(max_inflight_jobs)
         if self.max_inflight_jobs <= 0:
             raise ValueError("DSA L3 max_inflight_jobs must be positive")
+        self.enable_load = bool(enable_load)
+        self.lookup_backend = lookup_backend
+        if self.enable_load and self.lookup_backend is None:
+            raise ValueError("DSA L3 load requires a scheduler lookup backend")
+        self.coordinator: Any | None = None
+        self._pending_load_jobs: list[DSAL3LoadJob] = []
         self._next_job_id = 0
         self._jobs: dict[int, DSAL3StoreJob] = {}
         self._pending_key_jobs: dict[str, int] = {}
         self._remote_ready_keys: set[str] = set()
+        self._remote_ready_key_limit: int | None = None
         self._l2_block_jobs: dict[int, set[int]] = defaultdict(set)
         self._request_scanned_counts: dict[str, int] = {}
         self._logged_first_scan = False
@@ -45,9 +64,160 @@ class DSAL3StoreScheduler:
         self._completed_jobs = 0
         self._failed_jobs = 0
         self._completed_bytes = 0
+        self._lookup_requests = 0
+        self._lookup_query_blocks = 0
+        self._lookup_hit_blocks = 0
+        self._planned_load_jobs = 0
+        self._planned_load_blocks = 0
 
     def build_connector_meta(self) -> DSAL3ConnectorMetadata:
-        return DSAL3ConnectorMetadata()
+        load_jobs = tuple(self._pending_load_jobs)
+        self._pending_load_jobs.clear()
+        return DSAL3ConnectorMetadata(load_jobs=load_jobs)
+
+    def bind_coordinator(self, coordinator: Any) -> None:
+        if self.coordinator is not None:
+            raise RuntimeError("DSA L3 scheduler coordinator was bound twice")
+        self.coordinator = coordinator
+        usable_blocks = int(
+            getattr(
+                getattr(coordinator, "dram_directory", None),
+                "usable_blocks",
+                0,
+            )
+        )
+        if usable_blocks > 0:
+            # One logical block owns one Indexer key and one MLA key. Bound
+            # the hint cache to the local L2 capacity so a long-running
+            # service cannot retain every key ever evicted by Mooncake.
+            self._remote_ready_key_limit = usable_blocks * 2
+
+    def _remember_remote_ready_keys(self, keys: tuple[str, ...]) -> None:
+        limit = self._remote_ready_key_limit
+        if limit is not None:
+            new_key_count = sum(
+                key not in self._remote_ready_keys for key in keys
+            )
+            if len(self._remote_ready_keys) + new_key_count > limit:
+                logger.info(
+                    "DSA L3 remote-ready hint cache reached its bound; "
+                    "dropping %d stale-capable keys before publishing %d",
+                    len(self._remote_ready_keys),
+                    len(keys),
+                )
+                self._remote_ready_keys.clear()
+        self._remote_ready_keys.update(keys)
+
+    def lookup_external_prefix(
+        self,
+        request: Any,
+        local_computed_tokens: int,
+    ) -> int:
+        """查询本地 L2 命中之后的成对 L3 component suffix。"""
+
+        if not self.enable_load or bool(
+            getattr(request, "skip_reading_prefix_cache", False)
+        ):
+            return 0
+        if self.coordinator is None or self.lookup_backend is None:
+            raise RuntimeError("DSA L3 lookup scheduler is not initialized")
+        block_size = int(self.schema.block_size)
+        local_computed_tokens = int(local_computed_tokens)
+        if local_computed_tokens % block_size:
+            raise RuntimeError("DSA L3 lookup local prefix is not block aligned")
+        local_blocks = local_computed_tokens // block_size
+        max_blocks = min(
+            (int(request.num_tokens) - 1) // block_size,
+            len(request.block_hashes),
+        )
+        if local_blocks >= max_blocks:
+            return 0
+        candidate_hashes = tuple(
+            bytes(block_hash)
+            for block_hash in request.block_hashes[
+                local_blocks:max_blocks
+            ]
+        )
+        self._lookup_requests += 1
+        self._lookup_query_blocks += len(candidate_hashes)
+        hit_blocks = self.lookup_backend.lookup_prefix_blocks(
+            candidate_hashes
+        )
+        self._lookup_hit_blocks += hit_blocks
+        external_tokens = self.coordinator.prepare_external_prefix_cache_hit(
+            request,
+            local_computed_tokens=local_computed_tokens,
+            external_block_count=hit_blocks,
+        )
+        logger.info(
+            "DSA L3 prefix lookup: request=%s local_blocks=%d "
+            "queried_blocks=%d hit_blocks=%d external_tokens=%d",
+            request.request_id,
+            local_blocks,
+            len(candidate_hashes),
+            hit_blocks,
+            external_tokens,
+        )
+        return external_tokens
+
+    def stage_external_load(
+        self,
+        request_id: str,
+        num_external_tokens: int,
+    ) -> None:
+        if not num_external_tokens:
+            return
+        if not self.enable_load or self.coordinator is None:
+            raise RuntimeError("DSA L3 external load is not enabled")
+        plan = self.coordinator.take_external_prefix_load_plan(request_id)
+        if plan is None:
+            raise RuntimeError(
+                "DSA L3 allocation did not publish its external load plan: "
+                f"request_id={request_id!r}"
+            )
+        if (
+            len(plan.block_hashes) * self.schema.block_size
+            != int(num_external_tokens)
+        ):
+            raise RuntimeError(
+                "DSA L3 external load token count changed after allocation"
+            )
+        blocks: list[DSAL3LoadBlock] = []
+        for offset, (block_hash, destination) in enumerate(
+            zip(
+                plan.block_hashes,
+                plan.destination_dram_block_ids,
+                strict=True,
+            )
+        ):
+            indexer_key, mla_key = self.schema.block_keys(block_hash)
+            blocks.append(
+                DSAL3LoadBlock(
+                    logical_block_index=(
+                        plan.logical_block_start + offset
+                    ),
+                    destination_l2_block_id=destination,
+                    block_hash=block_hash,
+                    indexer_key=indexer_key,
+                    mla_key=mla_key,
+                )
+            )
+        self._pending_load_jobs.append(
+            DSAL3LoadJob(
+                request_id=request_id,
+                blocks=tuple(blocks),
+            )
+        )
+        self._planned_load_jobs += 1
+        self._planned_load_blocks += len(blocks)
+        logger.info(
+            "DSA L3 load planned: request=%s logical_start=%d "
+            "blocks=%d bytes_per_block=%d",
+            request_id,
+            plan.logical_block_start,
+            len(blocks),
+            self.schema.bytes_per_logical_block,
+        )
 
     def _new_job_id(self) -> int:
         job_id = self._next_job_id
@@ -181,6 +351,7 @@ class DSAL3StoreScheduler:
             if job is None:
                 logger.debug("Ignoring stale DSA L3 result for job %d", job_id)
                 continue
+            ready_keys: list[str] = []
             for block in job.blocks:
                 self._pending_key_jobs.pop(block.indexer_key, None)
                 self._pending_key_jobs.pop(block.mla_key, None)
@@ -193,7 +364,9 @@ class DSAL3StoreScheduler:
                             None,
                         )
                 if result.success:
-                    self._remote_ready_keys.update((block.indexer_key, block.mla_key))
+                    ready_keys.extend((block.indexer_key, block.mla_key))
+            if ready_keys:
+                self._remember_remote_ready_keys(tuple(ready_keys))
             self._completed_jobs += 1
             self._completed_bytes += int(result.transferred_bytes)
             if not result.success:
@@ -214,6 +387,43 @@ class DSAL3StoreScheduler:
     def request_finished(self, request_id: str) -> None:
         self._request_scanned_counts.pop(request_id, None)
 
+    def reset_cache(self) -> bool:
+        """Logically invalidate remote objects by rotating the key namespace."""
+
+        if self._jobs or self._pending_load_jobs:
+            logger.warning(
+                "DSA L3 namespace reset rejected with pending transfers: "
+                "store_jobs=%d load_jobs=%d",
+                len(self._jobs),
+                len(self._pending_load_jobs),
+            )
+            return False
+        if self._pending_key_jobs or self._l2_block_jobs:
+            raise RuntimeError(
+                "DSA L3 reset found orphaned pending store indexes"
+            )
+        self._namespace_generation += 1
+        fingerprint = hashlib.sha256(
+            (
+                f"{self._base_schema.fingerprint}:"
+                f"{self._namespace_generation}"
+            ).encode()
+        ).hexdigest()[:32]
+        self.schema = replace(
+            self._base_schema,
+            fingerprint=fingerprint,
+        )
+        if self.lookup_backend is not None:
+            self.lookup_backend.schema = self.schema
+        self._remote_ready_keys.clear()
+        self._request_scanned_counts.clear()
+        logger.info(
+            "DSA L3 namespace reset: generation=%d fingerprint=%s",
+            self._namespace_generation,
+            fingerprint,
+        )
+        return True
+
     def has_pending_jobs(self) -> bool:
         """让 EngineCore 在异步 store 完成前继续推进 connector。"""
 
@@ -223,7 +433,10 @@ class DSAL3StoreScheduler:
         logger.info(
             "DSA L3 scheduler summary: planner_calls=%d planned_jobs=%d "
             "planned_blocks=%d completed_jobs=%d failed_jobs=%d "
-            "completed_bytes=%d inflight_jobs=%d remote_ready_keys=%d",
+            "completed_bytes=%d inflight_jobs=%d remote_ready_keys=%d "
+            "lookup_requests=%d lookup_query_blocks=%d "
+            "lookup_hit_blocks=%d planned_load_jobs=%d "
+            "planned_load_blocks=%d",
             self._planner_calls,
             self._planned_jobs,
             self._planned_blocks,
@@ -232,12 +445,24 @@ class DSAL3StoreScheduler:
             self._completed_bytes,
             len(self._jobs),
             len(self._remote_ready_keys),
+            self._lookup_requests,
+            self._lookup_query_blocks,
+            self._lookup_hit_blocks,
+            self._planned_load_jobs,
+            self._planned_load_blocks,
         )
-        if self._jobs:
-            raise RuntimeError(
-                f"DSA L3 scheduler shutdown with unacknowledged store jobs: job_ids={tuple(sorted(self._jobs))}"
-            )
+        pending_job_ids = tuple(sorted(self._jobs))
         self._jobs.clear()
         self._pending_key_jobs.clear()
         self._l2_block_jobs.clear()
         self._request_scanned_counts.clear()
+        self._pending_load_jobs.clear()
+        try:
+            if self.lookup_backend is not None:
+                self.lookup_backend.close()
+        finally:
+            if pending_job_ids:
+                raise RuntimeError(
+                    "DSA L3 scheduler shutdown with unacknowledged store "
+                    f"jobs: job_ids={pending_job_ids}"
+                )

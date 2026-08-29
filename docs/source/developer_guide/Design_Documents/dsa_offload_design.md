@@ -1,6 +1,6 @@
 # DSA 稀疏卸载当前设计
 
-> - 最后更新：2026-08-25
+> - 最后更新：2026-08-31
 > - 目标基线：vLLM v0.23.0 + vLLM-Ascend v0.23.0 正式版
 >   `5cb98caa`（CANN 9.1.0、TorchNPU 2.10.0.post4、
 >   Triton Ascend 3.2.2）
@@ -8,8 +8,9 @@
 >   chunked prefill 已完成分段 prefill/首 token 初验，完整 sparse decode
 >   验收待补；A5 packed C8 已完成 GLM-5.1 eager/graph 端到端初验；
 >   GLM-5.2 MTP 已完成 UT、离线 eager/FULL graph 与在线 FULL graph 冒烟
-> - 本地 DRAM complete-bundle prefix cache 第一版已完成代码与 CPU UT，
->   NPU restore 算子和端到端命中仍待服务器验收
+> - 本地 DRAM complete-bundle prefix cache 已完成第一版上板；Mooncake
+>   P1-W rank0 异步 write-behind 与 P1-R 同步 all-rank prefix loadback
+>   已完成代码、UT 和 TP8 收缩验收，在线长稳与统一 P2 回归仍待补齐
 > - 首要验收模型：GLM-5.1、GLM-5.2；兼容回归模型：DeepSeek-V3.2
 
 ## 1. 文档定位
@@ -62,7 +63,11 @@ DSA 稀疏卸载最终目标是在长上下文 decode 中实现：
   完成服务器阶段冒烟。
 - scheduler-owned DRAM complete bundle 的 hash-ready、LRU/refcount、
   请求结束保留、最长连续命中、target 分平面 restore，以及可选 MTP
-  full-HBM EAGLE 公共命中第一版；该能力尚未完成服务器端到端验收。
+  full-HBM EAGLE 公共命中第一版；
+- `DSAL3Connector` 的 Mooncake Store-owned TCP：TP0 异步上传完整 L2
+  Indexer/MLA component、physical-id reuse fence、完成回报与 shutdown drain；
+- L2 命中后的 L3 连续 suffix lookup、联合 HBM/L2 admission、all-rank
+  `L3 -> L2` 同步恢复、TP success consensus 和既有 `L2 -> HBM` restore。
 
 正式版基线同时提供并由 DSA 原样继承：
 
@@ -75,10 +80,14 @@ DSA 稀疏卸载最终目标是在长上下文 decode 中实现：
 
 当前尚未完成：
 
-- HBM Indexer/dense-MLA 热副本参与 prefix lookup、L3 prefix cache、
-  prefill/decode mixed、preemption/resume、非 MTP speculative
-  method、MTP draft 数不等于 3/非 greedy MTP、async scheduling、KV transfer、KV-cache
-  metrics/events、GLM-5.2 A5 正式 QA/性能验收和 A5 BF16 算子链。
+- HBM Indexer/dense-MLA 热副本参与 prefix lookup，以及 component-wise
+  `HBM > L2 > L3` source plan 和 HBM-only hit 的 L2 backfill/去重；
+- L3 在线 continuous batching/FD/连接长稳、统一 load/store drain、
+  layerwise async load、HBM 直通、MTP/DP/非 Mooncake backend；
+- prefill/decode mixed、preemption/resume、P/D 分离、非 MTP speculative
+  method、MTP draft 数不等于 3/非 greedy MTP、MTP proposer graph、
+  async scheduling、KV-cache metrics/events；
+- GLM-5.2 A5 正式 QA/性能验收、A5 BF16 算子链和 DeepSeek-V3.2 回归。
 
 当前已在 Linux + Ascend 环境完成 DSA UT，并取得 GLM-5.1 W4A8/W4A4C8、
 TP16/EP 的 disabled、cache-init、eager 与 FULL decode graph 初验证据。
@@ -89,6 +98,31 @@ capture/replay 主路径可运行，但仍不替代完整 QA 数据集、长时�
 `max_num_batched_tokens=4096/8192/16384` 下完成四条长短混合请求的
 baseline/DSA 首 token 对照；由于该组测试只生成一个 token，它尚不能证明
 后续 sparse decode 的完整正确性。
+
+### 2.1 妥协版 MTP 后续 RoadMap 位置
+
+当前实现严格位于原 RoadMap 第 3 项中后段：scheduler-owned DRAM 和完整
+Indexer+MLA 本地 prefix 已完成，L2/L3 第一版读写闭环已经打通，但 HBM 热层
+协同和 P2 长稳尚未关闭，不能直接把项目状态描述成已经进入 P/D 分离。
+
+| RoadMap 工作项 | 当前状态 |
+|---|---|
+| scheduler 统一管理 DRAM physical block | 已完成 |
+| 完整 Indexer+MLA bundle、block hash 与 LocalDRAM prefix | 第一版已完成并上板 |
+| L2→L3 异步 write-behind | P1-W 已完成并初验 |
+| L3→L2→HBM prefix loadback | P1-R 同步版已完成并初验 |
+| HBM target prefix 与 L2/L3 component-wise source | 未实现，下一项默认优先级 |
+| MTP 多级 prefix | 未实现；L3 当前显式拒绝 MTP |
+| preemption/resume | 未实现，scheduler 显式失败 |
+| P/D 分离 | 未开始 |
+| 理想版动态 MTP | 未开始；当前固定 MTP3 可用 |
+| MTP proposer graph | 未实现；target uniform Q=4 FULL graph 已完成 |
+
+默认推进顺序为：先关闭 L3 P1-R 长稳尾项，再实现 HBM target prefix、
+component source mask 与 L2 backfill/去重；随后依次处理 MTP 多级 prefix、
+preemption/resume 和 P/D 分离。L3 layerwise/direct 与理想版 MTP 属于性能或
+高风险扩展，不应先于上述正确性合同。详细阶段门禁见
+{doc}`dsa_offload_roadmap`。
 
 ## 3. 当前总体架构
 
@@ -949,16 +983,17 @@ component 之间取公共前缀。当前接口已把 Indexer/MLA restore 分列�
 报告中的 prefix-enabled 状态和 vLLM 原生聚合 hit rate 同时保留。进入性能
 验收后应将逐请求日志降为 DEBUG、采样或移除，避免在线高 QPS 日志放大。
 
-### 12.5 Rank-local L2 与 AscendStore L3 对接计划
+### 12.5 Rank-local L2 与 AscendStore L3 对接状态
 
 完整接口、异步 job/reuse-fence、component schema、支持矩阵和测试门禁见
 {doc}`dsa_l2_l3_cache_design`。本节只保留总览。
 
 RoadMap 中的 scheduler-owned DRAM pool 和完整 Indexer+MLA 本地 prefix bundle
 已经落地；Mooncake Store-owned TCP 已通过 swapped L2 单卡、跨 NUMA、TP8
-120-plane 逐字节门禁。下一阶段不再重新设计 L2，而是在现有两级命中上增加
-AscendStore L3。AscendDirect HBM 基线仍保留回归，但不作为 DSA Host H2H
-P1-W 数据面。
+120-plane 逐字节门禁。P1-W rank0 异步 write-behind 与 P1-R 同步 prefix
+loadback 均已接入当前代码；下一阶段不再重新设计 L2，而是关闭在线长稳，
+再加入 HBM target hot tier。AscendDirect HBM 基线仍保留回归，但不作为
+DSA Host H2H P1-W 数据面。
 
 第一版采用以下读路径：
 
@@ -1024,20 +1059,20 @@ L2 -> L3 使用异步 write-behind，而不是当前 AscendStore 非 layerwise �
 Mooncake 源地址，则使用初始化期预分配的固定 staging ring；不能在 forward 热
 路径临时创建 tensor，也不能在未获得完成回报前复用 staging slot。
 
-实施顺序：
+当前阶段：
 
-1. **P0 介质与 schema 门禁**：用 21 个 full Indexer（key/scale）plane 和
-   78 个 packed MLA plane 构造一个真实 6,904,320-byte DSA block，分别验证
-   split HBM 与 swapped L2 的 TP8 put/get、逐字节结果和 buffer registration；
-2. **P1 只读接入**：关闭 MTP、preemption、async scheduling、PP/CP，先打通
-   `L2 local hit + Mooncake additional hit -> HBM -> forward -> L2`，保留
-   `load_async=False` 和 `kv_load_failure_policy=fail`；
-3. **P2 rank0 异步写回**：按 ready watermark 增量上传 L2 的 Indexer/MLA
-   component，补 reuse fence、完成聚合、去重、失败处理和 shutdown drain；
-4. **P3 层级优化**：加入 component-wise `HBM > L2 > L3` source plan、连接
-   预热、批量/并发 IO 和性能门禁，再复用同一 schema 接入 MemCache；
-5. MTP L3、preemption/resume、P/D、跨节点 TP 和 L3 eviction event 均在上述
-   正确性闭环后单独开放，初版配置必须显式拒绝。
+1. **P0 介质与 schema 门禁：完成**。21 个 full Indexer（key/scale）plane、
+   78 个 packed MLA plane 和真实 6,904,320-byte bundle 已完成 TP8 门禁；
+2. **P1-W rank0 异步写回：完成首版**。按 ready watermark 增量上传，具备
+   reuse fence、完成聚合、去重、失败处理和 shutdown drain；
+3. **P1-R 同步只读：完成首版**。`L2 local hit + Mooncake suffix -> all-rank
+   L2 -> HBM -> forward` 已接入，保持 `kv_load_failure_policy=fail`；
+4. **P2 稳态关闭：进行中**。补在线 continuous batching、FD/连接长稳、
+   request/physical-id reuse 和 load/store completion 联合 drain；
+5. **P3-HOT 层级优化：未开始**。加入 component-wise `HBM > L2 > L3`
+   source plan、dense MLA block role、L2 backfill/去重和独立 restore mask；
+6. MTP L3、preemption/resume、P/D、跨节点 TP 和 L3 eviction event 均在上述
+   正确性闭环后单独开放，当前配置继续显式拒绝。
 
 ## 13. 统一 metadata 与图模式
 
@@ -1252,9 +1287,11 @@ condense/reorder 时必须保留该请求的 resident/DRAM 所有权。
 - no-MTP 已覆盖 bsz=4 的约 8K/5K/70K/40K eager/FULL graph，以及
   active=2（约 5K/40K）、capture sizes 仅 1/4 的向上 padding和 eager；
 - MTP3 已覆盖约 8K/5K/70K/40K 的 bsz=4 FULL graph，以及单请求约 40K
-  的在线推理。上述结果作为 scheduler DRAM pool 第一版常见场景门禁。
+  的在线推理；优化版 LIM 的 32/64 heads、shared durable-prefix、miss union、
+  双尾与严格单调 TopK 共 24 项 A5 算子用例通过。上述结果作为 scheduler
+  DRAM pool 与妥协版 MTP 第一版常见场景门禁。
 
-本地 DRAM prefix cache 第一版的当前证据：
+本地 DRAM 与 L3 prefix cache 第一版的当前证据：
 
 - Windows 隔离环境中，新增 hash-ready/LRU/shared-ref、MTP 公共命中、
   prefix allocation、restore metadata 和既有 DSA 回归共 171 项通过；
@@ -1263,16 +1300,15 @@ condense/reorder 时必须保留该请求的 resident/DRAM 所有权。
   round-trip 实测为 `2 passed, 3 skipped`，A5 跳过项均为不适用的 BF16
   paired-plane 算子；
 - Python `compileall`、Ruff、`git diff --check` 与在线脚本 `bash -n` 通过；
-- 已新增 swapped DRAM→HBM byte-block round-trip NPU 用例；尚未执行服务器
-  自定义算子和真实模型第二轮同前缀验收，因此不能宣称上板完成。
+- Mooncake P1-W 已覆盖 TP8 eager/graph、chunked prefill、混合长度和在线
+  graph，rank0-only put、remote-ready key、reuse fence 与 shutdown drain
+  均有成功日志；
+- P1-R 已覆盖 all-rank `L3 -> L2` get、TP consensus、既有 restore 和
+  Local-L2/L3 replay 对照；bsz=1/eager 保持严格 token 门禁，多请求 graph
+  的数值变化已通过 Local-L2/Local-L2 与启停 L3 对照归因。
 
-这些结果证明当前核心控制面、eager 和 graph 主路径可运行。尚需补齐：
-
-- 本轮 scheduler-owned complete DRAM pool 的新增 UT、A3/A5 byte-plane
-  dump 编译与上板用例；
-- 启动日志中 `DSA DRAM CAPACITY REPORT` 的目标容量、自动缩容、1x 最低
-  Indexer mirror 和各 TP worker arena 创建一致性；
-- 完整 Indexer+MLA dump 后的 eager/FULL graph 精度与 128-token 边界性能；
+这些结果证明当前核心控制面、eager、graph、L2 与 L3 P1 主路径可运行。
+尚需补齐：
 
 - QA 数据集 disabled/eager/graph 精度对照；
 - bsz=1 与 bsz>1、全 DENSE、全 SPARSE、ENTER mixed；
@@ -1282,8 +1318,9 @@ condense/reorder 时必须保留该请求的 resident/DRAM 所有权。
   bsz=1/bsz>1、ENTER/steady sparse decode 与并发调度回归；
 - DeepSeek-V3.2 强制回归；
 - profiling 性能基线；
-- 本地 DRAM prefix 的 NPU bitwise restore、no-MTP/MTP3 第二轮相同前缀、
-  chunked prefill、eager/FULL graph 和在线连续请求回归；
+- LocalDRAM/L3 prefix 的在线 continuous batching、长稳 FD/连接、request
+  finish、row/physical-id reuse 与 load/store completion 联合 drain；
+- HBM target prefix、MTP 多级 prefix、L3 layerwise/direct 与故障恢复；
 - GLM-5.2 W4A4C8 的完整 QA、长稳并发、请求结束/行复用压力与性能回归。
 
 完整测试命令和验收要求维护在 `examples/dsa_demo/README.md`。

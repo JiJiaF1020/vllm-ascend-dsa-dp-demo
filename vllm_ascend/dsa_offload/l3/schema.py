@@ -26,12 +26,55 @@ class DSAL3Component(StrEnum):
 def _model_identity(vllm_config: Any) -> dict[str, Any]:
     model_config = vllm_config.model_config
     hf_config = model_config.hf_config
+    compute_hash = getattr(model_config, "compute_hash", None)
+    model_config_hash = (
+        str(compute_hash()) if callable(compute_hash) else ""
+    )
+    parallel_config = getattr(vllm_config, "parallel_config", None)
     return {
         "model": str(getattr(model_config, "model", "")),
         "revision": str(getattr(model_config, "revision", "") or ""),
         "architectures": tuple(getattr(hf_config, "architectures", ()) or ()),
         "model_type": str(getattr(hf_config, "model_type", "")),
         "quantization": str(getattr(model_config, "quantization", "") or ""),
+        "model_config_hash": model_config_hash,
+        "tensor_parallel_size": int(
+            getattr(parallel_config, "tensor_parallel_size", 1)
+        ),
+    }
+
+
+def _cache_spec_identity(spec: Any) -> dict[str, Any]:
+    """Return stable cache semantics not implied by page size alone."""
+
+    sparse_head_dim = getattr(spec, "sparse_head_dim", None)
+    return {
+        "type": type(spec).__qualname__,
+        "dtype": str(getattr(spec, "dtype", "")),
+        "num_kv_heads": int(getattr(spec, "num_kv_heads", 0)),
+        "head_size": int(getattr(spec, "head_size", 0)),
+        "sparse_head_dim": (
+            tuple(int(value) for value in sparse_head_dim)
+            if sparse_head_dim is not None
+            else None
+        ),
+        "scale_dim": int(getattr(spec, "scale_dim", 0)),
+        "scale_dtype": str(getattr(spec, "scale_dtype", "")),
+        "cache_sparse_sfa_c8": bool(
+            getattr(spec, "cache_sparse_sfa_c8", False)
+        ),
+        "cache_sparse_li_c8": bool(
+            getattr(spec, "cache_sparse_li_c8", False)
+        ),
+        "c8_k_cache_dtype": str(
+            getattr(spec, "c8_k_cache_dtype", "")
+        ),
+        "c8_k_scale_cache_dtype": str(
+            getattr(spec, "c8_k_scale_cache_dtype", "")
+        ),
+        "sfa_dcp_replicated_indexer_size": int(
+            getattr(spec, "sfa_dcp_replicated_indexer_size", 1)
+        ),
     }
 
 
@@ -90,11 +133,13 @@ class DSAL3KeySchema:
                     "layers": indexer_layers,
                     "page_size_bytes": int(indexer_spec.page_size_bytes),
                     "plane_count": indexer_plane_count,
+                    "spec": _cache_spec_identity(indexer_spec),
                 },
                 DSAL3Component.MLA: {
                     "layers": resident_layers,
                     "page_size_bytes": int(resident_spec.page_size_bytes),
                     "plane_count": mla_plane_count,
+                    "spec": _cache_spec_identity(resident_spec),
                 },
             },
         }

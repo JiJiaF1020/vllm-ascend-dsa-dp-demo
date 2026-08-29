@@ -364,7 +364,14 @@ class MooncakeBackend(Backend):
                 self.store = None
             self._store_initialized = False
 
-    def get(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
+    def get_with_sizes(
+        self,
+        keys: list[str],
+        addrs: list[list[int]],
+        sizes: list[list[int]],
+    ):
+        """Return Mooncake's per-key byte counts without normalization."""
+
         if self._lazy_init and not self._store_initialized:
             logger.error(
                 "Failed to get %d keys out of %d. Store is not initialized; "
@@ -394,9 +401,6 @@ class MooncakeBackend(Backend):
                     error_codes,
                 )
                 logger.debug("Failed to get key details. keys=%s, result=%s", keys, res_list)
-            for i, value in enumerate(res_list):
-                if value > 0:
-                    res_list[i] = 0
             return res_list
         except Exception as e:
             logger.error(
@@ -408,6 +412,12 @@ class MooncakeBackend(Backend):
             )
             logger.debug("Failed to get key details. keys=%s", keys)
             return None
+
+    def get(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
+        res_list = self.get_with_sizes(keys, addrs, sizes)
+        if res_list is None:
+            return None
+        return [0 if int(value) > 0 else int(value) for value in res_list]
 
 
 @dataclass

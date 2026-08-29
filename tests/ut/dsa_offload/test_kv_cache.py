@@ -342,6 +342,56 @@ def test_engine_core_finalizes_one_shared_dram_capacity_plan(
     assert all(config.dram_capacity is plan for config in configs)
 
 
+def test_engine_core_reserves_l3_host_pools_before_dram_planning(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(dsa_kv_cache, "_get_dsa_ratio", lambda: 3)
+    monkeypatch.setattr(
+        "vllm_ascend.ascend_config.get_ascend_config",
+        lambda: SimpleNamespace(
+            dsa_offload_config=SimpleNamespace(
+                hot_cpu_block_multiple=1.5,
+            )
+        ),
+    )
+    groups = build_dsa_kv_cache_groups(_make_specs())
+    hbm_bytes = dsa_pool_bytes_per_base_block(groups) * 128
+    vllm_config = _make_vllm_config()
+    vllm_config.kv_transfer_config = SimpleNamespace(
+        kv_connector="DSAL3Connector"
+    )
+    configs = [
+        build_dsa_kv_cache_config(
+            vllm_config,
+            groups,
+            available_memory=hbm_bytes,
+        )
+        for _ in range(2)
+    ]
+    bundle_bytes = dsa_dram_bytes_per_logical_block(groups)
+    indexer_blocks = get_dsa_group_num_blocks(configs[0], groups[0])
+    desired = int(indexer_blocks * 1.5)
+    l3_reservation = 4_096
+    monkeypatch.setattr(
+        dsa_kv_cache,
+        "_dsa_l3_host_reservation_bytes",
+        lambda _config, _tp_size: l3_reservation,
+    )
+    host_available = (
+        (desired + 1) * bundle_bytes * 2 + l3_reservation
+    )
+
+    plan = finalize_dsa_dram_capacity(
+        vllm_config,
+        configs,
+        host_available_bytes=host_available,
+    )
+
+    assert plan is not None
+    assert plan.host_available_bytes == host_available - l3_reservation
+    assert plan.usable_blocks == desired
+
+
 def test_mtp_full_group_uses_dense_three_x_capacity(
     monkeypatch,
 ) -> None:

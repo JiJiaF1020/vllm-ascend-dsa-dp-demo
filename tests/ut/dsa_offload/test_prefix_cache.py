@@ -69,6 +69,70 @@ def test_target_prefix_hit_uses_complete_dram_bundle_only() -> None:
     assert len(plan.dram_blocks) == 4
 
 
+def test_external_prefix_extends_local_dram_candidate_by_hash_suffix() -> None:
+    directory = DSASchedulerDRAMBlockDirectory(
+        usable_blocks=8,
+        max_logical_blocks=8,
+        block_size=128,
+        enable_caching=True,
+    )
+    hashes = _prime_dram_prefix(directory, 2)
+    hashes.extend(
+        [BlockHash(b"external-2"), BlockHash(b"external-3")]
+    )
+    coordinator = object.__new__(DSAKVCacheCoordinator)
+    coordinator.dram_directory = directory
+    coordinator.dram_block_size = 128
+    coordinator.scheduler_block_size = 128
+    coordinator.hash_block_size = 128
+    coordinator.num_single_type_manager = 2
+    coordinator.group_ids = SimpleNamespace(
+        indexer=0,
+        resident_mla=1,
+        mtp_full=None,
+    )
+    coordinator.mtp_full_manager = None
+    coordinator._pending_prefix_hits = {}
+    request = SimpleNamespace(request_id="target", block_hashes=hashes)
+
+    coordinator.prepare_prefix_cache_hit(request, 4 * 128)
+    external_tokens = coordinator.prepare_external_prefix_cache_hit(
+        request,
+        local_computed_tokens=2 * 128,
+        external_block_count=2,
+    )
+
+    assert external_tokens == 2 * 128
+    plan = coordinator.get_pending_prefix_hit("target")
+    assert plan is not None
+    assert plan.local_computed_tokens == 2 * 128
+    assert plan.external_computed_tokens == 2 * 128
+    assert plan.external_block_hashes == (
+        bytes(hashes[2]),
+        bytes(hashes[3]),
+    )
+
+
+def test_dram_prefix_admission_counts_evictable_hits_and_new_suffix() -> None:
+    directory = DSASchedulerDRAMBlockDirectory(
+        usable_blocks=8,
+        max_logical_blocks=8,
+        block_size=128,
+        enable_caching=True,
+    )
+    hashes = _prime_dram_prefix(directory, 4)
+    hits = directory.find_longest_cache_hit(hashes, 4 * 128)
+
+    assert directory.can_attach_cached_prefix(
+        hits,
+        new_block_count=4,
+    )
+    assert not directory.can_attach_cached_prefix(
+        hits,
+        new_block_count=5,
+    )
+
+
 def test_mtp_effective_hit_limits_target_dram_prefix() -> None:
     directory = DSASchedulerDRAMBlockDirectory(
         usable_blocks=8,

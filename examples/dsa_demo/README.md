@@ -10,6 +10,7 @@
 | `eval_dataset_acc_score.py` | 对 QA 脚本生成的 JSONL 计算 LongBench 指标 |
 | `serve_dsa.sh` | 以 OpenAI 兼容在线服务拉起 DSA eager/graph |
 | `stream_chat_client.py` | 交互式多轮流式客户端 |
+| `online_l2_l3_closeout_test.py` | 5k/8k/40k/70k 在线 L2/L3 生命周期收口 |
 | `online_long_context_dataset_test.py` | 在线长上下文数据集分桶回归 |
 | `L3_cache_sys_api_test/` | Mooncake/MemCache 独立 API、baseline L3 与后续 DSA 分层缓存测试 |
 
@@ -17,6 +18,8 @@
 [DSA 稀疏卸载详细设计](../../docs/source/developer_guide/Design_Documents/dsa_offload_design.md)。
 L3 接入、异步 write-behind 和 HBM 热层后续方案见
 [DSA L1/L2/L3 分层缓存详细设计](../../docs/source/developer_guide/Design_Documents/dsa_l2_l3_cache_design.md)。
+阶段优先级与退出门禁见
+[DSA 稀疏卸载后续开发 RoadMap](../../docs/source/developer_guide/Design_Documents/dsa_offload_roadmap.md)。
 
 ## 1. 前置条件
 
@@ -66,12 +69,13 @@ MAX_NUM_SEQS = 2
 MAX_MODEL_LEN = 8192
 MAX_NUM_BATCHED_TOKENS = 8192
 ENABLE_CHUNKED_PREFILL = False
-ENABLE_PREFIX_CACHING = False  # 第二次相同前缀请求验证本地 DRAM 命中
+ENABLE_PREFIX_CACHING = False  # DSA 下启用 LocalDRAM prefix；target HBM 尚不匹配
 PREFIX_CACHE_REPLAY_ROUNDS = 1  # prefix 验收时与上项一起改为 2
 LOGGING_LEVEL = "INFO"
 ENABLE_A5_PACKED_C8_DSA = False  # A5 W4A4C8 设 True；A3 W4A8 保持 False
 ENABLE_MTP = False  # A5 C8 上设 True 后固定启用 3 个 draft token
 ENABLE_L3_WRITE_BEHIND = False  # 首版 Mooncake rank0 L2->L3 异步写
+ENABLE_L3_PREFIX_LOADBACK = False  # P1-R: L3 suffix -> all-rank L2 -> HBM
 RESULT_JSON = None  # 需要保存对照 token IDs 时填写路径
 ```
 
@@ -269,7 +273,7 @@ DSA resident/DRAM 数据面；默认 ratio=3 时启动容量报告应显示 targ
 若修改了 `SERVED_MODEL_NAME`，同步把 `stream_chat_client.py` 顶部的
 `MODEL_NAME` 改成相同值。
 
-首版 DSA L3 仅验证 write-behind。先启动 Mooncake Master，再设置：
+DSA L3 P1-W/P1-R 都需要先启动 Mooncake Master。仅验证 write-behind 时设置：
 
 ```bash
 ENABLE_MTP="false"
@@ -283,8 +287,8 @@ DSA_L3_SHUTDOWN_TIMEOUT_SECONDS="300"
 该模式使用 `DSAL3Connector` 和 Mooncake Store-owned TCP。所有 TP rank 都按
 vLLM-Ascend embedded-client 范式贡献一段 `MOONCAKE_GLOBAL_SEGMENT_SIZE`，
 但只有 TP rank0 上传一份完整 Indexer+MLA L2 bundle；request finish 不等待，
-L2 physical block 被复用前才触发相关 job fence。当前尚不从 L3 lookup/load，
-因此启用后 TTFT 不应出现 external hit。验收时应看到每个 TP rank 的
+L2 physical block 被复用前才触发相关 job fence。P1-W 使用
+`kv_role=kv_producer`，因此 TTFT 不应出现 external hit。验收时应看到每个 TP rank 的
 `contributes_segment=True`，以及唯一 producer 的 `store planned/submitted/`
 `completed success=True` 和 Mooncake 对象增长。请求响应不等待异步 put；当
 离线脚本随后销毁 EngineCore 时，框架会继续执行 zero-token connector progress
@@ -302,6 +306,129 @@ Indexer+MLA 块，避免把 64 块合成 7,680 个 descriptor 后触发 10 秒�
 `tcp_segment_port_base + rank` 的保留区间仅用于生成 worker segment identity；
 scheduler-only client 使用额外固定 offset，真实 RPC/TCP 监听端口仍由 Mooncake
 分配。社区 `mooncake.json` 保持 `protocol=ascend`，不受 DSA TCP 改造影响。
+
+P1-R 同步 prefix loadback 在上述配置上再打开：
+
+```python
+ENABLE_PREFIX_CACHING = True
+ENABLE_L3_PREFIX_LOADBACK = True
+PREFIX_CACHE_REPLAY_ROUNDS = 3
+```
+
+Store-owned TCP 还必须在首次导入 Mooncake 前启用连接复用：
+
+```bash
+export MC_TCP_ENABLE_CONNECTION_POOL=1
+```
+
+`simple_prompt_test.py` 已自动设置该变量。GLM-5.2 A5 的一个完整 DSA
+block 包含 120 个 descriptor；连接池关闭时，TP8 大前缀同步回读会迅速累积
+短连接和 `TIME_WAIT`，最终表现为 `connect: Cannot assign requested address`
+与 Mooncake `-800 TRANSFER_FAIL`。
+
+Mooncake TCP 用 `host:tcp_segment_port_base+rank` 作为 segment identity，而
+不是实际监听端口。同一 Master 上并行运行或新旧实例交叠退出时，各实例必须设置
+不同的 `MOONCAKE_TCP_SEGMENT_PORT_BASE`，例如 `45000` 与 `30000`；否则一个
+实例挂载/卸载同名 segment 会污染另一个实例的 Master 元数据。离线和在线 demo
+均显式暴露该设置。
+
+此时 Connector 改用 `kv_role=kv_both`。离线 demo 依次执行冷算、本地 L2 replay，
+然后等待后台 put 一个受控窗口并调用
+`reset_prefix_cache(reset_connector=False)`：只清理本地 HBM/L2 hash，保留
+Mooncake 对象；最后执行 L3 replay。严格精度断言比较本地 L2 replay 与 L3
+replay，避免把 full-prefill 与 prefix-suffix 的数值路径差异误判为 L3 数据损坏。
+最后一轮同 prompt 应打印：
+
+```text
+DSA L3 prefix lookup: ... hit_blocks>0 external_tokens>0
+DSA L3 load planned: ... blocks>0
+DSA L3 load backend get finished: ...
+DSA L3 load completed: tp_rank=0..TP-1 ...
+DSA prefix restore submitted: ...
+[dsa-smoke] local-L2/L3 replay consistency passed
+```
+
+P1-R 首版同步执行 `L3 -> 每 rank LocalDRAM -> split HBM`。所有 rank 完成本地
+get 后用预分配状态 tensor 做 TP all-reduce；任一 rank 或任一 Indexer/MLA
+component 失败都会在 forward 前让全体 fail-fast。MTP、DP、异步 load 与
+recompute 仍不支持。Mooncake lookup/load 成功后，第二轮只计算未命中的尾部，
+不把已恢复 prefix 再次当作新增块上传。
+
+L3 key 不包含 TP rank，故 Mooncake 中只有一份池化对象；all-rank load 是同一
+对象向各 rank 本地 L2 的读出扇出，并不会在 L3 再保存 TP 份副本。
+
+### P1-R 精度收缩矩阵
+
+多请求 graph 下若 Local-L2/L3 token 不完全一致，先不要降低通过标准。
+`simple_prompt_test.py` 会请求 top-5 logprobs，并在第一个分歧位置打印双方
+候选。先用 Case A/B 隔离 L3，再用 Case C 继续归因 graph 数值变化：
+
+```python
+# Case A：5k 单请求仍走 dense decode，但覆盖完整 L3 prefix loadback。
+PROMPTS = chinese_5k
+RUN_MODE = "graph"
+MAX_NUM_SEQS = 1
+MAX_TOKENS = 5
+ENABLE_CHUNKED_PREFILL = True
+ENABLE_PREFIX_CACHING = True
+PREFIX_CACHE_REPLAY_ROUNDS = 3
+ENABLE_L3_WRITE_BEHIND = True
+ENABLE_L3_PREFIX_LOADBACK = True
+```
+
+```python
+# Case B：不清 Local-L2，检查混合 bsz=4 graph 自身是否严格稳定。
+PROMPTS = chinese_8k + chinese_5k + chinese_70k + chinese_40k
+RUN_MODE = "graph"
+MAX_NUM_SEQS = 4
+MAX_TOKENS = 5
+ENABLE_CHUNKED_PREFILL = True
+ENABLE_PREFIX_CACHING = True
+PREFIX_CACHE_REPLAY_ROUNDS = 3
+ENABLE_L3_WRITE_BEHIND = True
+ENABLE_L3_PREFIX_LOADBACK = False
+```
+
+```python
+# Case C：关闭 DSA/L3，检查原生 HBM prefix 的混合 graph 稳定性。
+PROMPTS = chinese_8k + chinese_5k + chinese_70k + chinese_40k
+RUN_MODE = "disabled"
+MAX_NUM_SEQS = 4
+MAX_TOKENS = 5
+ENABLE_CHUNKED_PREFILL = True
+ENABLE_PREFIX_CACHING = True
+PREFIX_CACHE_REPLAY_ROUNDS = 3
+ENABLE_L3_WRITE_BEHIND = False
+ENABLE_L3_PREFIX_LOADBACK = False
+```
+
+三组都保持：
+
+```python
+PREFIX_REPLAY_LOGPROBS = 5
+COMPARE_LAST_TWO_PREFIX_REPLAYS = True
+STRICT_PREFIX_REPLAY_TOKEN_MATCH = True
+ALLOW_MULTI_REQUEST_GRAPH_TOPK_VARIANCE = True
+```
+
+Case A 比较 Local-L2/L3；Case B 因不执行本地 reset，会比较连续两轮
+Local-L2。实际 A5 GLM-5.2 结果中，Case A 的 38 个块、262,364,160
+bytes/rank 严格一致；Case B 在没有任何 L3 load 的情况下，于 5k 请求第 5
+个生成 token 复现了混合 bsz=4 的同一分叉。更重要的是，启用和禁用 L3
+loadback 的 round2/round3 四条输出按 replay 轮次逐条相同，因此该差异属于
+多请求 graph replay 的既有数值变化，不是 L3 数据损坏。
+
+当前自动门禁采用分层规则：bsz=1 或 eager 仍要求 token 完全一致；仅对
+bsz>1 graph，若第一个分歧前已有相同 token，且双方选中 token 都出现在对方
+同位置的 top-k 中，则记录为 `top-k numerical consistency passed`。缺失
+logprobs、首 token 即分叉、候选不互相包含等情况仍严格失败。该规则不能替代
+NPU component bitwise UT、all-rank get 成功、block 数一致和 restore 完成日志。
+Case C 不阻塞 L3 P1-R 验收，仅用于进一步判断多请求 graph 数值变化来自社区
+HBM prefix 基线，还是 DSA Local-L2 restore/调度路径。
+
+注意：该配置下 `enable_prefix_caching=True` 不代表 target HBM Indexer/MLA 已参与
+匹配。DSA 已拦截基线 target HBM hit，当前查询顺序是 LocalDRAM L2 后接 L3；
+HBM component-wise 命中属于后续 P3-HOT。
 
 ```bash
 bash examples/dsa_demo/serve_dsa.sh 2>&1 | tee dsa-online.log
@@ -335,11 +462,91 @@ from novel_dataset import chinese_40k
 
 CONTINUATION_PROMPT = chinese_40k[0]
 MAX_TOKENS = 512
+L3_PREFIX_REPLAY_ROUNDS = 3
 ```
 
 此时脚本会调用流式 `/v1/completions`，将 `chinese_40k[0]` 原样作为
-prompt，输出一次续写后退出。`chinese_40k` 在测试数据中是只包含一条
+prompt。P1-R 三轮模式依次验证 cold、Local-L2 replay，并调用 vLLM 原生
+`/pause?mode=wait&clear_cache=false` 确定性 drain pending store，再调用
+`/reset_prefix_cache?reset_external=false` 并 `/resume` 后执行 L3 replay；严格比较
+后两轮文本。固定 sleep 不能证明异步上传完成，不再作为在线验收屏障。
+`serve_dsa.sh` 只在 `ENABLE_L3_PREFIX_LOADBACK=true` 时为该内部门禁设置
+`VLLM_SERVER_DEV_MODE=1`，生产服务不要启用开发接口。
+`chinese_40k` 在测试数据中是只包含一条
 文本的 list，因此这里需要取 `[0]`。
+
+### 在线 L2/L3 收口矩阵
+
+完成单条 40k 冒烟后，使用 `online_l2_l3_closeout_test.py` 一次覆盖四种
+长度、chunked prefill、continuous batching、row reuse 和本地 cache reset
+后的 L3 loadback。服务端建议配置：
+
+```bash
+MODEL_PATH="/models/GLM-5.2-w4a4c8-mxfp4"
+SERVED_MODEL_NAME="glm-5.2-dsa"
+RUN_MODE="graph"                 # 首轮也可先用 eager
+ENABLE_A5_PACKED_C8_DSA="true"
+ENABLE_MTP="false"
+ENABLE_L3_WRITE_BEHIND="true"
+ENABLE_L3_PREFIX_LOADBACK="true"
+ENABLE_PREFIX_CACHING="true"
+TENSOR_PARALLEL_SIZE="8"
+MAX_NUM_SEQS="4"
+MAX_MODEL_LEN="131072"
+MAX_NUM_BATCHED_TOKENS="16384"
+ENABLE_CHUNKED_PREFILL="true"
+```
+
+这些值位于 `serve_dsa.sh` 顶部用户配置区。先启动同目录文档指定的 Mooncake
+Master，再拉起服务：
+
+```bash
+bash examples/dsa_demo/serve_dsa.sh 2>&1 | tee dsa-online-l2-l3.log
+```
+
+确保服务器上的 `novel_dataset.py` 可被 Python 导入，且包含
+`chinese_5k`、`chinese_8k`、`chinese_40k`、`chinese_70k`。客户端顶部的
+`SERVER_RUN_MODE` 必须与服务端 `RUN_MODE` 一致，然后运行：
+
+```bash
+python examples/dsa_demo/online_l2_l3_closeout_test.py \
+  2>&1 | tee dsa-online-l2-l3-client.log
+```
+
+脚本不把四条 prompt 同时作为首次 seed batch，因为同批请求不能复用尚未
+发布的 prefix。它按以下顺序执行：
+
+1. 先只清 HBM/L2，四条请求逐条 seed；已有 L3 对象则加载，缺失才 cold
+   计算并触发异步 L2→L3 put；
+2. 四条请求逐条执行 Local-L2 A/B 自对照；
+3. pause/drain 后只清 HBM/L2 namespace，逐条执行两次强制 L3 A/B；
+4. 对 Local-L2/L3 分叉做同介质重放归因；
+5. 多轮 `bsz=4`，每轮执行 Local-L2 A、Local-L2 B、清本地后的 L3；
+6. 最后再次 pause/drain，结果写入
+   `/tmp/dsa-online-l2-l3-closeout.json`。
+
+eager 始终要求 token IDs 严格一致。graph 若发生 top-token 边界分叉，首个
+分叉 token 必须互相位于对方 top-k，而且同一请求的差异必须先在对应的
+Local-L2/Local-L2 或 L3/L3 自对照中出现；稳定但跨介质不同的结果仍直接失败。
+脚本会给 request ID 加上 `dsa-closeout-<run>-<phase>-<length>` 前缀，并打印
+首个分叉位置的实际 top-k logprob，便于关联服务端 hit/load/restore 日志。
+单个对照失败时不会立即中止，脚本会采完串行与并发全部阶段，再统一以非零
+状态退出并把 `diagnostic_failures` 写入结果 JSON。
+脚本默认 `FRESH_EXTERNAL_NAMESPACE_AT_START=False`，因此相同服务上反复运行
+会复用相同 Mooncake key，不会整份重写 prompt。只有需要隔离旧对象的 cold
+门禁时才临时设为 `True`；该操作只轮换 namespace，不物理删除旧对象，会一直
+占用容量直到 Mooncake 淘汰。5k 请求默认只生成 8 tokens，避免它的 109/128
+尾块在不同续写中形成新的 durable key。顺序阶段保持 SSE 流式打印，并发阶段
+缓冲输出以真正形成 `bsz=4`。
+
+服务日志还必须同时满足：
+
+- 首次或 L3 缺失的 seed 阶段出现非零
+  `store planned/submitted/completed success=True`；已有对象的重复测试应看到
+  backend hit，而不是相同完整前缀再次增加容量；
+- L3 阶段四条请求均出现非零 external hit、all-rank get 和 restore；
+- reset 前后没有 stale job、refcount underflow、连接失败或 pending store；
+- 客户端最终打印 `PASSED`，JSON 中 `status` 为 `passed`。
 
 不安装 Python OpenAI SDK 时，也可以直接观察 SSE 流：
 
@@ -438,14 +645,16 @@ LV-Eval 或 CLongEval 官方排行榜分数。正式精度对比应保持相同�
 
 - prefill/decode mixed batch（chunked prefill 本身已支持）；
 - async scheduling；
-- HBM Indexer/dense-MLA 热副本协同命中与 L3 prefix load；LocalDRAM
-  complete-bundle 的 rank0 write-behind 已进入首版 NPU 验收；
+- HBM Indexer/dense-MLA 热副本协同命中，以及 HBM-only hit 的 L2
+  backfill/去重；L3 P1-R 同步 loadback 已完成 A5 TP8 收缩验收，但在线
+  continuous batching 与长稳仍待补齐；
 - preemption/resume；
 - 非 MTP speculative method、MTP draft 数不等于 3、非 greedy MTP；
-- 除 `DSAL3Connector` store-only 路径外的 KV transfer connector；
+- MTP 与 L3 组合、L3 的 DP>1、layerwise async load 和 HBM 直通；
+- `DSAL3Connector` 之外的 DSA KV transfer connector，以及非 Mooncake 后端；
 - context parallel 和 pipeline parallel；
 - KV-cache metrics/events；
-- A5 设备算子验收。
+- A5 BF16 算子链、完整 QA 与性能验收。
 
 这些能力会在后续按独立合同逐项扩展。在相应实现和回归完成前，不要通过
 删除启动期校验强行打开。

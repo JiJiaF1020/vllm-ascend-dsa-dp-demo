@@ -261,6 +261,46 @@ def test_dsa_l3_connector_is_allowed_for_mooncake_without_mtp() -> None:
     assert config.enabled
 
 
+def test_dsa_l3_prefix_load_requires_kv_both_and_prefix_caching() -> None:
+    kv_transfer = SimpleNamespace(
+        kv_connector="DSAL3Connector",
+        kv_role="kv_both",
+        kv_load_failure_policy="fail",
+        kv_connector_extra_config={"backend": "mooncake"},
+    )
+
+    config = DSAOffloadConfig.from_dict(
+        {"enabled": True},
+        vllm_config=_vllm_config(
+            kv_transfer_config=kv_transfer,
+            enable_prefix_caching=True,
+            shutdown_timeout=300,
+        ),
+    )
+    assert config.enabled
+
+    with pytest.raises(ValueError, match="enable_prefix_caching=True"):
+        DSAOffloadConfig.from_dict(
+            {"enabled": True},
+            vllm_config=_vllm_config(
+                kv_transfer_config=kv_transfer,
+                enable_prefix_caching=False,
+                shutdown_timeout=300,
+            ),
+        )
+
+    kv_transfer.kv_load_failure_policy = "recompute"
+    with pytest.raises(ValueError, match="kv_load_failure_policy='fail'"):
+        DSAOffloadConfig.from_dict(
+            {"enabled": True},
+            vllm_config=_vllm_config(
+                kv_transfer_config=kv_transfer,
+                enable_prefix_caching=True,
+                shutdown_timeout=300,
+            ),
+        )
+
+
 def test_dsa_l3_connector_requires_positive_shutdown_timeout() -> None:
     kv_transfer = SimpleNamespace(
         kv_connector="DSAL3Connector",

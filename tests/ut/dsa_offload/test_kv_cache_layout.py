@@ -128,6 +128,17 @@ class _DRAMDirectory:
     def __init__(self) -> None:
         self.freed_request_ids: list[str] = []
         self.attached: dict[str, tuple[_Block, ...]] = {}
+        self.request_blocks: dict[str, list[_Block]] = {}
+        self._next_id = 9100
+
+    def can_attach_cached_prefix(
+        self,
+        blocks: tuple[_Block, ...],
+        *,
+        new_block_count: int = 0,
+    ) -> bool:
+        del blocks, new_block_count
+        return True
 
     def attach_cached_prefix(
         self,
@@ -135,6 +146,27 @@ class _DRAMDirectory:
         blocks: tuple[_Block, ...],
     ) -> None:
         self.attached[request_id] = blocks
+        self.request_blocks[request_id] = list(blocks)
+
+    def ensure_request_blocks(
+        self,
+        request_id: str,
+        logical_block_count: int,
+    ) -> tuple[int, tuple[int, ...]]:
+        blocks = self.request_blocks.setdefault(request_id, [])
+        start = len(blocks)
+        allocated = [
+            _Block(self._next_id + offset)
+            for offset in range(logical_block_count - start)
+        ]
+        self._next_id += len(allocated)
+        blocks.extend(allocated)
+        return start, tuple(block.block_id for block in allocated)
+
+    def get_request_blocks(self, request_id: str) -> tuple[int, ...]:
+        return tuple(
+            block.block_id for block in self.request_blocks[request_id]
+        )
 
     def free_request(self, request_id: str) -> tuple[int, ...]:
         self.freed_request_ids.append(request_id)
@@ -192,6 +224,7 @@ def _make_manager(
     coordinator.dram_directory = _DRAMDirectory()
     coordinator._pending_prefix_hits = {}
     coordinator._pending_prefix_restores = {}
+    coordinator._pending_external_prefix_loads = {}
     coordinator.request_cache_layout = DSARequestCachePlanner(
         block_size=128,
         sparse_activation_tokens=2048,
@@ -266,6 +299,45 @@ def test_prefix_hit_allocates_target_destinations_and_commits_restore() -> None:
     restore = coordinator.take_prefix_restore_plan("prefix")
     assert restore is not None
     assert restore.source_dram_block_ids == (9001, 9002)
+    assert restore.destination_indexer_block_ids == (1000, 1001)
+    assert restore.destination_resident_block_ids == (2000, 2001)
+
+
+def test_external_prefix_allocates_l2_suffix_and_one_combined_restore() -> None:
+    manager, coordinator = _make_manager()
+    request = _Request("external", 512, 0, 0, 512)
+    local_dram = (_Block(9001),)
+    external_hash = b"external-hash"
+    coordinator._pending_prefix_hits[request.request_id] = (
+        DSAPrefixCacheHitPlan(
+            request_id=request.request_id,
+            num_computed_tokens=256,
+            dram_blocks=local_dram,  # type: ignore[arg-type]
+            external_computed_tokens=128,
+            external_block_hashes=(external_hash,),
+        )
+    )
+
+    allocated = allocate_dsa_slots(
+        manager,  # type: ignore[arg-type]
+        request,  # type: ignore[arg-type]
+        256,
+        num_new_computed_tokens=128,
+        num_external_computed_tokens=128,
+        new_computed_blocks=manager.empty_kv_cache_blocks,
+    )
+
+    assert allocated is not None
+    assert len(coordinator.indexer_manager.req_to_blocks["external"]) == 4
+    assert len(coordinator.resident_manager.req_to_blocks["external"]) == 4
+    external = coordinator.take_external_prefix_load_plan("external")
+    assert external is not None
+    assert external.logical_block_start == 1
+    assert external.block_hashes == (external_hash,)
+    assert external.destination_dram_block_ids == (9100,)
+    restore = coordinator.take_prefix_restore_plan("external")
+    assert restore is not None
+    assert restore.source_dram_block_ids == (9001, 9100)
     assert restore.destination_indexer_block_ids == (1000, 1001)
     assert restore.destination_resident_block_ids == (2000, 2001)
 

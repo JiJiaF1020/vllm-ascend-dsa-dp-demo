@@ -53,10 +53,67 @@ class DSAL3StoreJob:
         return tuple(block.source_l2_block_id for block in self.blocks)
 
 
+@dataclass(frozen=True, slots=True)
+class DSAL3LoadBlock:
+    """一个远端 component pair 到本 rank L2 bundle 的恢复项。"""
+
+    logical_block_index: int
+    destination_l2_block_id: int
+    block_hash: bytes
+    indexer_key: str
+    mla_key: str
+
+    def __post_init__(self) -> None:
+        if self.logical_block_index < 0:
+            raise ValueError("DSA L3 load logical block index must be non-negative")
+        if self.destination_l2_block_id <= 0:
+            raise ValueError("DSA L3 load destination block ID must be positive")
+        if not self.block_hash:
+            raise ValueError("DSA L3 load block hash cannot be empty")
+        if not self.indexer_key or not self.mla_key:
+            raise ValueError("DSA L3 load block requires both component keys")
+
+
+@dataclass(frozen=True, slots=True)
+class DSAL3LoadJob:
+    """一个请求连续 L3-only suffix 的同步 all-rank load。"""
+
+    request_id: str
+    blocks: tuple[DSAL3LoadBlock, ...]
+
+    def __post_init__(self) -> None:
+        if not self.request_id:
+            raise ValueError("DSA L3 load job requires a request ID")
+        if not self.blocks:
+            raise ValueError("DSA L3 load job cannot be empty")
+        logical_indices = tuple(
+            block.logical_block_index for block in self.blocks
+        )
+        expected = tuple(
+            range(logical_indices[0], logical_indices[0] + len(self.blocks))
+        )
+        if logical_indices != expected:
+            raise ValueError(
+                "DSA L3 load job must contain one contiguous logical suffix"
+            )
+        destination_ids = tuple(
+            block.destination_l2_block_id for block in self.blocks
+        )
+        if len(set(destination_ids)) != len(destination_ids):
+            raise ValueError("DSA L3 load job contains duplicate L2 destinations")
+
+    @property
+    def destination_l2_block_ids(self) -> tuple[int, ...]:
+        return tuple(
+            block.destination_l2_block_id for block in self.blocks
+        )
+
+
 @dataclass(slots=True)
 class DSAL3ConnectorMetadata(KVConnectorMetadata):
     store_jobs: dict[int, DSAL3StoreJob] = field(default_factory=dict)
     jobs_to_flush: set[int] = field(default_factory=set)
+    load_jobs: tuple[DSAL3LoadJob, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
