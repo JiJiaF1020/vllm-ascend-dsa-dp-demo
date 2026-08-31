@@ -37,6 +37,7 @@ class DSAL3StoreWorker:
         backend: DSAL3BackendAdapter,
         max_inflight_jobs: int,
         enable_load: bool = False,
+        direct_hbm_load: bool = False,
         event_factory: EventFactory | None = None,
         load_consensus: Callable[[bool], bool] | None = None,
     ) -> None:
@@ -44,6 +45,9 @@ class DSAL3StoreWorker:
         self.device = torch.device(device)
         self.backend = backend
         self.enable_load = bool(enable_load)
+        self.direct_hbm_load = bool(direct_hbm_load)
+        if self.direct_hbm_load and not self.enable_load:
+            raise ValueError("DSA direct-HBM requires load to be enabled")
         self.max_inflight_jobs = int(max_inflight_jobs)
         if self.max_inflight_jobs <= 0:
             raise ValueError("DSA L3 max_inflight_jobs must be positive")
@@ -82,7 +86,10 @@ class DSAL3StoreWorker:
         self.store = store
         if not self.is_store_rank and not self.enable_load:
             return
-        self.backend.bind_store(store)
+        self.backend.bind_store(
+            store,
+            register_hbm=self.direct_hbm_load,
+        )
         if self.enable_load and self.device.type == "npu":
             self._load_status = torch.ones(
                 1,
@@ -209,6 +216,12 @@ class DSAL3StoreWorker:
         if local_error is None:
             try:
                 for job in load_jobs:
+                    if bool(job.direct_hbm) != self.direct_hbm_load:
+                        raise RuntimeError(
+                            "DSA L3 load destination capability disagrees "
+                            f"with worker config: job={job.direct_hbm}, "
+                            f"worker={self.direct_hbm_load}"
+                        )
                     transferred = self.backend.get_load_job(
                         job=job,
                         store=self.store,
@@ -239,11 +252,12 @@ class DSAL3StoreWorker:
             self._load_bytes += transferred
             logger.info(
                 "DSA L3 load completed: tp_rank=%d request=%s "
-                "blocks=%d bytes=%d",
+                "blocks=%d bytes=%d destination=%s",
                 self.tp_rank,
                 job.request_id,
                 len(job.blocks),
                 transferred,
+                "hbm" if job.direct_hbm else "l2",
             )
 
     def _all_ranks_loaded(self, local_success: bool) -> bool:

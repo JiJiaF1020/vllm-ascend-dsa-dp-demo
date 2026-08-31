@@ -65,12 +65,20 @@ class DSADRAMBlockAssignment:
 
 @dataclass(frozen=True, slots=True)
 class DSADRAMBlockRestore:
-    """一个 prefix-hit 请求的 target DRAM->HBM 分平面恢复任务。"""
+    """一个 prefix-hit 请求的 target DRAM->HBM 分平面恢复任务。
+
+    ``ready_block_count`` 是恢复完成后 L2 的连续 durable 水位，不要求
+    覆盖本次 copy range。HBM-only 本地前缀可能在 L2 中形成待回填缺口；
+    此时可以先把更靠后的 L3 suffix 从 L2 恢复到 HBM，而 durable 水位
+    仍停留在缺口之前，随后由首个 prefill forward 的 dump 补齐。
+    """
 
     request_id: str
     source_dram_block_ids: tuple[int, ...]
     destination_indexer_block_ids: tuple[int, ...]
     destination_resident_block_ids: tuple[int, ...]
+    logical_block_start: int = 0
+    ready_block_count: int | None = None
 
     def __post_init__(self) -> None:
         lengths = (
@@ -78,11 +86,28 @@ class DSADRAMBlockRestore:
             len(self.destination_indexer_block_ids),
             len(self.destination_resident_block_ids),
         )
-        if not lengths[0] or len(set(lengths)) != 1:
+        if len(set(lengths)) != 1:
             raise ValueError(
-                "DSA DRAM restore planes must have one matching positive "
+                "DSA DRAM restore planes must have one matching "
                 f"length, got {lengths}"
             )
+        if self.logical_block_start < 0:
+            raise ValueError("DSA DRAM restore start must be non-negative")
+        ready_block_count = (
+            self.logical_block_start + lengths[0]
+            if self.ready_block_count is None
+            else int(self.ready_block_count)
+        )
+        if ready_block_count < 0:
+            raise ValueError(
+                "DSA DRAM restore ready watermark must be non-negative: "
+                f"ready={ready_block_count}"
+            )
+        object.__setattr__(
+            self,
+            "ready_block_count",
+            ready_block_count,
+        )
         if any(
             block_id <= 0
             for block_ids in (

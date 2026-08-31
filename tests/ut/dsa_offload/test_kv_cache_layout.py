@@ -301,6 +301,168 @@ def test_prefix_hit_allocates_target_destinations_and_commits_restore() -> None:
     assert restore.source_dram_block_ids == (9001, 9002)
     assert restore.destination_indexer_block_ids == (1000, 1001)
     assert restore.destination_resident_block_ids == (2000, 2001)
+    assert restore.logical_block_start == 0
+    assert restore.ready_block_count == 2
+
+
+def test_paired_hbm_prefix_skips_covered_l2_restore_prefix() -> None:
+    manager, coordinator = _make_manager()
+    request = _Request("hbm-prefix", 512, 0, 0, 512)
+    dram_blocks = (_Block(9001), _Block(9002))
+    hbm_indexer = (_Block(110),)
+    hbm_resident = (_Block(210),)
+    coordinator._pending_prefix_hits[request.request_id] = (
+        DSAPrefixCacheHitPlan(
+            request_id=request.request_id,
+            num_computed_tokens=256,
+            dram_blocks=dram_blocks,  # type: ignore[arg-type]
+            hbm_indexer_blocks=hbm_indexer,  # type: ignore[arg-type]
+            hbm_resident_blocks=hbm_resident,  # type: ignore[arg-type]
+        )
+    )
+
+    allocated = allocate_dsa_slots(
+        manager,  # type: ignore[arg-type]
+        request,  # type: ignore[arg-type]
+        256,
+        num_new_computed_tokens=256,
+        new_computed_blocks=SimpleNamespace(
+            blocks=(hbm_indexer, hbm_resident)
+        ),
+    )
+
+    assert allocated is not None
+    assert (
+        coordinator.indexer_manager.req_to_blocks["hbm-prefix"][0]
+        == hbm_indexer[0]
+    )
+    assert (
+        coordinator.resident_manager.req_to_blocks["hbm-prefix"][0]
+        == hbm_resident[0]
+    )
+    restore = coordinator.take_prefix_restore_plan("hbm-prefix")
+    assert restore is not None
+    assert restore.logical_block_start == 1
+    assert restore.ready_block_count == 2
+    assert restore.source_dram_block_ids == (9002,)
+    assert restore.destination_indexer_block_ids == (1000,)
+    assert restore.destination_resident_block_ids == (2000,)
+
+
+def test_full_paired_hbm_prefix_publishes_ready_without_restore_copy() -> None:
+    manager, coordinator = _make_manager()
+    request = _Request("hbm-full", 512, 0, 0, 512)
+    dram_blocks = (_Block(9001), _Block(9002))
+    hbm_indexer = (_Block(110), _Block(111))
+    hbm_resident = (_Block(210), _Block(211))
+    coordinator._pending_prefix_hits[request.request_id] = (
+        DSAPrefixCacheHitPlan(
+            request_id=request.request_id,
+            num_computed_tokens=256,
+            dram_blocks=dram_blocks,  # type: ignore[arg-type]
+            hbm_indexer_blocks=hbm_indexer,  # type: ignore[arg-type]
+            hbm_resident_blocks=hbm_resident,  # type: ignore[arg-type]
+        )
+    )
+
+    allocated = allocate_dsa_slots(
+        manager,  # type: ignore[arg-type]
+        request,  # type: ignore[arg-type]
+        256,
+        num_new_computed_tokens=256,
+        new_computed_blocks=SimpleNamespace(
+            blocks=(hbm_indexer, hbm_resident)
+        ),
+    )
+
+    assert allocated is not None
+    restore = coordinator.take_prefix_restore_plan("hbm-full")
+    assert restore is not None
+    assert restore.logical_block_start == 2
+    assert restore.ready_block_count == 2
+    assert restore.source_dram_block_ids == ()
+    assert restore.destination_indexer_block_ids == ()
+    assert restore.destination_resident_block_ids == ()
+
+
+def test_hbm_only_suffix_allocates_l2_backfill_without_marking_ready() -> None:
+    manager, coordinator = _make_manager()
+    request = _Request("hbm-only", 512, 0, 0, 512)
+    dram_blocks = (_Block(9001),)
+    hbm_indexer = (_Block(110), _Block(111), _Block(112))
+    hbm_resident = (_Block(210), _Block(211), _Block(212))
+    coordinator._pending_prefix_hits[request.request_id] = (
+        DSAPrefixCacheHitPlan(
+            request_id=request.request_id,
+            num_computed_tokens=384,
+            dram_blocks=dram_blocks,  # type: ignore[arg-type]
+            hbm_indexer_blocks=hbm_indexer,  # type: ignore[arg-type]
+            hbm_resident_blocks=hbm_resident,  # type: ignore[arg-type]
+        )
+    )
+
+    allocated = allocate_dsa_slots(
+        manager,  # type: ignore[arg-type]
+        request,  # type: ignore[arg-type]
+        128,
+        num_new_computed_tokens=384,
+        new_computed_blocks=SimpleNamespace(
+            blocks=(hbm_indexer, hbm_resident)
+        ),
+    )
+
+    assert allocated is not None
+    assert coordinator.dram_directory.attached["hbm-only"] == dram_blocks
+    assert len(coordinator.dram_directory.request_blocks["hbm-only"]) == 4
+    restore = coordinator.take_prefix_restore_plan("hbm-only")
+    assert restore is not None
+    assert restore.logical_block_start == 1
+    assert restore.ready_block_count == 1
+    assert restore.source_dram_block_ids == ()
+    assert restore.destination_indexer_block_ids == ()
+    assert restore.destination_resident_block_ids == ()
+
+
+def test_hbm_only_gap_keeps_l2_watermark_before_l3_suffix() -> None:
+    manager, coordinator = _make_manager()
+    request = _Request("hbm-l3", 640, 0, 0, 640)
+    local_dram = (_Block(9001),)
+    hbm_indexer = (_Block(110), _Block(111), _Block(112))
+    hbm_resident = (_Block(210), _Block(211), _Block(212))
+    external_hash = b"external-hash"
+    coordinator._pending_prefix_hits[request.request_id] = (
+        DSAPrefixCacheHitPlan(
+            request_id=request.request_id,
+            num_computed_tokens=512,
+            dram_blocks=local_dram,  # type: ignore[arg-type]
+            hbm_indexer_blocks=hbm_indexer,  # type: ignore[arg-type]
+            hbm_resident_blocks=hbm_resident,  # type: ignore[arg-type]
+            external_computed_tokens=128,
+            external_block_hashes=(external_hash,),
+        )
+    )
+
+    allocated = allocate_dsa_slots(
+        manager,  # type: ignore[arg-type]
+        request,  # type: ignore[arg-type]
+        128,
+        num_new_computed_tokens=384,
+        num_external_computed_tokens=128,
+        new_computed_blocks=SimpleNamespace(
+            blocks=(hbm_indexer, hbm_resident)
+        ),
+    )
+
+    assert allocated is not None
+    external = coordinator.take_external_prefix_load_plan("hbm-l3")
+    assert external is not None
+    assert external.logical_block_start == 3
+    assert external.destination_dram_block_ids == (9102,)
+    restore = coordinator.take_prefix_restore_plan("hbm-l3")
+    assert restore is not None
+    assert restore.logical_block_start == 3
+    assert restore.ready_block_count == 1
+    assert restore.source_dram_block_ids == (9102,)
 
 
 def test_external_prefix_allocates_l2_suffix_and_one_combined_restore() -> None:
@@ -340,6 +502,79 @@ def test_external_prefix_allocates_l2_suffix_and_one_combined_restore() -> None:
     assert restore.source_dram_block_ids == (9001, 9100)
     assert restore.destination_indexer_block_ids == (1000, 1001)
     assert restore.destination_resident_block_ids == (2000, 2001)
+
+
+def test_direct_hbm_external_prefix_restores_only_local_l2_prefix() -> None:
+    manager, coordinator = _make_manager()
+    coordinator.set_l3_direct_hbm_load_enabled(True)
+    request = _Request("external-direct", 512, 0, 0, 512)
+    local_dram = (_Block(9001),)
+    external_hash = b"external-hash"
+    coordinator._pending_prefix_hits[request.request_id] = (
+        DSAPrefixCacheHitPlan(
+            request_id=request.request_id,
+            num_computed_tokens=256,
+            dram_blocks=local_dram,  # type: ignore[arg-type]
+            external_computed_tokens=128,
+            external_block_hashes=(external_hash,),
+        )
+    )
+
+    allocated = allocate_dsa_slots(
+        manager,  # type: ignore[arg-type]
+        request,  # type: ignore[arg-type]
+        256,
+        num_new_computed_tokens=128,
+        num_external_computed_tokens=128,
+        new_computed_blocks=manager.empty_kv_cache_blocks,
+    )
+
+    assert allocated is not None
+    external = coordinator.take_external_prefix_load_plan(
+        "external-direct"
+    )
+    assert external is not None
+    assert external.destination_dram_block_ids == (9100,)
+    assert external.destination_indexer_hbm_block_ids == (1001,)
+    assert external.destination_resident_hbm_block_ids == (2001,)
+    restore = coordinator.take_prefix_restore_plan("external-direct")
+    assert restore is not None
+    assert restore.logical_block_start == 0
+    assert restore.ready_block_count == 1
+    assert restore.source_dram_block_ids == (9001,)
+    assert restore.destination_indexer_block_ids == (1000,)
+    assert restore.destination_resident_block_ids == (2000,)
+
+
+def test_direct_hbm_pure_l3_prefix_defers_l2_ready_to_first_forward() -> None:
+    manager, coordinator = _make_manager()
+    coordinator.set_l3_direct_hbm_load_enabled(True)
+    request = _Request("external-only", 256, 0, 0, 256)
+    coordinator._pending_prefix_hits[request.request_id] = (
+        DSAPrefixCacheHitPlan(
+            request_id=request.request_id,
+            num_computed_tokens=128,
+            dram_blocks=(),
+            external_computed_tokens=128,
+            external_block_hashes=(b"external-hash",),
+        )
+    )
+
+    allocated = allocate_dsa_slots(
+        manager,  # type: ignore[arg-type]
+        request,  # type: ignore[arg-type]
+        128,
+        num_new_computed_tokens=0,
+        num_external_computed_tokens=128,
+        new_computed_blocks=manager.empty_kv_cache_blocks,
+    )
+
+    assert allocated is not None
+    external = coordinator.take_external_prefix_load_plan("external-only")
+    assert external is not None
+    assert external.destination_indexer_hbm_block_ids == (1000,)
+    assert external.destination_resident_hbm_block_ids == (2000,)
+    assert coordinator.take_prefix_restore_plan("external-only") is None
 
 
 def test_chunked_prefill_grows_both_dense_planes_incrementally() -> None:

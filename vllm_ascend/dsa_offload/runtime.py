@@ -183,7 +183,15 @@ class DSAOffloadRuntime:
         )
         self.active_dram_block_table.np.fill(DSA_DRAM_NULL_BLOCK_ID)
         self.active_dram_block_table.gpu.zero_()
-        max_dump_jobs = cdiv(self.max_num_tokens, self.block_size) + self.max_num_reqs
+        # 普通 forward 只会新增约 ``max_num_tokens / block_size`` 个
+        # 满块；HBM-only prefix 首轮却可能回填每个请求的完整历史。
+        # 仍在初始化期一次预分配，热路径只切实际 job 前缀。
+        max_dump_jobs = (
+            self.max_num_reqs * self.max_logical_blocks
+            if self.enable_prefix_caching
+            else cdiv(self.max_num_tokens, self.block_size)
+            + self.max_num_reqs
+        )
         self.dump_src_block_ids = CpuGpuBuffer(
             max_dump_jobs,
             dtype=torch.int32,
@@ -322,7 +330,7 @@ class DSAOffloadRuntime:
         restores: Sequence[object],
         state: DSAInputBatchCacheLayout,
     ) -> None:
-        """把冷路径 restore plan 写入固定 buffer，并推进 worker durable 水位。"""
+        """写入冷路径 restore，并提交恢复后的连续 L2 durable 水位。"""
 
         store = self.dram_store
         if store is None:
@@ -351,10 +359,36 @@ class DSAOffloadRuntime:
                 block_count
                 == len(restore.destination_indexer_block_ids)
                 == len(restore.destination_resident_block_ids)
-                and block_count > 0
             ):
                 raise RuntimeError(
                     "DSA prefix restore contains inconsistent block columns"
+                )
+            logical_start = int(restore.logical_block_start)
+            ready_block_count = int(restore.ready_block_count)
+            logical_end = logical_start + block_count
+            if (
+                logical_start < 0
+                or ready_block_count < 0
+                or logical_end > store.max_logical_blocks
+                or ready_block_count > store.max_logical_blocks
+            ):
+                raise RuntimeError(
+                    "DSA prefix restore contains an invalid logical range: "
+                    f"request_id={request_id!r}, start={logical_start}, "
+                    f"count={block_count}, ready={ready_block_count}"
+                )
+            if ready_block_count and np.any(
+                store.logical_block_table[
+                    pool_index,
+                    :ready_block_count,
+                ]
+                == DSA_DRAM_NULL_BLOCK_ID
+            ):
+                raise RuntimeError(
+                    "DSA prefix restore ready watermark crosses an "
+                    "unassigned L2 block: "
+                    f"request_id={request_id!r}, "
+                    f"ready={ready_block_count}"
                 )
             end = offset + block_count
             if end > capacity:
@@ -364,7 +398,7 @@ class DSAOffloadRuntime:
                 )
             assigned = store.logical_block_table[
                 pool_index,
-                :block_count,
+                logical_start : logical_start + block_count,
             ]
             self.restore_src_dram_block_ids.np[offset:end] = (
                 restore.source_dram_block_ids
@@ -384,27 +418,29 @@ class DSAOffloadRuntime:
                     f"DRAM table: request_id={request_id!r}"
                 )
             self._restore_pool_indices[restore_rows] = int(pool_index)
-            self._restore_ready_counts[restore_rows] = block_count
+            self._restore_ready_counts[restore_rows] = ready_block_count
             restore_rows += 1
             offset = end
 
-        self.restore_src_dram_block_ids.gpu[:offset].copy_(
-            self.restore_src_dram_block_ids.cpu[:offset],
-            non_blocking=True,
-        )
-        self.restore_dst_indexer_block_ids.gpu[:offset].copy_(
-            self.restore_dst_indexer_block_ids.cpu[:offset],
-            non_blocking=True,
-        )
-        self.restore_dst_resident_block_ids.gpu[:offset].copy_(
-            self.restore_dst_resident_block_ids.cpu[:offset],
-            non_blocking=True,
-        )
+        if offset:
+            self.restore_src_dram_block_ids.gpu[:offset].copy_(
+                self.restore_src_dram_block_ids.cpu[:offset],
+                non_blocking=True,
+            )
+            self.restore_dst_indexer_block_ids.gpu[:offset].copy_(
+                self.restore_dst_indexer_block_ids.cpu[:offset],
+                non_blocking=True,
+            )
+            self.restore_dst_resident_block_ids.gpu[:offset].copy_(
+                self.restore_dst_resident_block_ids.cpu[:offset],
+                non_blocking=True,
+            )
+        if offset:
+            self._execute_prefix_restore_jobs(offset)
         store.commit_durable_full_block_counts(
             pool_indices=self._restore_pool_indices[:restore_rows],
             full_block_counts=self._restore_ready_counts[:restore_rows],
         )
-        self._execute_prefix_restore_jobs(offset)
         logger.info(
             "DSA prefix restore submitted: requests=%d blocks=%d "
             "target_layers=%d",

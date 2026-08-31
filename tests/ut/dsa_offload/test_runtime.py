@@ -94,6 +94,18 @@ def test_lidu_scratch_is_shared_but_cache_slots_remain_per_layer() -> None:
     assert resident_pool.get_cache_slots(0).data_ptr() != resident_pool.get_cache_slots(1).data_ptr()
 
 
+def test_prefix_dump_metadata_covers_full_history_for_every_request() -> None:
+    _, runtime, _ = _make_runtime(
+        max_num_reqs=2,
+        enable_prefix_caching=True,
+    )
+
+    expected_jobs = 2 * runtime.max_logical_blocks
+    assert runtime.dump_src_block_ids.gpu.shape == (expected_jobs,)
+    assert runtime.dump_indexer_src_block_ids.gpu.shape == (expected_jobs,)
+    assert runtime.dump_dst_block_ids.gpu.shape == (expected_jobs,)
+
+
 def test_shared_topology_allocates_only_full_selection_states() -> None:
     resident_pool, runtime, _ = _make_runtime(
         resident_layer_count=2,
@@ -191,6 +203,193 @@ def test_prefix_restore_uses_fixed_jobs_and_restores_both_planes(
     assert torch.all(resident_rope[1] == 4)
     assert torch.all(indexer[2] == 5)
     assert store.durable_full_block_counts[pool_index] == 1
+
+
+def test_prefix_restore_can_copy_only_the_l2_suffix(monkeypatch) -> None:
+    resident_pool, runtime, store = _make_runtime(
+        resident_layer_count=1,
+        selection_state_count=1,
+        enable_prefix_caching=True,
+    )
+    pool_index = resident_pool.acquire("req")
+    store.apply_assignment(
+        pool_index=pool_index,
+        logical_block_start=0,
+        physical_block_ids=(5, 6),
+    )
+    resident_nope = torch.zeros((4, 128, 1, 2), dtype=torch.bfloat16)
+    resident_rope = torch.zeros((4, 128, 1, 1), dtype=torch.bfloat16)
+    indexer = torch.zeros((4, 128, 1, 2), dtype=torch.int8)
+    store.add_layer(
+        layer_id=0,
+        resident_nope_cache=resident_nope,
+        resident_rope_cache=resident_rope,
+        indexer_cache=indexer,
+    )
+    arenas = store.get_layer_arenas(0)
+    assert arenas.nope is not None
+    assert arenas.rope is not None
+    arenas.nope[6].fill_(3)
+    arenas.rope[6].fill_(4)
+    arenas.indexer_dram_bytes[0][6].fill_(5)
+
+    def copy_blocks(
+        *,
+        source_bytes,
+        destination_bytes,
+        src_block_ids,
+        dst_block_ids,
+    ) -> None:
+        destination_bytes[dst_block_ids.long()] = source_bytes[
+            src_block_ids.long()
+        ]
+
+    monkeypatch.setattr(
+        runtime_module,
+        "copy_full_cache_plane_bytes",
+        copy_blocks,
+    )
+    runtime.prepare_prefix_restore_jobs(
+        restores=(
+            DSADRAMBlockRestore(
+                request_id="req",
+                source_dram_block_ids=(6,),
+                destination_indexer_block_ids=(2,),
+                destination_resident_block_ids=(1,),
+                logical_block_start=1,
+                ready_block_count=2,
+            ),
+        ),
+        state=SimpleNamespace(resident_token_pool=resident_pool),
+    )
+
+    assert torch.all(resident_nope[1] == 3)
+    assert torch.all(resident_rope[1] == 4)
+    assert torch.all(indexer[2] == 5)
+    assert store.durable_full_block_counts[pool_index] == 2
+
+
+@pytest.mark.parametrize("ready_block_count", [0, 1])
+def test_prefix_restore_can_copy_l3_suffix_past_hbm_only_l2_gap(
+    monkeypatch,
+    ready_block_count: int,
+) -> None:
+    resident_pool, runtime, store = _make_runtime(
+        resident_layer_count=1,
+        selection_state_count=1,
+        enable_prefix_caching=True,
+    )
+    pool_index = resident_pool.acquire("req")
+    store.apply_assignment(
+        pool_index=pool_index,
+        logical_block_start=0,
+        physical_block_ids=(5, 6, 7, 8),
+    )
+    resident_nope = torch.zeros((4, 128, 1, 2), dtype=torch.bfloat16)
+    resident_rope = torch.zeros((4, 128, 1, 1), dtype=torch.bfloat16)
+    indexer = torch.zeros((4, 128, 1, 2), dtype=torch.int8)
+    store.add_layer(
+        layer_id=0,
+        resident_nope_cache=resident_nope,
+        resident_rope_cache=resident_rope,
+        indexer_cache=indexer,
+    )
+    arenas = store.get_layer_arenas(0)
+    assert arenas.nope is not None
+    assert arenas.rope is not None
+    arenas.nope[8].fill_(3)
+    arenas.rope[8].fill_(4)
+    arenas.indexer_dram_bytes[0][8].fill_(5)
+
+    def copy_blocks(
+        *,
+        source_bytes,
+        destination_bytes,
+        src_block_ids,
+        dst_block_ids,
+    ) -> None:
+        destination_bytes[dst_block_ids.long()] = source_bytes[
+            src_block_ids.long()
+        ]
+
+    monkeypatch.setattr(
+        runtime_module,
+        "copy_full_cache_plane_bytes",
+        copy_blocks,
+    )
+    runtime.prepare_prefix_restore_jobs(
+        restores=(
+            DSADRAMBlockRestore(
+                request_id="req",
+                source_dram_block_ids=(8,),
+                destination_indexer_block_ids=(2,),
+                destination_resident_block_ids=(1,),
+                logical_block_start=3,
+                # A preceding HBM-only range still needs first-forward
+                # backfill, so this later copy cannot advance L2 past it.
+                ready_block_count=ready_block_count,
+            ),
+        ),
+        state=SimpleNamespace(resident_token_pool=resident_pool),
+    )
+
+    assert torch.all(resident_nope[1] == 3)
+    assert torch.all(resident_rope[1] == 4)
+    assert torch.all(indexer[2] == 5)
+    assert (
+        store.durable_full_block_counts[pool_index]
+        == ready_block_count
+    )
+
+
+def test_full_hbm_prefix_can_publish_l2_ready_without_copy() -> None:
+    resident_pool, runtime, store = _make_runtime(
+        enable_prefix_caching=True,
+    )
+    pool_index = resident_pool.acquire("req")
+    store.apply_assignment(
+        pool_index=pool_index,
+        logical_block_start=0,
+        physical_block_ids=(5, 6),
+    )
+
+    runtime.prepare_prefix_restore_jobs(
+        restores=(
+            DSADRAMBlockRestore(
+                request_id="req",
+                source_dram_block_ids=(),
+                destination_indexer_block_ids=(),
+                destination_resident_block_ids=(),
+                logical_block_start=2,
+                ready_block_count=2,
+            ),
+        ),
+        state=SimpleNamespace(resident_token_pool=resident_pool),
+    )
+
+    assert store.durable_full_block_counts[pool_index] == 2
+
+
+def test_prefix_restore_rejects_ready_watermark_over_unassigned_l2() -> None:
+    resident_pool, runtime, _ = _make_runtime(
+        enable_prefix_caching=True,
+    )
+    resident_pool.acquire("req")
+
+    with pytest.raises(RuntimeError, match="unassigned L2 block"):
+        runtime.prepare_prefix_restore_jobs(
+            restores=(
+                DSADRAMBlockRestore(
+                    request_id="req",
+                    source_dram_block_ids=(),
+                    destination_indexer_block_ids=(),
+                    destination_resident_block_ids=(),
+                    logical_block_start=1,
+                    ready_block_count=1,
+                ),
+            ),
+            state=SimpleNamespace(resident_token_pool=resident_pool),
+        )
 
 
 def test_a5_selection_scratch_is_allocated_only_for_packed_c8() -> None:
@@ -772,6 +971,63 @@ def test_dump_plan_is_compact_and_idempotent() -> None:
         decode_forward=False,
     )
     assert runtime.dump_job_count == 0
+
+
+def test_hbm_only_prefix_is_backfilled_by_first_prefill_chunk() -> None:
+    resident_pool, runtime, store = _make_runtime()
+    state = DSAInputBatchCacheLayout(
+        max_num_reqs=1,
+        device=torch.device("cpu"),
+        pin_memory=False,
+        resident_token_pool=resident_pool,
+    )
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        req_ids=["req-0"],
+        req_id_to_index={"req-0": 0},
+        # 两个完整 prefix blocks 命中 HBM，但 L2 ready 仍为 0。
+        num_computed_tokens_cpu=np.array([256], dtype=np.int32),
+        block_table=[_ResidentBlockTable(), _ResidentBlockTable()],
+    )
+    input_batch.block_table[1]._rows = np.array(
+        [[40, 41, 0, 0]],
+        dtype=np.int32,
+    )
+    state.refresh(
+        input_batch=input_batch,
+        projection=DSARequestCacheLayoutProjection(
+            request_ids=("req-0",),
+            stages=(int(DSARequestCacheStage.PREFILL),),
+            target_resident_budget_tokens=(256,),
+            sparse_budget_tokens=(0,),
+            resident_valid_tokens=(-1,),
+            resident_block_table_replacements=(),
+        ),
+    )
+    store.apply_assignment(
+        pool_index=0,
+        logical_block_start=0,
+        physical_block_ids=(1, 2),
+    )
+
+    runtime.prepare_forward(
+        input_batch=input_batch,
+        state=state,
+        num_scheduled_tokens=np.array([1], dtype=np.int32),
+        req_indices=torch.zeros(1, dtype=torch.int64),
+        positions=torch.tensor([256], dtype=torch.int64),
+        num_reqs=1,
+        num_tokens=1,
+        resident_group_id=0,
+        indexer_group_id=1,
+        decode_forward=False,
+    )
+
+    assert runtime.dump_job_count == 2
+    assert runtime.dump_src_block_ids.np[:2].tolist() == [10, 11]
+    assert runtime.dump_indexer_src_block_ids.np[:2].tolist() == [40, 41]
+    assert runtime.dump_dst_block_ids.np[:2].tolist() == [1, 2]
+    assert store.durable_full_block_counts[0] == 2
 
 
 def test_mtp_double_tail_crosses_boundary_and_dumps_on_next_outer_step() -> None:

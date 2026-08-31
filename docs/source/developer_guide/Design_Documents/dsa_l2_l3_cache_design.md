@@ -26,14 +26,21 @@ cold/Local-L2/L3、单 5K graph 严格精度门禁，以及混合 bsz=4 graph �
 Local-L2/L3 与 Local-L2/Local-L2 对照均已通过。多请求 graph 已确认存在与
 L3 无关的 replay 数值变化；在线 P1-R 与长稳仍待回归。**
 
+**P1-HOT 妥协版已完成代码改造、等待上板：no-MTP 下 L1
+Indexer+dense-MLA pair 与 L2 complete bundle 独立查询，本地命中取较长者；
+HBM-only L2 gap 在首个 prefill forward 中同步补齐。外部命中继续固定走
+`L3 -> L2 -> HBM`。**
+
 ## 2. 目标与非目标
 
 ### 2.1 目标
 
 1. 保留当前 scheduler-owned DSA L2 DRAM directory，不重新建立第二套本地
    block manager。
-2. 新请求按唯一 `Request.block_hashes` 查询本地 L2 与远端 L3。
-3. L3 只补充 L2 之后的连续 prefix suffix，不重复加载 L2 已命中的部分。
+2. 新请求按唯一 `Request.block_hashes` 查询本地 L1 HBM pair、L2 complete
+   bundle 与远端 L3。
+3. 本地有效命中取 `max(HBM pair, L2 bundle)`；L3 只补充该最长本地前缀
+   之后的连续 suffix。
 4. TCP 首版将 L3-only suffix 恢复到各 rank 已注册的 L2，再复用现有
    L2->HBM restore；不为 TCP 另建 HBM staging 或第二套 read metadata。
 5. prefill/decode 新 durable 满块完成同步 L1->L2 dump 后，由 TP rank0
@@ -43,7 +50,7 @@ L3 无关的 replay 数值变化；在线 P1-R 与长稳仍待回归。**
    外部 IO 不进入 graph。
 8. Mooncake/MemCache 复用同一 DSA 控制面，后端差异封装在 AscendStore
    `Backend` 层。
-9. 为未来 component-wise `HBM > L2 > L3` source plan 保留接口。
+9. 当前按完整 HBM pair 复用；为未来独立 component source mask 保留接口。
 
 ### 2.2 第一版非目标
 
@@ -478,7 +485,7 @@ flowchart TB
         end
     end
 
-    LEGEND["① TCP prefix load: L3-only suffix -> L2 -> L1<br/>② Durable full block: L1 -> L2 sync; rank0 L2 -> L3 async<br/>③ Sparse decode: KSC token-wise L2 -> resident L1<br/>Future P3-HOT: component-wise HBM -> L2 -> L3 lookup"]:::legend
+    LEGEND["① Prefix load: L3 -> L2 -> L1, sync<br/>② HBM-only gap/new full block: L1 -> L2 sync; rank0 L2 -> L3 async<br/>③ Sparse decode: KSC token-wise L2 -> resident L1<br/>Lookup: local=max(L1 pair, L2), then extend from L3"]:::legend
 
     P -. "compute Request.block_hashes" .-> S
     S -. "L3 block-hash lookup" .-> L3
@@ -489,11 +496,11 @@ flowchart TB
 
     D0 -->|"① local prefix restore, sync"| H0
     DN -->|"① local prefix restore, sync"| HN
-    L3 -->|"① L3-only suffix to local L2, sync"| D0
-    L3 -->|"① L3-only suffix to local L2, sync"| DN
+    L3 -->|"① external suffix load, sync"| D0
+    L3 -->|"① external suffix load, sync"| DN
 
-    H0 -->|"② full-block dump, sync"| D0
-    HN -->|"② full-block dump, sync"| DN
+    H0 -->|"② new full block / prefix backfill, sync"| D0
+    HN -->|"② new full block / prefix backfill, sync"| DN
     D0 -->|"② rank0 write-behind, async"| L3
 
     D0 --> K0
@@ -517,9 +524,10 @@ flowchart TB
 ```
 
 图中虚线是 scheduler/worker/L3 lookup 的控制信息，红、蓝、黄实线分别对应
-① prefix load、② full-block 下沉、③ decode KSC miss IO。L3->L2 红线只传
-本地最长命中之后的 L3-only suffix，再复用现有 L2->L1 restore；L2->L3 蓝线
-初版只有 rank0 提交。
+① prefix load、② full-block 下沉/backfill、③ decode KSC miss IO。当前外部
+prefix 固定走 `L3 -> L2 -> L1`。蓝色 `L1 -> L2` 既承载每个 chunk 的新满块，
+也承载 HBM pair 比 L2 更长时，首个 prefix-suffix chunk 对 L2 缺口的回填；
+`L2 -> L3` 初版只有 rank0 提交。direct-HBM 不属于当前正确性合同。
 
 ## 7. Prefix lookup 与 load path
 
@@ -534,30 +542,38 @@ flowchart TB
 2. **P1-R sync-read**：write-behind 稳定后，再开放 L2 hit 之后的 L3 suffix
    lookup、L2/HBM 联合 admission、all-rank `L3->local L2` 与既有
    `L2->HBM` restore。
+3. **P1-HOT compromise**：L2 complete bundle 与 L1 Indexer+dense-MLA pair
+   独立查询，本地有效前缀取二者较长值；L1-only 范围在首个 prefill forward
+   中用既有 full-block dump 补齐 L2。L3 仍固定经 L2 恢复到 L1。
+4. **后续研究项**：独立 component source mask、direct-HBM、layerwise async
+   不进入当前版本门禁。
 
 两阶段共用 `DSAL3Connector`、key/schema 与 completion 通道，不建立临时旁路。
 
 ### 7.1 第一版顺序
 
-1. DSA `get_computed_blocks()` 查询 L2 完整 bundle 的最长连续 prefix。
-2. vLLM 基线继续调用 Connector，传入 L2 hit token count。
-3. Connector 只查询 L2 之后的 L3 suffix。
+1. DSA `get_computed_blocks()` 分别查询 L2 完整 bundle 与 L1 成对
+   Indexer+dense-MLA 的最长连续 prefix。
+2. 本地有效命中取 `max(l2_blocks, hbm_pair_blocks)`；HBM pair 直接 touch 为
+   新请求 block table 前段。
+3. vLLM 基线继续调用 Connector，L3 只查询最长本地命中之后的 suffix。
 4. Indexer/MLA L3 component hit 取公共连续前缀。
-5. scheduler 为 L3-only suffix 分配完整 Indexer+MLA L2 bundle，并对
-   `L2 hit + L3-only hit + 本轮 compute` 一次完成 HBM admission。
+5. scheduler 为 HBM-only L2 缺口、L3 suffix 和本轮 compute 一次分配完整 L2
+   bundle，并同时完成 split HBM admission。
 6. Connector metadata 携带 L3 component keys 与每 rank local L2 destination。
-7. all-rank worker 在 forward 前用 Store-owned TCP 将 L3 suffix 写入各自 L2。
-8. 各 rank 捕获本地 get 结果，并通过预分配 NPU 状态 tensor 做一次 TP all-reduce；
-   只有全员成功才发布本轮 L2 ready watermark 并执行既有 L2->HBM restore。
-9. forward 只计算未命中部分；已恢复 suffix 不重复执行 HBM->L2 dump。
+7. all-rank worker 在 forward 前用 Store-owned TCP 将 L3 suffix 写入各自 L2，
+   再把 HBM 尚未覆盖的部分执行 `L2 -> HBM` restore。
+8. 若 `hbm_pair_blocks > l2_blocks`，worker durable 水位保持在旧 L2 边界，
+   不跨过尚未物化的缺口；首个 prefill forward 的既有 dump 将该缺口与本轮
+   新满块一起同步补齐。
+9. model output 成功返回后，scheduler 才推进完整 L2 ready/hash，并允许 rank0
+   异步下沉 L3。
 10. 任一 rank/component load 失败则 fail-fast，不发布 L2 hash。
 
-这里的 `enable_prefix_caching=True` 只是当前 vLLM 公共入口，同时启用 DSA L2
-directory 的 hash/refcount/restore。P1-R **不查询 target HBM Indexer/MLA**：
-`prepare_prefix_cache_hit()` 只查询完整 LocalDRAM bundle，target HBM group 返回
-空列表；分配边界也拒绝把 target HBM hit block 当成 prefix。MTP full-HBM 是唯一
-已有的 HBM hash 候选，但 DSA+L3 首版明确拒绝 MTP。因此当前 tier 顺序严格为
-`L2 -> L3`，HBM target prefix 仍属于 P3-HOT。
+这里的 `enable_prefix_caching=True` 是当前 vLLM 公共入口，同时启用 DSA L1
+target hash 与 L2 directory 的 hash/refcount/restore。当前只支持 no-MTP 下的
+完整 HBM pair，不支持 Indexer-only/MLA-only source mask；MTP 多级 prefix 仍由
+后续阶段单独开放。
 
 ### 7.2 为什么 TCP 第一版选择 L3->L2->HBM
 
@@ -568,7 +584,8 @@ directory 的 hash/refcount/restore。P1-R **不查询 target HBM Indexer/MLA**�
 - 不要求 TCP transport 识别或直接写 NPU HBM；
 - L3 suffix 在 forward 前已经成为完整 L2 bundle，可直接供后续 KSC、prefix
   reuse 与 L2 eviction 使用；
-- 只执行必要的 L2->HBM restore，不再在 forward 后增加 HBM->L2 回写。
+- 已在 HBM 的成对 prefix 不重复执行 L2->HBM restore；若它比 L2 更长，
+  首个 prefill forward 才用既有 dump 补齐缺失的 L2 bundle。
 
 代价：
 
@@ -577,7 +594,7 @@ directory 的 hash/refcount/restore。P1-R **不查询 target HBM Indexer/MLA**�
 - all-rank get 完成后才能原子发布 Indexer+MLA 公共前缀；
 - 初版必须 fail-fast，不能静默 recompute。
 
-### 7.3 L3->HBM direct 后续路径
+### 7.3 L3->HBM direct 后续路径（当前冻结）
 
 AscendDirect 修复跨 NUMA Host H2H、或未来后端能可靠直接写 split HBM 后，可在
 不改变 lookup/schema 的前提下增加 direct destination capability。它必须复用同一
@@ -586,6 +603,10 @@ scheduler source plan，不能另建一套 eager/graph metadata。该优化保�
 - 不要求 L2 常驻副本的 P/D consumer；
 - 大容量只读 prefix；
 - 已证明 direct load 后无需立刻物化 L2 的场景。
+
+当前 A5 + Mooncake wheel 无法仅靠配置同时满足拓扑无感 L2 pool 与 direct-HBM，
+正式数据面固定使用 `L3 -> L2 -> HBM`。代码中的 direct capability 仅用于隔离
+实验，不属于部署脚本、回归矩阵或当前版本完成标准。
 
 ### 7.4 P2-LAYERWISE：TTFT 流水优化
 
@@ -1071,8 +1092,7 @@ Mooncake 优先实现。MemCache 后续复用相同 DSA key/schema/job 状态机
 
 ## 18. HBM target prefix 高优先级后续
 
-该适配点不能遗忘。L3 第一版完成后，应尽快把 HBM target 热副本加入
-component-wise source plan：
+L3 数据路径阶段性收口后，HBM target 热副本进入 P1-HOT 实施：
 
 ```text
 Indexer: HBM -> L2 -> L3
@@ -1080,19 +1100,119 @@ MLA:     dense HBM -> L2 -> L3
 MTP:     HBM
 ```
 
-必要改造：
+当前妥协版实现以下正确性闭环：
 
-1. Indexer HBM pool 开启 hash；
-2. resident MLA block 增加 `DENSE_PREFIX/BUDGET/TAIL` role；
-3. 只给 `DENSE_PREFIX` 发布 hash；
-4. prefix lookup 按 logical block 和 component 选最热 source；
-5. Indexer/MLA source 长度允许不同，但最终必须覆盖同一连续 token prefix；
-6. restore plan 拆成独立 component source/destination/mask；
-7. eviction 与 invalid-block identity 使用 group-qualified id；
-8. 保持 worker 最终 HBM block table 为 eager/graph 唯一真源。
+- 仅 no-MTP；
+- Indexer 与 dense MLA 同时命中形成 HBM pair，pair 允许比 L2 complete bundle
+  更长；
+- HBM pair 直接 touch 为请求 block table 前段；
+- 本地有效命中为 `max(hbm_pair_blocks, l2_blocks)`；L3 从该边界之后查询；
+- L3 suffix 固定 `L3 -> L2 -> HBM`，不执行 direct-HBM；
+- HBM-only 范围先分配 L2 block，但不推进 durable ready；首个 prefill
+  forward 用既有 full-block dump 补齐后才发布 hash；
+- 不命中时保持现有 L2/L3 行为和 steady decode 热路径。
 
-该项优先级定为 **P3-HOT（高）**，排在 L3 正确性闭环与 rank0 async store
-之后，不归入低优先级远期优化。
+当前只按完整 HBM pair 复用，不拆 Indexer-only/MLA-only source mask。若一个
+component 的 HBM 命中更长，超出 pair 的部分仍按 L2 restore 处理。这是有意的
+阶段性保守策略，不改变最终 component-wise 研究方向。
+
+Mooncake capability 以 transport 为边界：当前 Store-owned TCP 的
+`tcp_transport.cpp` 没有 Ascend device-memory staging 分支，裸 socket read 写
+NPU pointer 会返回 `EFAULT`。因此框架启动期拒绝 TCP direct-HBM；TCP 继续走
+`L3 -> L2 -> HBM` 正式路径。为避免误入同样未闭合 L2 合同的 Ascend 路径，
+当前框架对任意 protocol 的 `direct_hbm_load=true` 都会启动期拒绝。
+direct-HBM 只保留为未来 NPU-aware backend 的独立研究项。
+
+当前 A5 单机 TP8 的实测能力矩阵为：
+
+| Mooncake transport | rank-local L2 / 跨 NUMA Host IO | L3 直达 NPU HBM | 当前用途 |
+|---|---|---|---|
+| `protocol=ascend` + `global_ub` | swapped Host 本地路径可用，但跨 NUMA H2H 曾在 HComm/URMA completion 失败 | 可用，基线 HBM 与独立 probe 已验证 | 研究候选，不进入当前部署 |
+| Store-owned `protocol=tcp` | 可用，已完成 TP8 L2 write/loadback | 不可用；TCP 无 Ascend device staging，裸 socket 写 NPU pointer 返回 `EFAULT` | 当前正式 P1-W/P1-R/P1-HOT 数据面 |
+
+因此“L2 跨 NUMA 池化”和“L3 direct-HBM”在当前 wheel 的单一 transport
+实例中暂不可兼得。当前版本明确选择前者并冻结 `L3 -> L2 -> HBM`；框架侧
+不能用拓扑硬编码或无界 staging 假装消除该缺口。
+
+> **硬约束**：任何 tier 组合最终都必须在请求释放 dense MLA 或进入 sparse
+> decode 前，使 L2 `[0, durable_full_blocks)` 成为完整且 ready 的
+> Indexer+MLA bundle。HBM hit 只能改变 restore/source mask；HBM-only 数据
+> 必须先回填 L2，不能把 HBM refcount 或一次 lookup 当成 durable backing。
+
+后续独立 component mask 仍需：Indexer/MLA 分别选择最热 source、restore plan
+拆成独立 source/destination/mask，并保持 worker 最终 HBM block table 为
+eager/graph 唯一真源；这些不属于本轮 pair 版本。
+
+### 18.1 当前妥协版规范数据流
+
+当前 lookup 使用完整 pair 粒度：
+
+```text
+hbm_pair_blocks = min(HBM Indexer, HBM dense MLA)
+l2_blocks       = complete LocalDRAM bundle prefix
+local_blocks    = max(hbm_pair_blocks, l2_blocks)
+external_blocks = pooled L3 complete-bundle suffix after local_blocks
+
+executable_prefix = local_blocks + external_blocks
+```
+
+lookup/admission 必须先 pin/touch HBM pair 与 L2 blocks，再修改 block table，
+防止查询后、执行前被淘汰。MTP 当前不进入该流程。
+
+数据动作固定为：
+
+| HBM pair | L2 bundle | L3 bundle | 计算源与动作 |
+|---|---|---|---|
+| 有 | 有/无 | 任意 | 直接复用 HBM；超出 L2 的范围在首个 forward 回填 L2 |
+| 无/较短 | 有 | 任意 | 对 HBM 未覆盖的 L2 后缀执行 `L2 -> HBM` |
+| 无 | 无 | 有 | `L3 -> L2 -> HBM` |
+| 无 | 无 | 无 | prefix 在该 block 前结束 |
+
+当 HBM pair 比 L2 更长时，L2 logical row 会先分配完整 block ID，但 worker
+durable 水位停在原 L2 边界。即使更靠后的 L3 suffix 已经写入 L2，也不能跨过
+中间 HBM-only 缺口发布 hash。
+
+### 18.2 Prefill 与 durable 补齐时序
+
+L3 suffix 在 forward 前先完整写入 L2，再恢复到 HBM。HBM-only 本地 prefix
+造成的 L2 缺口并入首个 prefix-suffix prefill forward 的既有 full-block dump
+plan：每层沿用当前 cache write 之后的同 stream D2H，把 prefix 缺口和该 chunk
+新产生的满块一起增量写入 L2。model output 返回后 scheduler 再统一推进
+ready/hash。
+
+必须满足：
+
+1. backfill source HBM 在首个 forward 完成前保持 pin，不能被 block pool 复用；
+2. 每个 chunk 新产生的 durable 满块继续增量 `HBM -> L2`；
+3. L2 component 齐备后才发布 complete-bundle ready/hash，并异步
+   `L2 -> L3`；
+4. request 释放 dense HBM、进入 `ENTER/SPARSE` 或向下游 P/D 交接前，必须
+   等待 `[0, durable_full_blocks)` 的全部 L2 backfill 完成；
+5. 已存在的 HBM pair 不重复从 L2/L3 加载；当前 pair 版本允许 full-block dump
+   覆盖 HBM-only gap 之后已经由 L3 填入的 L2 suffix，以换取单调连续水位和
+   简单正确性。逐 component/逐区间去重留给性能阶段。
+
+prefix caching 开启时，dump metadata 在 runtime 初始化期按
+`max_num_reqs * max_logical_blocks` 一次预分配，确保单 token 的首个 prefill
+forward 也能回填长历史；steady decode 仍只切片复制实际 job 数，不在热路径
+创建新空间。
+
+后续 layerwise/multi-stream 优化可以用 event 让 `L3 -> L2 -> HBM` 与 prefill
+计算部分重叠，但那是性能阶段；event 不能替代上述首个 forward 返回后的
+ready 提交边界。
+
+最终热路径因此是：
+
+```text
+lookup:   local=max(HBM pair, complete L2), then complete L3 suffix
+load:     L3 -> L2 -> HBM / L2 -> HBM（只补 HBM pair 未覆盖部分）
+prefill:  首个 chunk 的既有 dump 同步补 L2 prefix 缺口和新满块
+persist:  complete L2 bundle -> L3 async
+decode:   KSC 按 topK miss 执行 L2 -> resident HBM
+```
+
+该项原编号为 **P3-HOT（高）**，在当前执行 RoadMap 中前移为 P1，排在
+L3 数据路径阶段性收口之后，不归入低优先级远期优化。
 
 ## 19. 配置与初版支持矩阵
 

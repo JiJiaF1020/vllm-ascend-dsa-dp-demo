@@ -23,6 +23,7 @@ ENABLE_A5_PACKED_C8_DSA="false"
 ENABLE_MTP="false"
 ENABLE_L3_WRITE_BEHIND="false"
 ENABLE_L3_PREFIX_LOADBACK="false"
+ENABLE_L3_DIRECT_HBM_LOAD="false"
 MOONCAKE_CONFIG_PATH="${SCRIPT_DIR}/L3_cache_sys_api_test/baseline_e2e/configs/mooncake-dsa-tcp.json"
 MOONCAKE_GLOBAL_SEGMENT_SIZE="4GB"
 MC_TCP_ENABLE_CONNECTION_POOL="${MC_TCP_ENABLE_CONNECTION_POOL:-1}"
@@ -125,6 +126,19 @@ case "${ENABLE_L3_PREFIX_LOADBACK}" in
         ;;
 esac
 
+case "${ENABLE_L3_DIRECT_HBM_LOAD}" in
+    true)
+        echo "ENABLE_L3_DIRECT_HBM_LOAD is frozen; use L3->L2->HBM" >&2
+        exit 2
+        ;;
+    false)
+        ;;
+    *)
+        echo "ENABLE_L3_DIRECT_HBM_LOAD must be true or false, got: ${ENABLE_L3_DIRECT_HBM_LOAD}" >&2
+        exit 2
+        ;;
+esac
+
 case "${ENABLE_L3_WRITE_BEHIND}" in
     true)
         if [[ "${ENABLE_MTP}" == "true" ]]; then
@@ -155,7 +169,7 @@ case "${ENABLE_L3_WRITE_BEHIND}" in
             --shutdown-timeout
             "${DSA_L3_SHUTDOWN_TIMEOUT_SECONDS}"
             --kv-transfer-config
-            "{\"kv_connector\":\"DSAL3Connector\",\"kv_role\":\"${DSA_L3_KV_ROLE}\",\"kv_load_failure_policy\":\"fail\",\"kv_connector_extra_config\":{\"backend\":\"mooncake\",\"max_inflight_l3_store_jobs\":${DSA_L3_MAX_INFLIGHT_STORE_JOBS},\"max_active_channels\":${DSA_L3_MAX_ACTIVE_CHANNELS},\"max_descriptors_per_l3_put\":${DSA_L3_MAX_DESCRIPTORS_PER_PUT}}}"
+            "{\"kv_connector\":\"DSAL3Connector\",\"kv_role\":\"${DSA_L3_KV_ROLE}\",\"kv_load_failure_policy\":\"fail\",\"kv_connector_extra_config\":{\"backend\":\"mooncake\",\"max_inflight_l3_store_jobs\":${DSA_L3_MAX_INFLIGHT_STORE_JOBS},\"max_active_channels\":${DSA_L3_MAX_ACTIVE_CHANNELS},\"max_descriptors_per_l3_put\":${DSA_L3_MAX_DESCRIPTORS_PER_PUT},\"direct_hbm_load\":${ENABLE_L3_DIRECT_HBM_LOAD}}}"
         )
         ;;
     false)
@@ -214,6 +228,7 @@ echo "[dsa-online] mode=${RUN_MODE} model=${MODEL_PATH}"
 echo "[dsa-online] a5_packed_c8=${ENABLE_A5_PACKED_C8_DSA} mtp3=${ENABLE_MTP} safetensors=${SAFETENSORS_LOAD_STRATEGY}"
 echo "[dsa-online] l3_write_behind=${ENABLE_L3_WRITE_BEHIND} mooncake_config=${MOONCAKE_CONFIG_PATH}"
 echo "[dsa-online] l3_prefix_loadback=${ENABLE_L3_PREFIX_LOADBACK}"
+echo "[dsa-online] l3_direct_hbm_load=${ENABLE_L3_DIRECT_HBM_LOAD}"
 if [[ "${ENABLE_L3_WRITE_BEHIND}" == "true" ]]; then
     echo "[dsa-online] mooncake_tcp_connection_pool=${MC_TCP_ENABLE_CONNECTION_POOL}"
     echo "[dsa-online] mooncake_tcp_segment_port_base=${MOONCAKE_TCP_SEGMENT_PORT_BASE}"

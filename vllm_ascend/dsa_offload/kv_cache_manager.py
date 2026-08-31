@@ -11,8 +11,9 @@ component-wise 判断和生命周期分配。这样 scheduler 无论在 patch �
 
 请求阶段由 ``request_cache_layout`` 以 plan/commit 协议统一规划；本文件只把
 规划结果翻译成各 manager 的实际 block 分配、ENTER 收缩和 steady grow。
-本地 prefix hit 仍走同一分配器：查询阶段的 DRAM/MTP 候选只有在所有 HBM
-component admission 成功后才提交，target HBM block 由普通 dense plan 分配。
+本地 prefix hit 仍走同一分配器：查询阶段的 L2、成对 target HBM 与 MTP
+候选只有在所有 component admission 成功后才提交；HBM pair 可以独立于
+L2 延伸，缺失的 L2 bundle 由首个 prefill forward 的既有 dump 回填。
 MTP3 的 resident 表在 ENTER 时一次排成 ``budget + parity0 + parity1``；
 保留下来的 dense 尾块按 logical-block parity 放入固定列，之后不再换址。
 任何容量不足都必须发生在物理表修改前，不能让失败重试提前推进阶段。
@@ -110,7 +111,29 @@ def _require_initial_runtime_contract(
             f"planned_external={expected_external_tokens}"
         )
     for group_id, group_blocks in enumerate(blocks):
-        if group_id == coordinator.group_ids.mtp_full:
+        if group_id == coordinator.group_ids.indexer:
+            expected = (
+                prefix_plan.hbm_indexer_blocks
+                if prefix_plan is not None
+                else ()
+            )
+            if tuple(group_blocks) != expected:
+                raise RuntimeError(
+                    "DSA Indexer HBM prefix blocks disagree with the "
+                    "pending hit plan"
+                )
+        elif group_id == coordinator.group_ids.resident_mla:
+            expected = (
+                prefix_plan.hbm_resident_blocks
+                if prefix_plan is not None
+                else ()
+            )
+            if tuple(group_blocks) != expected:
+                raise RuntimeError(
+                    "DSA resident HBM prefix blocks disagree with the "
+                    "pending hit plan"
+                )
+        elif group_id == coordinator.group_ids.mtp_full:
             expected_mtp = (
                 prefix_plan.mtp_blocks if prefix_plan is not None else ()
             )
@@ -120,8 +143,7 @@ def _require_initial_runtime_contract(
                 )
         elif group_blocks:
             raise RuntimeError(
-                "DSA first-version target prefix hits must come from the "
-                "DRAM bundle, not HBM group blocks"
+                "DSA prefix hit contains blocks for an unknown cache group"
             )
     return blocks
 
@@ -130,7 +152,7 @@ def get_dsa_computed_blocks(
     manager: KVCacheManager,
     request: Request,
 ) -> tuple[KVCacheBlocks, int]:
-    """Request-aware DSA lookup：DRAM target 与可选 MTP HBM 求公共前缀。"""
+    """Request-aware DSA lookup：联合 target HBM/L2 与可选 MTP。"""
 
     from vllm_ascend.dsa_offload.kv_cache_coordinator import (
         DSAKVCacheCoordinator,
@@ -154,12 +176,27 @@ def get_dsa_computed_blocks(
     prefix_plan = coordinator.get_pending_prefix_hit(request.request_id)
     logger.info(
         "DSA prefix lookup: request_id=%s hit=%s "
-        "effective_tokens=%d dram_blocks=%d mtp_blocks=%d "
+        "effective_tokens=%d hbm_pair_blocks=%d l2_blocks=%d "
+        "hbm_only_blocks=%d "
+        "mtp_blocks=%d "
         "request_tokens=%d",
         request.request_id,
         bool(num_computed_tokens),
         num_computed_tokens,
+        (
+            prefix_plan.hbm_block_count
+            if prefix_plan is not None
+            else 0
+        ),
         len(prefix_plan.dram_blocks) if prefix_plan is not None else 0,
+        (
+            max(
+                prefix_plan.hbm_block_count - prefix_plan.l2_block_count,
+                0,
+            )
+            if prefix_plan is not None
+            else 0
+        ),
         len(prefix_plan.mtp_blocks) if prefix_plan is not None else 0,
         request.num_tokens,
     )
@@ -200,7 +237,7 @@ def _allocate_dense_plan(
     coordinator: DSAKVCacheCoordinator,
     request: Request,
     plan: DSARequestCachePlan,
-    empty_blocks: tuple[Sequence[KVCacheBlock], ...],
+    computed_blocks: tuple[Sequence[KVCacheBlock], ...],
     num_new_computed_tokens: int,
     num_external_computed_tokens: int,
 ) -> KVCacheBlocks | None:
@@ -211,7 +248,7 @@ def _allocate_dense_plan(
     requirements = coordinator.get_num_blocks_to_allocate_by_group(
         request_id=request.request_id,
         num_tokens=plan.indexer_tokens_need_slot,
-        new_computed_blocks=empty_blocks,
+        new_computed_blocks=computed_blocks,
         num_encoder_tokens=0,
         total_computed_tokens=(
             request.num_computed_tokens + total_prefix_tokens
@@ -234,10 +271,10 @@ def _allocate_dense_plan(
     if total_prefix_tokens:
         coordinator.allocate_new_computed_blocks(
             request_id=request.request_id,
-            new_computed_blocks=empty_blocks,
-            # DSA target 的 local/external prefix 都来自 L2，不把任何
-            # HBM hit block 交给 single-type manager；统一按已计算长度
-            # 建账，随后由 allocate_new_blocks 分配 split HBM 目的块。
+            new_computed_blocks=computed_blocks,
+            # target HBM pair 直接 touch；其余 L2/L3 prefix 按已计算
+            # 长度建账并由 allocate_new_blocks 分配 restore 目的块。
+            # 若 HBM 比 L2 更长，L2 缺口在首个 forward 中回填。
             num_local_computed_tokens=total_prefix_tokens,
             num_external_computed_tokens=0,
         )

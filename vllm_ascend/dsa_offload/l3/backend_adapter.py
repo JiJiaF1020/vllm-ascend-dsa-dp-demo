@@ -81,6 +81,24 @@ def configure_dsa_mooncake_tcp() -> None:
     )
 
 
+def validate_dsa_mooncake_direct_hbm(
+    *,
+    protocol: str,
+    direct_hbm_load: bool,
+) -> None:
+    """冻结尚未满足 A5 L1/L2/L3 完整合同的 direct-HBM。"""
+
+    if direct_hbm_load:
+        raise RuntimeError(
+            "DSA L3 direct-HBM is frozen in the current A5 multi-tier "
+            "contract. Store-owned TCP cannot write NPU pointers, while "
+            "the Ascend transport cannot yet provide the required "
+            "topology-transparent LocalDRAM path. Keep "
+            "direct_hbm_load=false and use L3->L2->HBM. "
+            f"Configured Mooncake protocol={protocol!r}."
+        )
+
+
 class DSAL3BackendAdapter:
     """把宽松 Backend API 收敛为 DSA 可判定成败的合同。"""
 
@@ -109,6 +127,7 @@ class DSAL3BackendAdapter:
         max_active_channels: int,
         max_descriptors_per_put: int,
         contribute_memory: bool = True,
+        direct_hbm_load: bool = False,
     ) -> DSAL3BackendAdapter:
         from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend import (
             MooncakeBackend,
@@ -116,6 +135,10 @@ class DSAL3BackendAdapter:
         )
 
         config = MooncakeStoreConfig.load_from_env()
+        validate_dsa_mooncake_direct_hbm(
+            protocol=config.protocol,
+            direct_hbm_load=direct_hbm_load,
+        )
         if config.protocol == "ascend":
             configure_dsa_mooncake_global_ub(max_active_channels)
         elif config.protocol == "tcp":
@@ -144,7 +167,12 @@ class DSAL3BackendAdapter:
             max_descriptors_per_put=max_descriptors_per_put,
         )
 
-    def bind_store(self, store: DSAWorkerDRAMStore) -> None:
+    def bind_store(
+        self,
+        store: DSAWorkerDRAMStore,
+        *,
+        register_hbm: bool = False,
+    ) -> None:
         if self._registered:
             raise RuntimeError("DSA L3 DRAM store was bound twice")
         indexer_bytes = store.get_l3_component_bytes_per_block(DSAL3Component.INDEXER)
@@ -168,19 +196,42 @@ class DSAL3BackendAdapter:
                 f"{self.schema.indexer_bytes_per_block},"
                 f"{self.schema.mla_bytes_per_block})"
             )
-        regions = store.get_l3_registration_regions()
+        regions = list(store.get_l3_registration_regions())
+        if register_hbm:
+            for component in DSAL3Component:
+                hbm_addresses, hbm_sizes = (
+                    store.build_l3_hbm_component_payload(
+                        component=component,
+                        physical_block_ids=(1,),
+                    )
+                )
+                hbm_bytes = sum(hbm_sizes[0])
+                expected = (
+                    self.schema.indexer_bytes_per_block
+                    if component is DSAL3Component.INDEXER
+                    else self.schema.mla_bytes_per_block
+                )
+                if hbm_bytes != expected:
+                    raise RuntimeError(
+                        "DSA direct-HBM payload disagrees with schema: "
+                        f"component={component.value}, hbm={hbm_bytes}, "
+                        f"schema={expected}, addresses={len(hbm_addresses[0])}"
+                    )
+            regions.extend(store.get_l3_hbm_registration_regions())
         self.backend.register_buffer(
             [pointer for pointer, _ in regions],
             [size for _, size in regions],
         )
-        self._registered_regions = regions
+        self._registered_regions = tuple(regions)
         self._registered = True
         logger.info(
-            "DSA L3 LocalDRAM registered: regions=%d bytes=%d indexer_planes=%d mla_planes=%d",
+            "DSA L3 buffers registered: regions=%d bytes=%d "
+            "indexer_planes=%d mla_planes=%d direct_hbm=%s",
             len(regions),
             sum(size for _, size in regions),
             indexer_planes,
             mla_planes,
+            register_hbm,
         )
 
     @staticmethod
@@ -350,19 +401,35 @@ class DSAL3BackendAdapter:
         job: DSAL3LoadJob,
         store: DSAWorkerDRAMStore,
     ) -> int:
-        """同步恢复一个请求的 L3-only suffix 到本 rank L2。"""
+        """同步恢复 L3-only suffix 到本 rank L2 或 split HBM。"""
 
         if not self._registered:
             raise RuntimeError("DSA L3 backend is not bound to its DRAM store")
-        block_ids = job.destination_l2_block_ids
-        indexer_addrs, indexer_sizes = store.build_l3_component_payload(
-            component=DSAL3Component.INDEXER,
-            physical_block_ids=block_ids,
-        )
-        mla_addrs, mla_sizes = store.build_l3_component_payload(
-            component=DSAL3Component.MLA,
-            physical_block_ids=block_ids,
-        )
+        if job.direct_hbm:
+            indexer_addrs, indexer_sizes = (
+                store.build_l3_hbm_component_payload(
+                    component=DSAL3Component.INDEXER,
+                    physical_block_ids=(
+                        job.destination_indexer_hbm_block_ids
+                    ),
+                )
+            )
+            mla_addrs, mla_sizes = store.build_l3_hbm_component_payload(
+                component=DSAL3Component.MLA,
+                physical_block_ids=(
+                    job.destination_resident_hbm_block_ids
+                ),
+            )
+        else:
+            block_ids = job.destination_l2_block_ids
+            indexer_addrs, indexer_sizes = store.build_l3_component_payload(
+                component=DSAL3Component.INDEXER,
+                physical_block_ids=block_ids,
+            )
+            mla_addrs, mla_sizes = store.build_l3_component_payload(
+                component=DSAL3Component.MLA,
+                physical_block_ids=block_ids,
+            )
         keys: list[str] = []
         addresses: list[list[int]] = []
         sizes: list[list[int]] = []
@@ -373,13 +440,14 @@ class DSAL3BackendAdapter:
         batches = self._descriptor_batches(addresses)
         logger.info(
             "DSA L3 load backend get: request=%s blocks=%d keys=%d "
-            "descriptors=%d batches=%d bytes=%d",
+            "descriptors=%d batches=%d bytes=%d destination=%s",
             job.request_id,
             len(job.blocks),
             len(keys),
             sum(len(parts) for parts in addresses),
             len(batches),
             sum(sum(parts) for parts in sizes),
+            "hbm" if job.direct_hbm else "l2",
         )
         for start, end in batches:
             with self._io_lock:

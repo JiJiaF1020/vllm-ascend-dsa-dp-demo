@@ -59,6 +59,8 @@ class DSAL3LoadBlock:
 
     logical_block_index: int
     destination_l2_block_id: int
+    destination_indexer_hbm_block_id: int
+    destination_resident_hbm_block_id: int
     block_hash: bytes
     indexer_key: str
     mla_key: str
@@ -68,6 +70,13 @@ class DSAL3LoadBlock:
             raise ValueError("DSA L3 load logical block index must be non-negative")
         if self.destination_l2_block_id <= 0:
             raise ValueError("DSA L3 load destination block ID must be positive")
+        if (
+            self.destination_indexer_hbm_block_id <= 0
+            or self.destination_resident_hbm_block_id <= 0
+        ):
+            raise ValueError(
+                "DSA L3 load HBM destination block IDs must be positive"
+            )
         if not self.block_hash:
             raise ValueError("DSA L3 load block hash cannot be empty")
         if not self.indexer_key or not self.mla_key:
@@ -80,6 +89,7 @@ class DSAL3LoadJob:
 
     request_id: str
     blocks: tuple[DSAL3LoadBlock, ...]
+    direct_hbm: bool = False
 
     def __post_init__(self) -> None:
         if not self.request_id:
@@ -101,11 +111,46 @@ class DSAL3LoadJob:
         )
         if len(set(destination_ids)) != len(destination_ids):
             raise ValueError("DSA L3 load job contains duplicate L2 destinations")
+        for name, hbm_ids in (
+            (
+                "Indexer",
+                tuple(
+                    block.destination_indexer_hbm_block_id
+                    for block in self.blocks
+                ),
+            ),
+            (
+                "resident",
+                tuple(
+                    block.destination_resident_hbm_block_id
+                    for block in self.blocks
+                ),
+            ),
+        ):
+            if len(set(hbm_ids)) != len(hbm_ids):
+                raise ValueError(
+                    f"DSA L3 load job contains duplicate {name} HBM "
+                    "destinations"
+                )
 
     @property
     def destination_l2_block_ids(self) -> tuple[int, ...]:
         return tuple(
             block.destination_l2_block_id for block in self.blocks
+        )
+
+    @property
+    def destination_indexer_hbm_block_ids(self) -> tuple[int, ...]:
+        return tuple(
+            block.destination_indexer_hbm_block_id
+            for block in self.blocks
+        )
+
+    @property
+    def destination_resident_hbm_block_ids(self) -> tuple[int, ...]:
+        return tuple(
+            block.destination_resident_hbm_block_id
+            for block in self.blocks
         )
 
 

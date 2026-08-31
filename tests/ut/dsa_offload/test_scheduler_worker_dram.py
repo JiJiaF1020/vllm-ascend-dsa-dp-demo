@@ -196,6 +196,45 @@ def test_l3_component_views_use_fixed_arena_addresses() -> None:
     ]
 
 
+def test_l3_direct_hbm_views_use_split_component_block_ids() -> None:
+    store = _make_store()
+    resident_packed = torch.empty(4, 128, 1, 656, dtype=torch.int8)
+    indexer_key = torch.empty(12, 128, 1, 128, dtype=torch.int8)
+    indexer_scale = torch.empty(12, 128, 1, 1, dtype=torch.float32)
+    store.add_packed_layer(
+        layer_id=0,
+        resident_packed_cache=resident_packed,
+        indexer_cache=(indexer_key, indexer_scale),
+    )
+
+    regions = store.get_l3_hbm_registration_regions()
+    assert len(regions) == 3
+    indexer_addresses, indexer_sizes = (
+        store.build_l3_hbm_component_payload(
+            component=DSAL3Component.INDEXER,
+            physical_block_ids=(2, 5),
+        )
+    )
+    mla_addresses, mla_sizes = store.build_l3_hbm_component_payload(
+        component=DSAL3Component.MLA,
+        physical_block_ids=(1, 3),
+    )
+    arenas = store.get_layer_arenas(0)
+
+    assert indexer_sizes == [[128 * 128, 128 * 4]] * 2
+    assert indexer_addresses[0] == [
+        int(plane[2].data_ptr()) for plane in arenas.indexer_source_bytes
+    ]
+    assert indexer_addresses[1] == [
+        int(plane[5].data_ptr()) for plane in arenas.indexer_source_bytes
+    ]
+    assert mla_sizes == [[128 * 656]] * 2
+    assert mla_addresses == [
+        [int(arenas.resident_source_bytes[0][1].data_ptr())],
+        [int(arenas.resident_source_bytes[0][3].data_ptr())],
+    ]
+
+
 
 def test_scheduler_directory_assigns_once_and_reclaims_request() -> None:
     directory = DSASchedulerDRAMBlockDirectory(

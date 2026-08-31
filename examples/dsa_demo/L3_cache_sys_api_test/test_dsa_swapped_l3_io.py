@@ -9,11 +9,12 @@ logical GLM-5.2 A5 block is represented by the real byte-level schema:
   FP32-scale plane;
 * 78 packed MLA layers, each with 128 * 656 bytes.
 
-The probe allocates every source and destination plane with
-``torch_npu.empty_with_swapped_memory``, registers ordinary HBM first and the
-swapped arenas second, stores the two logical components, loads them back, and
-checks every byte. Mooncake is the primary path; MemCache uses the same schema
-as a fallback backend.
+The probe always allocates source planes with
+``torch_npu.empty_with_swapped_memory``. Destination planes can use swapped
+memory or ordinary HBM, allowing an isolated L2->L3->L1 direct-load gate.
+It registers ordinary HBM first and swapped arenas second, stores the two
+logical components, loads them back, and checks every byte. Mooncake is the
+primary path; MemCache uses the same schema as a fallback backend.
 """
 
 from __future__ import annotations
@@ -209,6 +210,7 @@ def _allocate_schema_buffers(
     device: Any,
     arena_blocks: int,
     block_index: int,
+    destination_memory: str,
 ) -> list[PlaneBuffers]:
     buffers: list[PlaneBuffers] = []
     for spec in specs:
@@ -217,10 +219,18 @@ def _allocate_schema_buffers(
             dtype=torch.int8,
             device=device,
         )
-        destination = torch_npu.empty_with_swapped_memory(
-            (arena_blocks, spec.num_bytes),
-            dtype=torch.int8,
-            device=device,
+        destination = (
+            torch_npu.empty_with_swapped_memory(
+                (arena_blocks, spec.num_bytes),
+                dtype=torch.int8,
+                device=device,
+            )
+            if destination_memory == "swapped"
+            else torch.empty(
+                (arena_blocks, spec.num_bytes),
+                dtype=torch.int8,
+                device=device,
+            )
         )
         source.zero_()
         destination.zero_()
@@ -520,6 +530,11 @@ def main() -> int:
     parser.add_argument("--backend", choices=("mooncake", "memcache"), default="mooncake")
     parser.add_argument("--component", choices=("all", "indexer", "mla"), default="all")
     parser.add_argument("--schema-mode", choices=("smoke", "exact"), default="exact")
+    parser.add_argument(
+        "--destination-memory",
+        choices=("swapped", "hbm"),
+        default="swapped",
+    )
     parser.add_argument("--device-id", type=int, default=0)
     parser.add_argument("--visible-devices", default=os.getenv("ASCEND_RT_VISIBLE_DEVICES", "0"))
     parser.add_argument("--local-host", default="127.0.0.1")
@@ -578,6 +593,7 @@ def main() -> int:
         device,
         args.arena_blocks,
         args.block_index,
+        args.destination_memory,
     )
     hbm_sentinels = [
         torch.arange(4096, dtype=torch.int32, device=device).remainder(127).to(torch.int8),
@@ -596,6 +612,7 @@ def main() -> int:
         "[dsa-swapped-l3] schema "
         f"backend={args.backend} device={args.device_id} "
         f"component={args.component} schema_mode={args.schema_mode} "
+        f"destination_memory={args.destination_memory} "
         f"arena_blocks={args.arena_blocks} block_index={args.block_index} "
         f"planes={component_counts} bytes={component_bytes} "
         f"total_bytes={sum(component_bytes.values())}",

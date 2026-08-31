@@ -59,11 +59,23 @@ class DSAL3Connector(KVConnectorBase_V1, SupportsHMA):
         max_descriptors_per_put = int(
             extra.get("max_descriptors_per_l3_put", 128)
         )
+        direct_hbm_load = extra.get("direct_hbm_load", False)
+        if not isinstance(direct_hbm_load, bool):
+            raise TypeError(
+                "DSA direct_hbm_load must be a JSON boolean, got "
+                f"{direct_hbm_load!r}"
+            )
+        if direct_hbm_load:
+            raise ValueError(
+                "DSA direct_hbm_load is frozen; use L3->L2->HBM"
+            )
+        self.direct_hbm_load = direct_hbm_load
         self.scheduler_handler: DSAL3StoreScheduler | None = None
         self.worker_handler: DSAL3StoreWorker | None = None
         if role == KVConnectorRole.SCHEDULER:
             logger.info(
-                "DSA prefix tiers: target_hbm=disabled local_l2=%s l3=%s",
+                "DSA prefix tiers: target_hbm=%s local_l2=%s l3=%s",
+                bool(vllm_config.cache_config.enable_prefix_caching),
                 bool(vllm_config.cache_config.enable_prefix_caching),
                 self.enable_load,
             )
@@ -76,6 +88,7 @@ class DSAL3Connector(KVConnectorBase_V1, SupportsHMA):
                         max_descriptors_per_put
                     ),
                     contribute_memory=False,
+                    direct_hbm_load=self.direct_hbm_load,
                 )
                 if self.enable_load
                 else None
@@ -85,6 +98,7 @@ class DSAL3Connector(KVConnectorBase_V1, SupportsHMA):
                 max_inflight_jobs=max_inflight,
                 lookup_backend=lookup_backend,
                 enable_load=self.enable_load,
+                direct_hbm_load=self.direct_hbm_load,
             )
         elif role == KVConnectorRole.WORKER:
             tp_rank = get_tensor_model_parallel_rank()
@@ -96,14 +110,16 @@ class DSAL3Connector(KVConnectorBase_V1, SupportsHMA):
                 schema=schema,
                 max_active_channels=max_active_channels,
                 max_descriptors_per_put=max_descriptors_per_put,
+                direct_hbm_load=self.direct_hbm_load,
             )
             logger.info(
                 "DSA L3 worker backend active: tp_rank=%d "
                 "contributes_segment=True store_producer=%s "
-                "load_consumer=%s",
+                "load_consumer=%s direct_hbm=%s",
                 tp_rank,
                 self.enable_store and tp_rank == 0,
                 self.enable_load,
+                self.direct_hbm_load,
             )
             self.worker_handler = DSAL3StoreWorker(
                 tp_rank=tp_rank,
@@ -111,6 +127,7 @@ class DSAL3Connector(KVConnectorBase_V1, SupportsHMA):
                 backend=backend,
                 max_inflight_jobs=max_inflight,
                 enable_load=self.enable_load,
+                direct_hbm_load=self.direct_hbm_load,
             )
 
     def bind_dsa_coordinator(self, coordinator: Any) -> None:

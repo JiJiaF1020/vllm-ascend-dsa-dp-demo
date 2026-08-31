@@ -30,6 +30,7 @@ from vllm_ascend.dsa_offload.l3.backend_adapter import (
     DSAL3BackendAdapter,
     configure_dsa_mooncake_global_ub,
     configure_dsa_mooncake_tcp,
+    validate_dsa_mooncake_direct_hbm,
 )
 from vllm_ascend.dsa_offload.l3.connector import DSAL3Connector
 from vllm_ascend.dsa_offload.l3.metadata import (
@@ -75,6 +76,20 @@ def test_mooncake_probe_supports_independent_producer_and_consumer() -> None:
         producer_rank=1,
         consumer_rank=0,
     ) == (True, False, 1)
+
+
+@pytest.mark.parametrize("protocol", ["tcp", "ascend"])
+def test_direct_hbm_is_frozen_before_io(protocol: str) -> None:
+    with pytest.raises(RuntimeError, match="is frozen"):
+        validate_dsa_mooncake_direct_hbm(
+            protocol=protocol,
+            direct_hbm_load=True,
+        )
+
+    validate_dsa_mooncake_direct_hbm(
+        protocol=protocol,
+        direct_hbm_load=False,
+    )
 
 
 def _cpu_arena(
@@ -162,6 +177,7 @@ def _make_load_job(
     block_ids: tuple[int, ...] = (1,),
     *,
     logical_start: int = 0,
+    direct_hbm: bool = False,
 ) -> DSAL3LoadJob:
     schema = _make_schema()
     blocks = []
@@ -172,12 +188,18 @@ def _make_load_job(
             DSAL3LoadBlock(
                 logical_block_index=logical_start + offset,
                 destination_l2_block_id=block_id,
+                destination_indexer_hbm_block_id=block_id,
+                destination_resident_hbm_block_id=block_id,
                 block_hash=block_hash,
                 indexer_key=indexer_key,
                 mla_key=mla_key,
             )
         )
-    return DSAL3LoadJob(request_id="load-req", blocks=tuple(blocks))
+    return DSAL3LoadJob(
+        request_id="load-req",
+        blocks=tuple(blocks),
+        direct_hbm=direct_hbm,
+    )
 
 
 def test_l3_connector_metadata_is_pickle_safe() -> None:
@@ -387,6 +409,7 @@ class _FakeBackend:
         self.put_args: tuple[Any, Any, Any] | None = None
         self.put_calls: list[tuple[Any, Any, Any]] = []
         self.get_calls: list[tuple[Any, Any, Any]] = []
+        self.exists_calls: list[list[str]] = []
         self.get_result: list[int] | None = None
         self.closed = False
         self.existing: list[int] | None = None
@@ -400,6 +423,7 @@ class _FakeBackend:
         return self.result
 
     def exists(self, keys):
+        self.exists_calls.append(list(keys))
         return self.existing or [0] * len(keys)
 
     def get(self, keys, addresses, sizes):
@@ -426,6 +450,34 @@ def test_backend_adapter_registers_and_puts_both_components() -> None:
     assert backend.put_args is not None
     assert len(backend.put_args[0]) == 2
     assert transferred == 128 * 128 + 128 * 4 + 128 * 656
+
+
+def test_backend_adapter_direct_load_targets_split_hbm_views() -> None:
+    store = _make_store()
+    backend = _FakeBackend()
+    adapter = DSAL3BackendAdapter(backend=backend, schema=_make_schema())
+    adapter.bind_store(store, register_hbm=True)
+
+    transferred = adapter.get_load_job(
+        job=_make_load_job((1, 2), direct_hbm=True),
+        store=store,
+    )
+
+    assert backend.registered is not None
+    assert len(backend.registered[0]) == 6
+    assert len(backend.get_calls) == 1
+    keys, addresses, sizes = backend.get_calls[0]
+    assert len(keys) == 4
+    arenas = store.get_layer_arenas(0)
+    assert addresses[0] == [
+        int(plane[1].data_ptr()) for plane in arenas.indexer_source_bytes
+    ]
+    assert addresses[1] == [
+        int(arenas.resident_source_bytes[0][1].data_ptr())
+    ]
+    assert sizes[0] == [128 * 128, 128 * 4]
+    assert sizes[1] == [128 * 656]
+    assert transferred == 2 * (128 * 128 + 128 * 4 + 128 * 656)
 
 
 def test_backend_adapter_rejects_missing_per_key_result() -> None:
@@ -719,6 +771,8 @@ def test_scheduler_queries_l3_suffix_and_builds_load_metadata() -> None:
             logical_block_start=1,
             block_hashes=(b"hash-1", b"hash-2"),
             destination_dram_block_ids=(2, 3),
+            destination_indexer_hbm_block_ids=(12, 13),
+            destination_resident_hbm_block_ids=(22, 23),
         )
     )
     scheduler = DSAL3StoreScheduler(
@@ -748,9 +802,115 @@ def test_scheduler_queries_l3_suffix_and_builds_load_metadata() -> None:
     assert len(metadata.load_jobs) == 1
     assert metadata.load_jobs[0].request_id == "req"
     assert metadata.load_jobs[0].destination_l2_block_ids == (2, 3)
+    assert metadata.load_jobs[0].destination_indexer_hbm_block_ids == (
+        12,
+        13,
+    )
+    assert metadata.load_jobs[0].destination_resident_hbm_block_ids == (
+        22,
+        23,
+    )
+    assert not metadata.load_jobs[0].direct_hbm
     assert not scheduler.build_connector_meta().load_jobs
     scheduler.shutdown()
     assert backend.closed
+
+
+@pytest.mark.parametrize(
+    ("existing", "expected_external_blocks"),
+    [
+        ([0, 0, 1, 1], 0),
+        ([1, 1, 1, 1], 2),
+    ],
+)
+def test_scheduler_l3_lookup_skips_l1_overlap(
+    existing: list[int],
+    expected_external_blocks: int,
+) -> None:
+    schema = _make_schema()
+    backend = _FakeBackend()
+    backend.existing = existing
+    adapter = DSAL3BackendAdapter(backend=backend, schema=schema)
+    observed: list[tuple[int, int]] = []
+
+    def prepare_external(
+        request,
+        *,
+        local_computed_tokens,
+        external_block_count,
+    ) -> int:
+        del request
+        observed.append((local_computed_tokens, external_block_count))
+        return external_block_count * 128
+
+    coordinator = SimpleNamespace(
+        dram_directory=SimpleNamespace(usable_blocks=8),
+        prepare_external_prefix_cache_hit=prepare_external,
+    )
+    scheduler = DSAL3StoreScheduler(
+        schema,
+        max_inflight_jobs=2,
+        lookup_backend=adapter,
+        enable_load=True,
+    )
+    scheduler.bind_coordinator(coordinator)
+    hashes = [BlockHash(f"hash-{index}".encode()) for index in range(5)]
+    request = SimpleNamespace(
+        request_id="req",
+        num_tokens=5 * 128 + 1,
+        block_hashes=hashes,
+        skip_reading_prefix_cache=False,
+    )
+
+    external_tokens = scheduler.lookup_external_prefix(
+        request,
+        3 * 128,
+    )
+
+    expected_keys = [
+        key
+        for block_hash in hashes[3:]
+        for key in schema.block_keys(bytes(block_hash))
+    ]
+    assert backend.exists_calls == [expected_keys]
+    assert observed == [(3 * 128, expected_external_blocks)]
+    assert external_tokens == expected_external_blocks * 128
+    scheduler.shutdown()
+
+
+def test_scheduler_builds_direct_hbm_load_metadata() -> None:
+    coordinator = SimpleNamespace(
+        dram_directory=SimpleNamespace(usable_blocks=8),
+        set_l3_direct_hbm_load_enabled=lambda enabled: None,
+        take_external_prefix_load_plan=lambda request_id: SimpleNamespace(
+            request_id=request_id,
+            logical_block_start=0,
+            block_hashes=(b"hash",),
+            destination_dram_block_ids=(2,),
+            destination_indexer_hbm_block_ids=(12,),
+            destination_resident_hbm_block_ids=(22,),
+        ),
+    )
+    scheduler = DSAL3StoreScheduler(
+        _make_schema(),
+        max_inflight_jobs=2,
+        lookup_backend=DSAL3BackendAdapter(
+            backend=_FakeBackend(),
+            schema=_make_schema(),
+        ),
+        enable_load=True,
+        direct_hbm_load=True,
+    )
+    scheduler.bind_coordinator(coordinator)
+
+    scheduler.stage_external_load("req", 128)
+    job = scheduler.build_connector_meta().load_jobs[0]
+
+    assert job.direct_hbm
+    assert job.destination_l2_block_ids == (2,)
+    assert job.destination_indexer_hbm_block_ids == (12,)
+    assert job.destination_resident_hbm_block_ids == (22,)
+    scheduler.shutdown()
 
 
 class _FakeEvent:
@@ -833,6 +993,33 @@ def test_nonproducer_load_worker_registers_and_restores_local_l2() -> None:
 
     assert backend.registered is not None
     assert len(backend.get_calls) == 1
+    assert worker._load_jobs == 1
+    assert worker._load_blocks == 2
+    worker.shutdown()
+
+
+def test_nonproducer_direct_load_worker_registers_hbm() -> None:
+    store = _make_store()
+    backend = _FakeBackend()
+    adapter = DSAL3BackendAdapter(backend=backend, schema=_make_schema())
+    worker = DSAL3StoreWorker(
+        tp_rank=1,
+        device=torch.device("cpu"),
+        backend=adapter,
+        max_inflight_jobs=2,
+        enable_load=True,
+        direct_hbm_load=True,
+        event_factory=_FakeEvent,
+    )
+    metadata = DSAL3ConnectorMetadata(
+        load_jobs=(_make_load_job((1, 2), direct_hbm=True),),
+    )
+
+    worker.bind_store(store)
+    worker.prepare_step(metadata)
+
+    assert backend.registered is not None
+    assert len(backend.registered[0]) == 6
     assert worker._load_jobs == 1
     assert worker._load_blocks == 2
     worker.shutdown()
@@ -1007,6 +1194,43 @@ def test_scheduler_connector_uses_noncontributing_lookup_client(
     assert connector.scheduler_handler.enable_load
     connector.shutdown()
     assert backend.closed
+
+
+def test_scheduler_connector_rejects_frozen_direct_hbm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=True),
+        kv_transfer_config=SimpleNamespace(
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "backend": "mooncake",
+                "direct_hbm_load": True,
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        DSAL3KeySchema,
+        "from_config",
+        classmethod(
+            lambda _cls, _vllm_config, _kv_cache_config: _make_schema()
+        ),
+    )
+    monkeypatch.setattr(
+        DSAL3BackendAdapter,
+        "create_mooncake",
+        classmethod(
+            lambda _cls, **_kwargs: pytest.fail(
+                "frozen direct-HBM must fail before backend creation"
+            )
+        ),
+    )
+    with pytest.raises(ValueError, match="is frozen"):
+        DSAL3Connector(
+            config,
+            KVConnectorRole.SCHEDULER,
+            SimpleNamespace(),
+        )
 
 
 class _FakeTransferEngine:

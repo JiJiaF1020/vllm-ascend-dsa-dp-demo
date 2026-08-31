@@ -95,10 +95,49 @@ def test_projection_rejects_dram_assignment_for_unscheduled_request() -> None:
 
 
 def test_projection_rejects_restore_with_mismatched_plane_lengths() -> None:
-    with pytest.raises(ValueError, match="matching positive length"):
+    with pytest.raises(ValueError, match="matching length"):
         DSADRAMBlockRestore(
             request_id="req",
             source_dram_block_ids=(1, 2),
             destination_indexer_block_ids=(3,),
             destination_resident_block_ids=(4, 5),
+        )
+
+
+def test_restore_allows_ready_watermark_without_copy_columns() -> None:
+    restore = DSADRAMBlockRestore(
+        request_id="req",
+        source_dram_block_ids=(),
+        destination_indexer_block_ids=(),
+        destination_resident_block_ids=(),
+        logical_block_start=2,
+        ready_block_count=2,
+    )
+
+    assert restore.logical_block_start == 2
+    assert restore.ready_block_count == 2
+
+
+def test_restore_allows_copy_beyond_contiguous_ready_watermark() -> None:
+    restore = DSADRAMBlockRestore(
+        request_id="req",
+        source_dram_block_ids=(1,),
+        destination_indexer_block_ids=(2,),
+        destination_resident_block_ids=(3,),
+        logical_block_start=2,
+        ready_block_count=0,
+    )
+
+    assert restore.logical_block_start == 2
+    assert restore.ready_block_count == 0
+
+
+def test_restore_rejects_negative_ready_watermark() -> None:
+    with pytest.raises(ValueError, match="non-negative"):
+        DSADRAMBlockRestore(
+            request_id="req",
+            source_dram_block_ids=(),
+            destination_indexer_block_ids=(),
+            destination_resident_block_ids=(),
+            ready_block_count=-1,
         )

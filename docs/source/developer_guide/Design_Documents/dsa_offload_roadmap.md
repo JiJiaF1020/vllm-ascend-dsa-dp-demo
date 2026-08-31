@@ -1,9 +1,9 @@
 # DSA 稀疏卸载后续开发 RoadMap
 
-> - 最后更新：2026-08-31
+> - 最后更新：2026-09-01
 > - 基线：vLLM-Ascend v0.23.0 `5cb98caa`
-> - 当前实现：DSA custom `1ca9bdaa`
-> - 当前阶段：原“妥协版 MTP 后续 RoadMap”第 3 项中后段
+> - 当前实现基点：DSA custom `4c979ffd`
+> - 当前阶段：P1-HOT 妥协版开发完成，等待成对 HBM-only backfill 上板
 
 ## 1. 文档定位
 
@@ -28,7 +28,7 @@
 | LocalDRAM prefix cache | 第一版完成 | complete bundle 最长连续命中与分平面 restore |
 | L2→L3 write-behind | P1-W 完成 | TP0 异步 put、reuse fence、shutdown drain |
 | L3→L2→HBM loadback | P1-R 完成首版 | no-MTP、Mooncake、同步 all-rank get、fail-fast |
-| HBM target prefix | 未开始 | 当前 DSA 拦截 target HBM hit |
+| HBM target prefix | P1-HOT 妥协版待上板 | HBM pair 可越过 L2；L3 固定经 L2；首 chunk 补 L2 gap |
 | MTP 多级 prefix | 未开始 | L3 当前显式拒绝 MTP |
 | preemption/resume | 未开始 | scheduler 当前显式失败 |
 | P/D 分离 | 未开始 | 等待 tier/source 与恢复合同稳定 |
@@ -38,9 +38,12 @@
 ## 3. P0：L3 P2 稳态关闭
 
 该阶段不扩展数据格式，目标是证明 P1-W/P1-R 在在线服务生命周期中稳定。
-统一验收入口已经落到
-`examples/dsa_demo/online_l2_l3_closeout_test.py`，当前等待 A5 TP8
-eager/graph 实测关闭本阶段。
+统一验收入口位于 `examples/dsa_demo/online_l2_l3_closeout_test.py`。
+A5 TP8 graph 已完成串行 Local-L2/L3、L3/L3 与三轮混合 `bsz=4`
+continuous batching：串行跨介质分叉均能由同介质相同签名复现，并发差异在
+Local-L2 自对照中已经广泛存在，没有形成 L3 独有错误证据。按项目进度将
+L3 数据路径阶段性收口；graph token 确定性、eager 严格回归、FD 长稳和
+external namespace 物理 GC 保留为独立遗留，不作为 P1-HOT 阻塞项。
 
 ### 工作项
 
@@ -68,24 +71,56 @@ eager/graph 实测关闭本阶段。
 
 这是完成 P0 后的默认下一功能优先级。
 
+当前妥协版先实现完整 HBM pair：无 MTP 时，Indexer 与 dense MLA 同时命中的
+公共前缀直接成为请求 block table 前段，并允许比 L2 complete bundle 更长。
+L3 仍统一经 L2 恢复，不引入 direct-HBM 或独立 component mask。
+
+当前准确分层关系是：
+
+```text
+local_l2_blocks = complete L2 prefix
+hbm_pair_blocks = min(HBM Indexer, HBM dense MLA)
+local_blocks = max(local_l2_blocks, hbm_pair_blocks)
+external_l3_blocks = local_blocks 之后的连续 L3 suffix
+
+[0, hbm_pair)                  直接复用 HBM pair
+[hbm_pair, local_l2)           L2 -> HBM restore（若 L2 更长）
+[local_l2, hbm_pair)           首个 prefill forward 执行 HBM -> L2 backfill
+[local_blocks, local_blocks+L3) L3 -> L2 -> HBM
+```
+
+当 HBM pair 越过 L2 时，scheduler 先为缺口分配 L2 physical IDs，但 ready
+水位停留在原 L2 边界。即使更靠后的 L3 suffix 已写入 L2，也不能越过中间
+缺口发布 hash；首个 prefill forward 的既有 full-block dump 会把缺口、新满块
+以及必要的连续后缀一起物化，worker 成功返回后才统一推进 ready。
+
+本阶段不可放松的最终不变量：请求释放任何 dense MLA block 或进入
+`ENTER/SPARSE` decode 前，L2 ready 前缀必须覆盖请求全部
+`durable_full_blocks`，且每个逻辑块同时包含完整 Indexer+MLA payload。HBM
+命中只减少 restore，不能代替 durable backing；当前 HBM-only 命中必须先
+完成 backfill，再推进 ready 水位和释放 HBM。
+
+当前退出门禁以完整 HBM pair 为准，不要求 Indexer-only/MLA-only 去重。
+逐 block/component source mask、L3 direct-HBM 与 layerwise async 统一后移到
+性能/研究阶段，不能阻塞 MTP 多级 prefix、preemption 和 P/D 主线。
+
 ### 工作项
 
 1. 为 resident HBM block 建立 `dense-context`、`sparse-budget`、`tail`
    角色，只有 dense-context MLA 可参与 prefix hash；
 2. Indexer HBM 始终保留完整上下文语义，但 lookup 后必须通过 refcount/pin
    防止 admission 前被重分配；
-3. scheduler 按 logical block/component 生成 HBM、L2、L3 source mask；
-4. Indexer 与 MLA 独立选择最热副本，再取请求可执行的公共连续前缀；
-5. HBM-only hit 在需要 durable backing 时回填 L2，已有 L2 component 不重复
-   dump；
-6. worker 使用独立 restore mask，避免已在 HBM 的 component 被再次加载；
-7. eager/graph 继续共用同一 projection、HBM block table 与 runtime owner。
+3. scheduler 独立查询 HBM pair 与 L2 complete bundle，并以较长者作为本地
+   effective prefix；
+4. L3 从 effective prefix 后查询，并固定执行 `L3 -> L2 -> HBM`；
+5. HBM-only hit 通过首个 forward 回填 L2，ready/hash 只在 worker 成功后推进；
+6. eager/graph 继续共用同一 projection、HBM block table 与 runtime owner。
 
 ### 退出门禁
 
-- HBM complete hit、Indexer-only hit、MLA-only hit、L2 suffix、L3 suffix；
+- HBM complete hit、HBM>L2、L2>HBM、HBM-only+L3 suffix；
 - HBM block 在 lookup/admission 事务内不被复用；
-- HBM→L2 backfill 不重复发布 hash 或覆盖 in-flight L3 source；
+- HBM→L2 backfill 不提前发布 hash，L3 suffix 不跨越未 ready 缺口；
 - 同一 prompt 在 tier 组合变化后 component bytes 与最终输出满足既有门禁；
 - 无命中 steady decode 不增加逐层 Python 或 tensor 分配。
 

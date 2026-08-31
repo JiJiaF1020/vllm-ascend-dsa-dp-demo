@@ -67,7 +67,9 @@ DSA 稀疏卸载最终目标是在长上下文 decode 中实现：
 - `DSAL3Connector` 的 Mooncake Store-owned TCP：TP0 异步上传完整 L2
   Indexer/MLA component、physical-id reuse fence、完成回报与 shutdown drain；
 - L2 命中后的 L3 连续 suffix lookup、联合 HBM/L2 admission、all-rank
-  `L3 -> L2` 同步恢复、TP success consensus 和既有 `L2 -> HBM` restore。
+  `L3 -> L2` 同步恢复、TP success consensus 和既有 `L2 -> HBM` restore；
+- no-MTP 下成对 HBM Indexer+dense-MLA prefix 独立参与本地最长命中，允许
+  越过 L2 complete bundle，并在首个 prefill forward 中补齐 L2 gap。
 
 正式版基线同时提供并由 DSA 原样继承：
 
@@ -80,8 +82,7 @@ DSA 稀疏卸载最终目标是在长上下文 decode 中实现：
 
 当前尚未完成：
 
-- HBM Indexer/dense-MLA 热副本参与 prefix lookup，以及 component-wise
-  `HBM > L2 > L3` source plan 和 HBM-only hit 的 L2 backfill/去重；
+- Indexer-only/MLA-only 的 component-wise source mask 与精细 IO 去重；
 - L3 在线 continuous batching/FD/连接长稳、统一 load/store drain、
   layerwise async load、HBM 直通、MTP/DP/非 Mooncake backend；
 - prefill/decode mixed、preemption/resume、P/D 分离、非 MTP speculative
@@ -101,9 +102,10 @@ baseline/DSA 首 token 对照；由于该组测试只生成一个 token，它尚
 
 ### 2.1 妥协版 MTP 后续 RoadMap 位置
 
-当前实现严格位于原 RoadMap 第 3 项中后段：scheduler-owned DRAM 和完整
-Indexer+MLA 本地 prefix 已完成，L2/L3 第一版读写闭环已经打通，但 HBM 热层
-协同和 P2 长稳尚未关闭，不能直接把项目状态描述成已经进入 P/D 分离。
+当前实现已将 L3 数据路径阶段性收口并进入 HBM 热层 P1-HOT：scheduler-owned
+DRAM、完整 Indexer+MLA 本地 prefix 和 L2/L3 第一版读写闭环已经打通；
+graph token 确定性与 L3 长稳作为遗留继续跟踪，不能直接把项目状态描述成
+已经进入 P/D 分离。
 
 | RoadMap 工作项 | 当前状态 |
 |---|---|
@@ -111,17 +113,17 @@ Indexer+MLA 本地 prefix 已完成，L2/L3 第一版读写闭环已经打通，
 | 完整 Indexer+MLA bundle、block hash 与 LocalDRAM prefix | 第一版已完成并上板 |
 | L2→L3 异步 write-behind | P1-W 已完成并初验 |
 | L3→L2→HBM prefix loadback | P1-R 同步版已完成并初验 |
-| HBM target prefix 与 L2/L3 component-wise source | 未实现，下一项默认优先级 |
+| HBM target prefix 与 L2/L3 component-wise source | 妥协版 pair 已开发；HBM 可越过 L2，L3 固定经 L2，待上板 |
 | MTP 多级 prefix | 未实现；L3 当前显式拒绝 MTP |
 | preemption/resume | 未实现，scheduler 显式失败 |
 | P/D 分离 | 未开始 |
 | 理想版动态 MTP | 未开始；当前固定 MTP3 可用 |
 | MTP proposer graph | 未实现；target uniform Q=4 FULL graph 已完成 |
 
-默认推进顺序为：先关闭 L3 P1-R 长稳尾项，再实现 HBM target prefix、
-component source mask 与 L2 backfill/去重；随后依次处理 MTP 多级 prefix、
-preemption/resume 和 P/D 分离。L3 layerwise/direct 与理想版 MTP 属于性能或
-高风险扩展，不应先于上述正确性合同。详细阶段门禁见
+默认推进顺序为：先上板收口成对 HBM target prefix 与 L2 backfill，随后依次
+处理 MTP 多级 prefix、preemption/resume 和 P/D 分离。独立 component source
+mask、L3 layerwise/direct 与理想版 MTP 属于性能或高风险扩展，不应阻塞上述
+主线。详细阶段门禁见
 {doc}`dsa_offload_roadmap`。
 
 ## 3. 当前总体架构
@@ -1014,6 +1016,9 @@ TCP 首版显式采用 `L3 -> L2 -> HBM`。这样对齐 LMCache 的固定 L2 reg
 KSC/prefix reuse 使用的完整 L2 bundle。外部 IO、L2 restore 都位于 model
 forward / graph replay 之前，eager 与 graph 继续消费同一份最终 HBM block table
 和 DSA metadata。
+该路径是当前 P1-R/P1-HOT 的正式妥协版数据面。HBM pair 可以覆盖本地 L2
+缺口，但所有 L3 suffix 仍先落 L2；请求释放 dense HBM 或进入 sparse decode
+前必须提交完整 L2 ready 不变量。direct-HBM 仅保留为后续研究项。
 chunked prefill 也沿用同一流程：首个有 external hit 的 chunk 完成恢复，后续 chunk
 继续按当前 durable watermark 增量 dump。
 
@@ -1055,9 +1060,9 @@ L2 -> L3 使用异步 write-behind，而不是当前 AscendStore 非 layerwise �
 4. worker 返回明确完成状态后清理 reuse fence 并标记 remote-ready；
 5. put 失败只损失 L3 副本，不破坏本地 L2；失败 key 不得对 lookup 可见。
 
-如果 `empty_with_swapped_memory` arena 不能被 A5 `global_ub_device` 直接注册为
-Mooncake 源地址，则使用初始化期预分配的固定 staging ring；不能在 forward 热
-路径临时创建 tensor，也不能在未获得完成回报前复用 staging slot。
+当前 A5 使用 Store-owned TCP 连接 Mooncake，完整 L2 arena 直接作为 Host
+source/destination；不引入 staging ring。AscendDirect/global_ub 与
+direct-HBM 仅保留为后续研究，不属于当前部署合同。
 
 当前阶段：
 
@@ -1067,10 +1072,11 @@ Mooncake 源地址，则使用初始化期预分配的固定 staging ring；不�
    reuse fence、完成聚合、去重、失败处理和 shutdown drain；
 3. **P1-R 同步只读：完成首版**。`L2 local hit + Mooncake suffix -> all-rank
    L2 -> HBM -> forward` 已接入，保持 `kv_load_failure_policy=fail`；
-4. **P2 稳态关闭：进行中**。补在线 continuous batching、FD/连接长稳、
-   request/physical-id reuse 和 load/store completion 联合 drain；
-5. **P3-HOT 层级优化：未开始**。加入 component-wise `HBM > L2 > L3`
-   source plan、dense MLA block role、L2 backfill/去重和独立 restore mask；
+4. **P2 稳态关闭：阶段性完成**。在线 continuous batching 已覆盖；graph
+   确定性、FD 长稳和 external namespace GC 作为独立遗留继续跟踪；
+5. **P1-HOT 妥协版：代码完成，待上板**。完整 HBM Indexer+MLA pair 可独立
+   于 L2 命中并作为本地最长前缀；L3 suffix 固定 `L3 -> L2 -> HBM`，HBM-only
+   L2 gap 由首个 chunk 的既有 dump 补齐，worker 返回后才推进 ready/hash；
 6. MTP L3、preemption/resume、P/D、跨节点 TP 和 L3 eviction event 均在上述
    正确性闭环后单独开放，当前配置继续显式拒绝。
 

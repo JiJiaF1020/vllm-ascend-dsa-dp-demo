@@ -390,6 +390,38 @@ class DSAWorkerDRAMStore:
                 )
         return tuple(planes)
 
+    def _l3_hbm_component_planes(
+        self,
+        component: DSAL3Component | str,
+    ) -> tuple[torch.Tensor, ...]:
+        """按 L3 schema 顺序返回 split HBM component byte views。"""
+
+        component = DSAL3Component(component)
+        planes: list[torch.Tensor] = []
+        for layer_id in sorted(self._layer_arenas):
+            arenas = self._layer_arenas[layer_id]
+            if component is DSAL3Component.INDEXER:
+                planes.extend(arenas.indexer_source_bytes)
+            else:
+                planes.extend(arenas.resident_source_bytes)
+        if not planes:
+            raise RuntimeError(
+                f"DSA L3 component {component.value!r} has no HBM planes"
+            )
+        for plane in planes:
+            if (
+                plane.dtype != torch.int8
+                or plane.ndim != 2
+                or int(plane.shape[0]) <= 1
+                or not plane.is_contiguous()
+            ):
+                raise RuntimeError(
+                    "DSA L3 direct-HBM requires contiguous [blocks, bytes] "
+                    f"int8 views, got shape={tuple(plane.shape)}, "
+                    f"dtype={plane.dtype}, contiguous={plane.is_contiguous()}"
+                )
+        return tuple(planes)
+
     def get_l3_registration_regions(self) -> tuple[tuple[int, int], ...]:
         """返回初始化期需向 L3 backend 增量注册的完整 arena 区间。"""
 
@@ -404,6 +436,28 @@ class DSAWorkerDRAMStore:
                 seen_ptrs.add(pointer)
                 regions.append((pointer, size))
         return tuple(regions)
+
+    def get_l3_hbm_registration_regions(
+        self,
+    ) -> tuple[tuple[int, int], ...]:
+        """返回 direct-HBM load 需要注册的底层 storage 区间。"""
+
+        region_sizes: dict[int, int] = {}
+        for component in DSAL3Component:
+            for plane in self._l3_hbm_component_planes(component):
+                storage = plane.untyped_storage()
+                pointer = int(storage.data_ptr())
+                size = int(storage.nbytes())
+                if pointer <= 0 or size <= 0:
+                    raise RuntimeError(
+                        "DSA HBM cache has an invalid storage region: "
+                        f"ptr={pointer}, bytes={size}"
+                    )
+                region_sizes[pointer] = max(
+                    region_sizes.get(pointer, 0),
+                    size,
+                )
+        return tuple(region_sizes.items())
 
     def get_l3_component_bytes_per_block(
         self,
@@ -452,6 +506,48 @@ class DSAWorkerDRAMStore:
                 [
                     int(plane.data_ptr())
                     + int(block_id) * int(plane.stride(0)) * plane.element_size()
+                    for plane in planes
+                ]
+            )
+            sizes.append(list(plane_sizes))
+        return addresses, sizes
+
+    def build_l3_hbm_component_payload(
+        self,
+        *,
+        component: DSAL3Component | str,
+        physical_block_ids: tuple[int, ...],
+    ) -> tuple[list[list[int]], list[list[int]]]:
+        """把 split HBM block IDs 映射为 Mooncake multi-buffer 列。"""
+
+        if not physical_block_ids:
+            return [], []
+        block_ids = np.asarray(physical_block_ids, dtype=np.int64)
+        planes = self._l3_hbm_component_planes(component)
+        capacity = min(int(plane.shape[0]) for plane in planes)
+        if (
+            block_ids.ndim != 1
+            or int(block_ids.min()) <= 0
+            or int(block_ids.max()) >= capacity
+        ):
+            raise ValueError(
+                "DSA L3 direct-HBM payload contains an invalid block ID: "
+                f"component={DSAL3Component(component).value}, "
+                f"ids={physical_block_ids}, capacity={capacity}"
+            )
+        plane_sizes = [
+            int(plane.shape[1]) * plane.element_size()
+            for plane in planes
+        ]
+        addresses: list[list[int]] = []
+        sizes: list[list[int]] = []
+        for block_id in block_ids.tolist():
+            addresses.append(
+                [
+                    int(plane.data_ptr())
+                    + int(block_id)
+                    * int(plane.stride(0))
+                    * plane.element_size()
                     for plane in planes
                 ]
             )

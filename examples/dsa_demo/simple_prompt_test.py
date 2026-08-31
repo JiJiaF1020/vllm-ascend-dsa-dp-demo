@@ -91,6 +91,7 @@ ENABLE_MTP = False
 MTP_NUM_SPECULATIVE_TOKENS = 3
 ENABLE_L3_WRITE_BEHIND = False
 ENABLE_L3_PREFIX_LOADBACK = False
+ENABLE_L3_DIRECT_HBM_LOAD = False
 MOONCAKE_CONFIG_PATH = str(
     Path(__file__).resolve().parent / "L3_cache_sys_api_test/baseline_e2e/configs/mooncake-dsa-tcp.json"
 )
@@ -201,6 +202,10 @@ def build_llm_kwargs() -> dict[str, Any]:
             "ENABLE_L3_PREFIX_LOADBACK requires three rounds: "
             "cold, local-L2 replay, and L3 replay"
         )
+    if ENABLE_L3_DIRECT_HBM_LOAD:
+        raise ValueError(
+            "ENABLE_L3_DIRECT_HBM_LOAD is frozen; use L3->L2->HBM"
+        )
     graph_enabled = RUN_MODE == "graph"
     kwargs: dict[str, Any] = {
         "model": MODEL_PATH,
@@ -259,6 +264,7 @@ def build_llm_kwargs() -> dict[str, Any]:
                 "max_inflight_l3_store_jobs": (DSA_L3_MAX_INFLIGHT_STORE_JOBS),
                 "max_active_channels": DSA_L3_MAX_ACTIVE_CHANNELS,
                 "max_descriptors_per_l3_put": (DSA_L3_MAX_DESCRIPTORS_PER_PUT),
+                "direct_hbm_load": ENABLE_L3_DIRECT_HBM_LOAD,
             },
         )
     if graph_enabled:
@@ -444,6 +450,7 @@ def main() -> None:
         f"a5_packed_c8={ENABLE_A5_PACKED_C8_DSA} mtp={ENABLE_MTP} "
         f"l3_write_behind={ENABLE_L3_WRITE_BEHIND} "
         f"l3_prefix_loadback={ENABLE_L3_PREFIX_LOADBACK} "
+        f"l3_direct_hbm={ENABLE_L3_DIRECT_HBM_LOAD} "
         f"prefix_cache={ENABLE_PREFIX_CACHING} "
         f"replay_rounds={PREFIX_CACHE_REPLAY_ROUNDS}"
     )
@@ -485,10 +492,14 @@ def main() -> None:
                     use_tqdm=False,
                 )
             )
-            if (
+            should_reset_for_l3 = (
+                ENABLE_L3_DIRECT_HBM_LOAD and round_index == 1
+            ) or (
                 ENABLE_L3_PREFIX_LOADBACK
+                and not ENABLE_L3_DIRECT_HBM_LOAD
                 and round_index + 2 == PREFIX_CACHE_REPLAY_ROUNDS
-            ):
+            )
+            if should_reset_for_l3:
                 # P1-W 不阻塞客户端响应。给后台 put 一个显式测试窗口，
                 # 随后只清本地 HBM/L2 prefix，不重置 Connector/Mooncake。
                 time.sleep(DSA_L3_REPLAY_SETTLE_SECONDS)
@@ -532,9 +543,13 @@ def main() -> None:
             and PREFIX_CACHE_REPLAY_ROUNDS >= 3
         ):
             comparison_label = (
-                "local-L2/L3 replay"
-                if ENABLE_L3_PREFIX_LOADBACK
-                else "local-L2/local-L2 replay"
+                "direct-L3/post-backfill local replay"
+                if ENABLE_L3_DIRECT_HBM_LOAD
+                else (
+                    "local-L2/L3 replay"
+                    if ENABLE_L3_PREFIX_LOADBACK
+                    else "local-L2/local-L2 replay"
+                )
             )
             _compare_replay_outputs(
                 output_rounds[-2],

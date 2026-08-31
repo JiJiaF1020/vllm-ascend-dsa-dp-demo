@@ -36,6 +36,7 @@ class DSAL3StoreScheduler:
         *,
         lookup_backend: DSAL3BackendAdapter | None = None,
         enable_load: bool = False,
+        direct_hbm_load: bool = False,
     ) -> None:
         self.schema = schema
         self._base_schema = schema
@@ -44,6 +45,9 @@ class DSAL3StoreScheduler:
         if self.max_inflight_jobs <= 0:
             raise ValueError("DSA L3 max_inflight_jobs must be positive")
         self.enable_load = bool(enable_load)
+        self.direct_hbm_load = bool(direct_hbm_load)
+        if self.direct_hbm_load and not self.enable_load:
+            raise ValueError("DSA direct-HBM requires L3 load to be enabled")
         self.lookup_backend = lookup_backend
         if self.enable_load and self.lookup_backend is None:
             raise ValueError("DSA L3 load requires a scheduler lookup backend")
@@ -79,6 +83,17 @@ class DSAL3StoreScheduler:
         if self.coordinator is not None:
             raise RuntimeError("DSA L3 scheduler coordinator was bound twice")
         self.coordinator = coordinator
+        configure_direct = getattr(
+            coordinator,
+            "set_l3_direct_hbm_load_enabled",
+            None,
+        )
+        if not callable(configure_direct) and self.direct_hbm_load:
+            raise RuntimeError(
+                "DSA coordinator does not expose direct-HBM capability"
+            )
+        if callable(configure_direct):
+            configure_direct(self.direct_hbm_load)
         usable_blocks = int(
             getattr(
                 getattr(coordinator, "dram_directory", None),
@@ -113,7 +128,12 @@ class DSAL3StoreScheduler:
         request: Any,
         local_computed_tokens: int,
     ) -> int:
-        """查询本地 L2 命中之后的成对 L3 component suffix。"""
+        """查询最长本地命中之后的成对 L3 component suffix。
+
+        ``local_computed_tokens`` 已由 coordinator 决议为
+        ``max(HBM pair, complete L2)``。因此 L3 永远不会读取被 L1/L2
+        覆盖的重叠区，只查询二者都未覆盖的连续后缀。
+        """
 
         if not self.enable_load or bool(
             getattr(request, "skip_reading_prefix_cache", False)
@@ -183,10 +203,17 @@ class DSAL3StoreScheduler:
                 "DSA L3 external load token count changed after allocation"
             )
         blocks: list[DSAL3LoadBlock] = []
-        for offset, (block_hash, destination) in enumerate(
+        for offset, (
+            block_hash,
+            destination_l2,
+            destination_indexer,
+            destination_resident,
+        ) in enumerate(
             zip(
                 plan.block_hashes,
                 plan.destination_dram_block_ids,
+                plan.destination_indexer_hbm_block_ids,
+                plan.destination_resident_hbm_block_ids,
                 strict=True,
             )
         ):
@@ -196,7 +223,13 @@ class DSAL3StoreScheduler:
                     logical_block_index=(
                         plan.logical_block_start + offset
                     ),
-                    destination_l2_block_id=destination,
+                    destination_l2_block_id=destination_l2,
+                    destination_indexer_hbm_block_id=(
+                        destination_indexer
+                    ),
+                    destination_resident_hbm_block_id=(
+                        destination_resident
+                    ),
                     block_hash=block_hash,
                     indexer_key=indexer_key,
                     mla_key=mla_key,
@@ -206,17 +239,19 @@ class DSAL3StoreScheduler:
             DSAL3LoadJob(
                 request_id=request_id,
                 blocks=tuple(blocks),
+                direct_hbm=self.direct_hbm_load,
             )
         )
         self._planned_load_jobs += 1
         self._planned_load_blocks += len(blocks)
         logger.info(
             "DSA L3 load planned: request=%s logical_start=%d "
-            "blocks=%d bytes_per_block=%d",
+            "blocks=%d bytes_per_block=%d destination=%s",
             request_id,
             plan.logical_block_start,
             len(blocks),
             self.schema.bytes_per_logical_block,
+            "hbm" if self.direct_hbm_load else "l2",
         )
 
     def _new_job_id(self) -> int:

@@ -76,6 +76,7 @@ ENABLE_A5_PACKED_C8_DSA = False  # A5 W4A4C8 设 True；A3 W4A8 保持 False
 ENABLE_MTP = False  # A5 C8 上设 True 后固定启用 3 个 draft token
 ENABLE_L3_WRITE_BEHIND = False  # 首版 Mooncake rank0 L2->L3 异步写
 ENABLE_L3_PREFIX_LOADBACK = False  # P1-R: L3 suffix -> all-rank L2 -> HBM
+ENABLE_L3_DIRECT_HBM_LOAD = False  # 当前固定 L3 -> L2 -> HBM
 RESULT_JSON = None  # 需要保存对照 token IDs 时填写路径
 ```
 
@@ -315,6 +316,15 @@ ENABLE_L3_PREFIX_LOADBACK = True
 PREFIX_CACHE_REPLAY_ROUNDS = 3
 ```
 
+当前 Mooncake Store-owned TCP wheel 不支持 NPU device pointer：TCP transport
+只为 CUDA/HIP 等设备实现 host staging，直接写 NPU HBM 会在
+`ClientSession::readBody` 返回 `EFAULT (Bad address)`。框架因此会在启动期拒绝
+任何 `direct_hbm_load=true`；不要通过切换 protocol 或
+`MC_STORE_MEMCPY=1` 绕过。当前正式部署必须保持
+`ENABLE_L3_DIRECT_HBM_LOAD=False`，统一使用
+`L3 -> L2 -> HBM`。direct-HBM 探针只保留为后续后端能力研究，不属于当前
+模型服务测试矩阵。
+
 Store-owned TCP 还必须在首次导入 Mooncake 前启用连接复用：
 
 ```bash
@@ -548,6 +558,33 @@ Local-L2/Local-L2 或 L3/L3 自对照中出现；稳定但跨介质不同的结�
 - reset 前后没有 stale job、refcount underflow、连接失败或 pending store；
 - 客户端最终打印 `PASSED`，JSON 中 `status` 为 `passed`。
 
+### P1-HOT 成对 HBM target prefix
+
+P1-HOT 不增加启动参数，沿用 no-MTP、`ENABLE_PREFIX_CACHING=true` 的 L2/L3
+配置。首次 seed 完成后，相同 prompt 的下一次本地 replay 应打印：
+
+```text
+DSA prefix lookup: ... hbm_pair_blocks>0 l2_blocks=... hbm_only_blocks=...
+DSA L3 prefix lookup: ... local_blocks=max(hbm_pair_blocks,l2_blocks)
+```
+
+HBM pair 只覆盖同时命中的 Indexer+dense MLA，但不再要求同长度 L2 bundle
+仍存在。若 `hbm_pair_blocks > l2_blocks`，首个 prefill forward 会产生非零
+full-block dump，model output 返回后 L2 ready/hash 才推进到完整 durable
+前缀。L3 suffix 始终打印 `destination=l2`，随后执行既有 restore。MTP、
+Indexer-only、MLA-only 与逐 component IO 去重仍属于后续阶段。
+
+建议按以下顺序收口：
+
+1. `tests/ut/dsa_offload` 全量通过，重点覆盖 pure-HBM、HBM>L2、
+   HBM-only gap+L3 suffix 和 restore-ready 水位；
+2. no-MTP、无 L3、5K dense prompt 连续 replay 两轮，分别跑 eager/graph，
+   第二轮确认 `hbm_pair_blocks>0`；
+3. no-MTP、开启 L3 TCP、5K/8K/40K/70K graph/chunked 三轮 replay，确认
+   L3 load 始终为 `destination=l2`，且没有 ready watermark 回退；
+4. 最后补在线 graph 单 40K 与混合并发。当前必须保持
+   `ENABLE_L3_DIRECT_HBM_LOAD=False`。
+
 不安装 Python OpenAI SDK 时，也可以直接观察 SSE 流：
 
 ```bash
@@ -645,9 +682,8 @@ LV-Eval 或 CLongEval 官方排行榜分数。正式精度对比应保持相同�
 
 - prefill/decode mixed batch（chunked prefill 本身已支持）；
 - async scheduling；
-- HBM Indexer/dense-MLA 热副本协同命中，以及 HBM-only hit 的 L2
-  backfill/去重；L3 P1-R 同步 loadback 已完成 A5 TP8 收缩验收，但在线
-  continuous batching 与长稳仍待补齐；
+- HBM Indexer-only/MLA-only 的独立 source mask 与细粒度 IO 去重；完整 HBM
+  pair 与 HBM-only L2 backfill 已完成代码改造、待 A5 上板；
 - preemption/resume；
 - 非 MTP speculative method、MTP draft 数不等于 3、非 greedy MTP；
 - MTP 与 L3 组合、L3 的 DP>1、layerwise async load 和 HBM 直通；
