@@ -21,15 +21,24 @@ P1-W rank0 异步 write-behind 已完成 TCP 框架适配、UT，以及 TP8 离�
 长请求的 eager/graph、5K+8K+40K+70K 混合长度多请求 graph/chunked prefill
 和在线 graph 单 40K 流式请求的完整闭环验收，首版正确性阶段已经关闭。
 P1-R 同步 L3 suffix lookup、all-rank `L3 -> L2` 与既有 `L2 -> HBM`
-restore 已完成代码接入并补齐 CPU UT 覆盖；A5 TP8 单 8K eager 的三轮
-cold/Local-L2/L3、单 5K graph 严格精度门禁，以及混合 bsz=4 graph 的
-Local-L2/L3 与 Local-L2/Local-L2 对照均已通过。多请求 graph 已确认存在与
-L3 无关的 replay 数值变化；在线 P1-R 与长稳仍待回归。**
+restore 已完成代码接入并补齐 CPU UT 覆盖；A5 TP8 单请求及
+`5K+8K+40K+70K` graph/chunked 混合请求的离线三轮闭环、在线顺序双回放与
+并发压力回放均已通过。在线记录中 943 个唯一 prompt bundle 只写一次，三组
+L3 回放每 rank 均完成 `3 * 943` 个 block load，无重复增长、漏 rank 或 IO
+失败。多请求 graph 仍存在与 L3 无关的 replay 数值变化。**
 
-**P1-HOT 妥协版已完成代码改造、等待上板：no-MTP 下 L1
+**P1-HOT no-MTP 已完成代码改造和上述上板闭环：L1
 Indexer+dense-MLA pair 与 L2 complete bundle 独立查询，本地命中取较长者；
-HBM-only L2 gap 在首个 prefill forward 中同步补齐。外部命中继续固定走
-`L3 -> L2 -> HBM`。**
+HBM-only L2 gap 在首个 prefill forward 中同步补齐。P2-MTP 多级 prefix 已
+完成首个 A5 TP8 eager 单 40K 三轮闭环：MTP active decode 仍保持 BF16
+full-HBM，不做 token-wise swap；verified 满块进入 L2/L3 complete bundle，
+并参与 lookup/loadback。eager 与 FULL graph 下，Local-L2 与清空本地后的
+L3 replay token 序列均严格一致；graph 的 cold/Local-L2/L3 三轮也完全一致。
+混合 8K/5K/70K/40K graph 已完成 L3 与 Local/Local 配对控制：两处严格分叉
+以相同 request、common-prefix 和 token 对在无 L3 load 时复现，归因于既有
+multi-request graph prefix 数值路径，不构成 L3 独有错误；该轮同时触发并完成
+一个 MTP decode prewrite durable block。外部命中继续固定走
+`L3 -> L2 -> HBM`。在线 MTP 多级 prefix 仍待回归。**
 
 ## 2. 目标与非目标
 
@@ -50,11 +59,11 @@ HBM-only L2 gap 在首个 prefill forward 中同步补齐。外部命中继续�
    外部 IO 不进入 graph。
 8. Mooncake/MemCache 复用同一 DSA 控制面，后端差异封装在 AscendStore
    `Backend` 层。
-9. 当前按完整 HBM pair 复用；为未来独立 component source mask 保留接口。
+9. no-MTP 按完整 HBM pair 复用；MTP 按 target pair+MTP full-cache triple
+   复用，并保留未来独立 component source mask 接口。
 
 ### 2.2 第一版非目标
 
-- MTP target cache 的 L3 存储；
 - request preemption/resume；
 - async scheduling；
 - PP、DCP、PCP 与跨节点 TP；
@@ -74,8 +83,8 @@ HBM-only L2 gap 在首个 prefill forward 中同步补齐。外部命中继续�
 |---|---|---|
 | HBM Indexer | 完整上下文 dense Indexer | 独立 pool |
 | HBM resident MLA | prefill 时 dense；sparse decode 时 budget+tail | 独立 pool |
-| rank-local DRAM | 完整 dense Indexer+MLA bundle | scheduler-owned 独立 pool |
-| MTP HBM | BF16 full cache，不卸载 | 可选独立 pool |
+| rank-local DRAM | 完整 dense Indexer+MLA；MTP 时再含 BF16 full-cache | scheduler-owned 独立 pool |
+| MTP HBM | BF16 full cache；active decode 不做 token-wise swap | 可选独立 pool |
 
 `DSASchedulerDRAMBlockDirectory` 已经复用 vLLM `BlockPool` 的 null block、
 refcount、hash map、free queue 和 LRU。scheduler 是 DRAM physical id、hash、
@@ -90,17 +99,23 @@ DRAM id。A5 GLM-5.2 一个逻辑 L2 block 当前包含：
     key bytes + scale bytes
 78 个 target MLA layer:
     packed C8 [128, 1, 656]
-总计 6,904,320 bytes / rank / logical block
+no-MTP 总计 6,904,320 bytes / rank / logical block
+
+MTP3 额外一个原生 BF16 full-cache layer:
+    128 * (512 + 64 + 128) * 2 = 180,224 bytes
+MTP complete bundle 总计 7,084,544 bytes / rank / logical block
 ```
 
-当前本地 prefix cache 只把完整 L2 bundle 作为 target 命中源。MTP 开启时，
-target L2 hit 还会与 MTP full-HBM hit 取公共前缀。
+本地 prefix cache 同时查询完整 L2 bundle 与 HBM。no-MTP 的 HBM 命中是
+target Indexer+dense-MLA pair；MTP 的 HBM 命中是 target pair+MTP full-cache
+triple。MTP L2 bundle 本身已经包含三 component，不再依赖原请求的 MTP HBM
+副本才能恢复。
 
 ### 3.2 当前 HBM target prefix 限制
 
-目前 HBM physical pool 中只有 MTP group 开启 prefix caching。target Indexer
-和 resident MLA pool 不发布 hash，原因不是 HBM 无法复用，而是 resident MLA
-同时容纳：
+启用 prefix caching 后，target Indexer、dense resident MLA 与可选 MTP group
+均可发布 hash。resident MLA 同时容纳以下角色，因此只有 PREFILL/DENSE 表中的
+块能够发布，ENTER 后的 budget/tail 永不发布：
 
 ```text
 dense prefix block      有文本前缀语义
@@ -109,9 +124,8 @@ KSC resident slots      无连续前缀语义
 tail/provisional block  未完全 durable
 ```
 
-在缺少 block-role 状态前直接给整个 resident pool 开 hash 会产生错误命中。
-因此第一版 L3 仍以 L2 为唯一 target 本地 prefix tier；HBM target 热层列为本文
-第 18 节的高优先级后续项。
+完整 HBM pair/triple 与 L2 分别查最长前缀，取较长者；单 component HBM
+source mask 仍是后续优化项。
 
 ### 3.3 vLLM Connector 与 OffloadingConnector 可复用能力
 
@@ -225,7 +239,7 @@ L3 key               内容寻址 key，不等于任何 L1/L2 physical id
 - 已完成 target forward；
 - 已通过 MTP target verification；
 - 位于完整 block；
-- 对应 Indexer 和 MLA payload 都已完成；
+- 对应 Indexer、MLA，以及启用时的 MTP BF16 payload 都已完成；
 - scheduler 已拥有该 logical block 的 block hash。
 
 不满尾块和 MTP provisional token 不得发布 L2/L3 key。
@@ -240,14 +254,15 @@ L3 key               内容寻址 key，不等于任何 L1/L2 physical id
 
 ### 5.1 component 拆分
 
-每个 token block 在 L3 使用两个对象：
+每个 token block 在 L3 使用两个或三个对象：
 
 ```text
 INDEXER component -> 所有 full Indexer layer 的 key/scale plane
 MLA component     -> 所有 target MLA layer 的 dense packed plane
+MTP component     -> 可选；所有 MTP layer 的原生 BF16 MLA+Indexer planes
 ```
 
-只有两个 component 都 ready 时，该 token block 才是完整 target L3 hit。
+no-MTP 要求前两个 component 均 ready；MTP 要求三个 component 均 ready。
 
 拆分的理由：
 
@@ -276,12 +291,14 @@ request block hash
 ```text
 vllm-ascend:dsa-l3:v1:<model>:a5-c8:bs128:<schema>:indexer:<hash>
 vllm-ascend:dsa-l3:v1:<model>:a5-c8:bs128:<schema>:mla:<hash>
+vllm-ascend:dsa-l3:v1:<model>:a5-c8:bs128:<schema>:mtp:<hash>
 ```
 
 schema fingerprint 应覆盖：
 
 - full Indexer layer id 顺序；
 - MLA layer id 顺序；
+- 可选 MTP layer id 与原生 BF16 plane 顺序；
 - 每个 plane dtype、byte size 和顺序；
 - packed/非 packed 模式；
 - Indexer shared topology；
@@ -571,9 +588,9 @@ prefix 固定走 `L3 -> L2 -> L1`。蓝色 `L1 -> L2` 既承载每个 chunk 的�
 10. 任一 rank/component load 失败则 fail-fast，不发布 L2 hash。
 
 这里的 `enable_prefix_caching=True` 是当前 vLLM 公共入口，同时启用 DSA L1
-target hash 与 L2 directory 的 hash/refcount/restore。当前只支持 no-MTP 下的
-完整 HBM pair，不支持 Indexer-only/MLA-only source mask；MTP 多级 prefix 仍由
-后续阶段单独开放。
+target hash 与 L2 directory 的 hash/refcount/restore。no-MTP 使用完整 HBM
+pair；固定 MTP3 使用完整 HBM triple 和三 component bundle。两者都暂不支持
+Indexer-only/MLA-only source mask。
 
 ### 7.2 为什么 TCP 第一版选择 L3->L2->HBM
 
@@ -591,7 +608,7 @@ target hash 与 L2 directory 的 hash/refcount/restore。当前只支持 no-MTP 
 
 - scheduler 必须联合预留 L2 bundle 与 split HBM blocks；
 - pending L3 load 期间 L2 destination 不可被复用；
-- all-rank get 完成后才能原子发布 Indexer+MLA 公共前缀；
+- all-rank get 完成后才能原子发布完整 durable bundle 公共前缀；
 - 初版必须 fail-fast，不能静默 recompute。
 
 ### 7.3 L3->HBM direct 后续路径（当前冻结）
@@ -679,7 +696,7 @@ durable full-block watermark。它可以生成本轮尚未远端发布的：
 logical block index
 L2 physical block id
 block hash
-INDEXER/MLA component key
+INDEXER/MLA/可选 MTP component key
 job id
 ```
 
@@ -708,16 +725,27 @@ zero-token control step；也不能让 worker 根据 row 长度自行推导 stor
 
 ### 9.2 worker 提交时序
 
+no-MTP 的 target Indexer/MLA 都在 target forward 内完成 dump，因此可在
+post-forward `get_finished()` 中直接记录 event 并提交异步 put。MTP 的第三个
+component 由后续 proposer 写入，必须使用两阶段发布：
+
 ```text
-本轮所有 layer L1->L2 dump 入同一 NPU stream
-    -> forward 结束
-    -> Connector get_finished()/post-forward 记录或继承 dump-ready event
-    -> rank0 把 store job 放入本地 pending queue
-    -> 下一 engine step 的 start/handle hook 提交后台 put
+target forward 完成 Indexer/MLA dump
+    -> 基线 Connector context 退出并调用 get_finished()
+    -> DSAL3Connector 只 stage 本轮 store jobs，不记录 ready event
+    -> MTP proposer 写 cache，并完成 MTP HBM -> L2 dump
+    -> runtime 校验所有 MTP layer 已完成当前 forward epoch
+    -> finalize_kv_connector() 调用 wait_for_save()
+    -> release staged jobs，记录 dump-ready event
+    -> rank0 后台执行 L2 -> L3 put
 ```
 
-这复用 vLLM `OffloadingConnector` 的 store deferral：上传在下一步开始，而不是
-当前 token generation 的尾部同步 `join()`。
+vLLM 基线的 `defer_finalize=True` 只延后 `wait_for_save()` 和 metadata clear，
+不会延后 `get_finished()`。因此不得在 MTP 路径的 `get_finished()` 中直接
+提交当前 store job，否则 event 位于 proposer dump 之前，会把陈旧 MTP L2
+payload 发布到 L3。zero-token Connector progress step 没有 attention forward，
+其 job 已有 durable backing，仍可立即提交。上传保持异步，不在当前 token
+generation 尾部执行同步 `join()`。
 
 ### 9.3 block reuse fence
 
@@ -902,12 +930,23 @@ GLM-5.2 A5 L2 当前约有 78 个 MLA arena 和 42 个 Indexer plane arena；P0
 
 ### 12.4 compromise MTP
 
-初版 DSA+L3 显式拒绝 MTP。后续开放时：
+妥协版 MTP 多级 prefix 使用以下合同：
 
-- target 只有 verified token 可以推进 L2/L3 watermark；
-- provisional 双尾块不能上传；
-- MTP BF16 full cache 仍只在 HBM；
-- target L2/L3 hit 与 MTP HBM hit 取公共前缀；
+- active sparse decode 的 MTP proposer 仍使用原生 BF16 full-HBM cache，不做
+  topK swap，也不依赖新的 BF16 稀疏算子；
+- scheduler 以排除本轮 provisional query 后的 confirmed token 数计算 durable
+  full-block watermark；
+- prefill 在 MTP cache 写后 dump，decode 在本轮 proposer 第一次 cache 写前
+  dump；一个 outer step 每个 MTP 层只发射一次；
+- target forward 退出时 `get_finished()` 只暂存三 component store job；MTP
+  dump 完成并通过 epoch 校验后，才由 `wait_for_save()` 记录 event、发布 L3
+  job，禁止 Indexer/MLA ready 而 MTP payload 仍陈旧的半完成 bundle；
+- target 双尾块与 MTP baseline rollback 各自保护未验证 token，任何 provisional
+  tail 都不能推进 L2/L3 key；
+- MTP complete L2/L3 bundle 增加第三个 BF16 component；prefix load 后同时恢复
+  target Indexer、target MLA 与 MTP full cache；
+- 对合并后的 L1/L2/L3 最长前缀只应用一次基线 Eagle 末块回退，用于重建
+  drafting 边界状态；
 - terminal 未 flush 满块只能降低命中长度，不能发布错误 key。
 
 ## 13. eager 与 graph
@@ -1097,12 +1136,11 @@ L3 数据路径阶段性收口后，HBM target 热副本进入 P1-HOT 实施：
 ```text
 Indexer: HBM -> L2 -> L3
 MLA:     dense HBM -> L2 -> L3
-MTP:     HBM
+MTP:     active full HBM -> durable full blocks in L2 -> L3
 ```
 
-当前妥协版实现以下正确性闭环：
+no-MTP 妥协版已实现以下正确性闭环：
 
-- 仅 no-MTP；
 - Indexer 与 dense MLA 同时命中形成 HBM pair，pair 允许比 L2 complete bundle
   更长；
 - HBM pair 直接 touch 为请求 block table 前段；
@@ -1136,7 +1174,8 @@ direct-HBM 只保留为未来 NPU-aware backend 的独立研究项。
 
 > **硬约束**：任何 tier 组合最终都必须在请求释放 dense MLA 或进入 sparse
 > decode 前，使 L2 `[0, durable_full_blocks)` 成为完整且 ready 的
-> Indexer+MLA bundle。HBM hit 只能改变 restore/source mask；HBM-only 数据
+> durable bundle；MTP 时该 bundle 必须同时含 Indexer+MLA+MTP。HBM hit
+> 只能改变 restore/source mask；HBM-only 数据
 > 必须先回填 L2，不能把 HBM refcount 或一次 lookup 当成 durable backing。
 
 后续独立 component mask 仍需：Indexer/MLA 分别选择最热 source、restore plan
@@ -1145,19 +1184,24 @@ eager/graph 唯一真源；这些不属于本轮 pair 版本。
 
 ### 18.1 当前妥协版规范数据流
 
-当前 lookup 使用完整 pair 粒度：
+当前 lookup 使用完整 pair/triple 粒度：
 
 ```text
 hbm_pair_blocks = min(HBM Indexer, HBM dense MLA)
-l2_blocks       = complete LocalDRAM bundle prefix
-local_blocks    = max(hbm_pair_blocks, l2_blocks)
+hbm_mtp_blocks  = min(hbm_pair_blocks, HBM MTP after Eagle drop)
+hbm_blocks      = hbm_pair_blocks (no-MTP) or hbm_mtp_blocks (MTP)
+l2_raw_blocks   = complete LocalDRAM bundle prefix
+l2_blocks       = l2_raw_blocks                  # no-MTP
+                = max(l2_raw_blocks - 1, 0)      # MTP replay boundary
+local_blocks    = max(hbm_blocks, l2_blocks)
 external_blocks = pooled L3 complete-bundle suffix after local_blocks
+                # MTP 对 suffix 末端再 drop 1，合并前缀总共只 drop 一次
 
 executable_prefix = local_blocks + external_blocks
 ```
 
-lookup/admission 必须先 pin/touch HBM pair 与 L2 blocks，再修改 block table，
-防止查询后、执行前被淘汰。MTP 当前不进入该流程。
+lookup/admission 必须先 pin/touch HBM pair/triple 与 L2 blocks，再修改 block
+table，防止查询后、执行前被淘汰。
 
 数据动作固定为：
 
@@ -1245,7 +1289,7 @@ DSA 配置校验第一版要求：
 | FULL graph | 支持，IO 在图外 |
 | chunked prefill | 支持 |
 | async scheduling | 拒绝 |
-| MTP | 拒绝 |
+| 固定 MTP3 + greedy | 支持，complete bundle 含 BF16 MTP component |
 | preemption | 拒绝 |
 | PP/DCP/PCP | 拒绝 |
 | load failure recompute | 拒绝 |
@@ -1353,10 +1397,10 @@ executor grace period 后被发送 SIGTERM，但该提示发生在 6 个 store j
 - external L2/HBM 联合 admission；
 - all-rank `L3 -> local L2` Store get；
 - 复用现有 L2->HBM restore 后进入 forward；
-- no-MTP、fail-fast、Mooncake only。
+- no-MTP 已上板；固定 MTP3 代码接入、待上板；fail-fast、Mooncake only。
 
 上述代码项已完成。scheduler 使用不贡献 segment 的 Mooncake client 查询本地 L2
-命中后的 paired Indexer/MLA key；allocator 在修改任一 pool 前联合检查 split HBM
+命中后的 Indexer/MLA/可选 MTP key；allocator 在修改任一 pool 前联合检查 split HBM
 与 L2 free queue，并为 L3-only suffix 分配完整 L2 bundle。所有 TP worker 在
 assignment 前同步 get 到相同 rank-local block IDs，再用 TP success consensus
 阻止任一失败 rank 的同伴提前进入 restore/forward，随后统一 projection 执行现有
@@ -1398,7 +1442,7 @@ all-rank get 成功、命中 block 数一致、restore 完成和无 transport fa
 
 ### P4：扩展
 
-- MTP target+MTP 公共前缀；
+- MTP 多级 prefix 性能优化与更多 proposer 形态；
 - preemption/resume；
 - P/D；
 - 多节点与 CP/PP；
@@ -1473,13 +1517,13 @@ L3 验收应继续对照 HBM-prefix warm 结果，不能只比较 cold/warm toke
 | 权重更新/reset 后命中旧远端 KV | external reset 仅在 transfer drain 后轮换 DSA L3 namespace generation；旧对象不再命中并交给后端淘汰。该操作暂不物理 GC，重复测试默认不得轮换 namespace |
 | Connector teardown 泄漏 | stop/join/unregister/close/drain |
 | sparse resident 被通用 save 错读 | store source 固定为 DSA L2 component view |
-| MTP provisional block 提前发布 | durable watermark + 初版拒绝 MTP |
+| MTP provisional block 提前发布 | scheduler confirmed watermark + target 双尾 + MTP pre-write dump |
 | eager/graph 元数据分裂 | 所有 IO 在图外，共用 scheduler plan/HBM table |
 
 ## 24. 决策摘要
 
-1. L2 block id 继续绑定完整 Indexer+MLA bundle。
-2. L3 按 Indexer/MLA component 分对象，以 hash 为身份。
+1. L2 block id 绑定完整 durable bundle；MTP 时包含额外 BF16 component。
+2. L3 按 Indexer/MLA/可选 MTP component 分对象，以 hash 为身份。
 3. TCP 第一版 read 为 L2 hit + `L3-only suffix -> local L2 -> HBM`。
 4. L3 suffix 在 forward 前已物化到 L2，不再执行一次 HBM->L2 回写。
 5. L2->L3 只由 rank0 异步写。
@@ -1487,4 +1531,4 @@ L3 验收应继续对照 HBM-prefix warm 结果，不能只比较 cold/warm toke
 7. 优先复用 vLLM OffloadingConnector job/reuse-fence/no-forward 模型。
 8. worker 完成事件是 source lifetime 真值；scheduler 不轮询 L3 判断完成。
 9. L3 eviction 由后端自治，DSA 只做连续公共前缀。
-10. HBM target prefix 是 P3-HOT 高优先级项，不得遗忘。
+10. no-MTP HBM target prefix 已闭环；固定 MTP3 多级 prefix 进入 P2 上板阶段。

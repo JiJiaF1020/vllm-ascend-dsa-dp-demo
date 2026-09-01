@@ -550,6 +550,7 @@ def test_attach_projection_populates_real_l3_connector_metadata() -> None:
     scheduler = _make_scheduler()
     schema = SimpleNamespace(
         bytes_per_logical_block=12,
+        has_mtp=False,
         block_keys=lambda block_hash: (
             f"indexer:{bytes(block_hash).hex()}",
             f"mla:{bytes(block_hash).hex()}",

@@ -318,25 +318,29 @@ def test_dsa_l3_connector_requires_positive_shutdown_timeout() -> None:
         )
 
 
-def test_dsa_l3_connector_rejects_mtp_in_first_version() -> None:
+def test_dsa_l3_connector_accepts_compromise_mtp() -> None:
     kv_transfer = SimpleNamespace(
         kv_connector="DSAL3Connector",
-        kv_role="kv_producer",
+        kv_role="kv_both",
+        kv_load_failure_policy="fail",
         kv_connector_extra_config={"backend": "mooncake"},
     )
 
-    with pytest.raises(ValueError, match="does not yet support MTP"):
-        DSAOffloadConfig.from_dict(
-            {
-                "enabled": True,
-                "sparse_activation_tokens": 8192,
-                "resident_budget_tokens": [8192, 10240, 12288],
-            },
-            vllm_config=_vllm_config(
-                kv_transfer_config=kv_transfer,
-                speculative_config=_mtp_config(),
-            ),
-        )
+    config = DSAOffloadConfig.from_dict(
+        {
+            "enabled": True,
+            "sparse_activation_tokens": 8192,
+            "resident_budget_tokens": [8192, 10240, 12288],
+        },
+        vllm_config=_vllm_config(
+            kv_transfer_config=kv_transfer,
+            speculative_config=_mtp_config(),
+            enable_prefix_caching=True,
+            shutdown_timeout=300,
+        ),
+    )
+
+    assert config.mtp_enabled
 
 
 @pytest.mark.parametrize(

@@ -17,6 +17,7 @@ from vllm_ascend.dsa_offload.kv_cache import (
     build_dsa_kv_cache_groups,
     dsa_dram_bytes_per_logical_block,
     dsa_max_memory_usage_bytes,
+    dsa_mtp_durable_offload_enabled,
     dsa_pool_bytes_per_base_block,
     finalize_dsa_dram_capacity,
     get_dsa_group_num_blocks,
@@ -419,7 +420,33 @@ def test_mtp_full_group_uses_dense_three_x_capacity(
         groups[0].kv_cache_spec.page_size_bytes * len(groups[0].layer_names)
         + groups[1].kv_cache_spec.page_size_bytes
         * len(groups[1].layer_names)
+        + groups[2].kv_cache_spec.page_size_bytes
+        * len(groups[2].layer_names)
     )
+
+
+def test_mtp_dram_payload_is_only_enabled_for_prefix_or_l3() -> None:
+    specs = _make_specs()
+    specs["model.layers.78.self_attn.attn"] = _make_mtp_spec()
+    groups = build_dsa_kv_cache_groups(specs)
+    vllm_config = _make_vllm_config(enable_prefix_caching=False)
+    target_only = dsa_dram_bytes_per_logical_block(
+        groups,
+        include_mtp=False,
+    )
+    complete = dsa_dram_bytes_per_logical_block(groups)
+
+    assert not dsa_mtp_durable_offload_enabled(vllm_config)
+    assert complete - target_only == groups[2].kv_cache_spec.page_size_bytes
+
+    vllm_config.cache_config.enable_prefix_caching = True
+    assert dsa_mtp_durable_offload_enabled(vllm_config)
+
+    vllm_config.cache_config.enable_prefix_caching = False
+    vllm_config.kv_transfer_config = SimpleNamespace(
+        kv_connector="DSAL3Connector"
+    )
+    assert dsa_mtp_durable_offload_enabled(vllm_config)
 
 
 def test_mtp_full_group_requires_target_indexer_token_coverage(

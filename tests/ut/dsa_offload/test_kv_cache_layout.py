@@ -272,6 +272,41 @@ def test_dense_enter_sparse_keeps_indexer_full_and_resident_fixed() -> None:
     assert tuple(block.block_id for block in coordinator.resident_manager.req_to_blocks["req"]) == resident_ids
 
 
+def test_enter_canonicalizes_descending_sparse_budget_blocks(
+    monkeypatch,
+) -> None:
+    manager, coordinator = _make_manager()
+    request = _Request("req", 3000, 0, 0, 3000)
+    allocate_dsa_slots(manager, request, 3000)  # type: ignore[arg-type]
+    request.num_computed_tokens = 3000
+    coordinator.release_prefill_resident_blocks(
+        request.request_id,
+        preserve_tail_block=True,
+    )
+    preserved_tail = coordinator.resident_manager.req_to_blocks[
+        request.request_id
+    ][0]
+    pool = coordinator.resident_manager.block_pool
+
+    def allocate_descending(count: int) -> list[_Block]:
+        if count > pool._free:
+            raise RuntimeError("test pool exhausted")
+        pool._free -= count
+        return [_Block(9000 - offset) for offset in range(count)]
+
+    monkeypatch.setattr(pool, "allocate", allocate_descending)
+    request.num_output_tokens = 1
+    request.num_tokens = 3001
+    allocate_dsa_slots(manager, request, 1)  # type: ignore[arg-type]
+
+    resident_blocks = coordinator.resident_manager.req_to_blocks[
+        request.request_id
+    ]
+    budget_ids = [block.block_id for block in resident_blocks[:-1]]
+    assert budget_ids == sorted(budget_ids)
+    assert resident_blocks[-1] == preserved_tail
+
+
 def test_prefix_hit_allocates_target_destinations_and_commits_restore() -> None:
     manager, coordinator = _make_manager()
     request = _Request("prefix", 512, 0, 0, 512)
@@ -303,6 +338,38 @@ def test_prefix_hit_allocates_target_destinations_and_commits_restore() -> None:
     assert restore.destination_resident_block_ids == (2000, 2001)
     assert restore.logical_block_start == 0
     assert restore.ready_block_count == 2
+
+
+def test_mtp_prefix_hit_restores_the_bf16_full_cache_component() -> None:
+    manager, coordinator = _make_manager(
+        mtp_full_blocks=128,
+        sparse_tail_block_count=2,
+    )
+    request = _Request("mtp-prefix", 512, 0, 0, 512)
+    dram_blocks = (_Block(9001), _Block(9002))
+    coordinator._pending_prefix_hits[request.request_id] = (
+        DSAPrefixCacheHitPlan(
+            request_id=request.request_id,
+            num_computed_tokens=256,
+            dram_blocks=dram_blocks,  # type: ignore[arg-type]
+        )
+    )
+
+    allocated = allocate_dsa_slots(
+        manager,  # type: ignore[arg-type]
+        request,  # type: ignore[arg-type]
+        256,
+        num_new_computed_tokens=256,
+        new_computed_blocks=manager.empty_kv_cache_blocks,
+    )
+
+    assert allocated is not None
+    assert coordinator.mtp_full_manager is not None
+    assert len(coordinator.mtp_full_manager.req_to_blocks["mtp-prefix"]) >= 2
+    restore = coordinator.take_prefix_restore_plan("mtp-prefix")
+    assert restore is not None
+    assert restore.source_dram_block_ids == (9001, 9002)
+    assert restore.destination_mtp_block_ids == (3000, 3001)
 
 
 def test_paired_hbm_prefix_skips_covered_l2_restore_prefix() -> None:
@@ -666,7 +733,9 @@ def test_block_aligned_prefill_enter_allocates_a_new_tail_block() -> None:
     assert len(coordinator.resident_manager.req_to_blocks["req"]) == 17
 
 
-def test_mtp_enter_installs_two_fixed_parity_tail_blocks() -> None:
+def test_mtp_enter_installs_two_fixed_parity_tail_blocks(
+    monkeypatch,
+) -> None:
     manager, coordinator = _make_manager(
         mtp_full_blocks=128,
         sparse_tail_block_count=2,
@@ -680,6 +749,15 @@ def test_mtp_enter_installs_two_fixed_parity_tail_blocks() -> None:
         preserve_tail_block=True,
     )
     preserved_tail = coordinator.resident_manager.req_to_blocks["req"][0]
+    pool = coordinator.resident_manager.block_pool
+
+    def allocate_descending(count: int) -> list[_Block]:
+        if count > pool._free:
+            raise RuntimeError("test pool exhausted")
+        pool._free -= count
+        return [_Block(9000 - offset) for offset in range(count)]
+
+    monkeypatch.setattr(pool, "allocate", allocate_descending)
 
     request.num_output_tokens = 1
     request.num_tokens = 3001
@@ -692,6 +770,11 @@ def test_mtp_enter_installs_two_fixed_parity_tail_blocks() -> None:
 
     resident_blocks = coordinator.resident_manager.req_to_blocks["req"]
     assert len(resident_blocks) == 18
+    assert [block.block_id for block in resident_blocks[:16]] == sorted(
+        block.block_id for block in resident_blocks[:16]
+    )
+    # The newly allocated parity-0 tail is not part of budget sorting.
+    assert resident_blocks[16].block_id == 8984
     # logical block 23 is odd, therefore the preserved dense tail must occupy
     # the fixed parity-1 column after the 16 budget blocks.
     assert resident_blocks[17] == preserved_tail

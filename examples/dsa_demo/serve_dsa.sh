@@ -15,7 +15,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 MODEL_PATH="/mnt/kv_dpc/weight/GLM-5.1-w4a8"
 SERVED_MODEL_NAME="glm-5.1-dsa"
-RUN_MODE="eager"  # eager / graph
+RUN_MODE="eager"  # disabled / eager / graph
 
 # A5/950 的 W4A4C8 模型设为 true；A3/910C 的 W4A8/BF16 保持 false。
 # A5 DSA 只支持 LI C8 与 SFA C8 同时开启，不提供半开组合。
@@ -63,13 +63,22 @@ export VLLM_ASCEND_ENABLE_MLAPO="1"
 export VLLM_LOGGING_LEVEL="${LOGGING_LEVEL}"
 
 case "${RUN_MODE}" in
+    disabled)
+        DSA_ENABLED="false"
+        ENABLE_DSA_GRAPH="false"
+        EXECUTION_ARGS=(
+            --enforce-eager
+        )
+        ;;
     eager)
+        DSA_ENABLED="true"
         ENABLE_DSA_GRAPH="false"
         EXECUTION_ARGS=(
             --enforce-eager
         )
         ;;
     graph)
+        DSA_ENABLED="true"
         ENABLE_DSA_GRAPH="true"
         if [[ "${ENABLE_MTP}" == "true" ]]; then
             GRAPH_CAPTURE_SIZES='[4,8,16]'
@@ -83,7 +92,7 @@ case "${RUN_MODE}" in
         )
         ;;
     *)
-        echo "RUN_MODE must be eager or graph, got: ${RUN_MODE}" >&2
+        echo "RUN_MODE must be disabled, eager or graph, got: ${RUN_MODE}" >&2
         exit 2
         ;;
 esac
@@ -141,8 +150,8 @@ esac
 
 case "${ENABLE_L3_WRITE_BEHIND}" in
     true)
-        if [[ "${ENABLE_MTP}" == "true" ]]; then
-            echo "DSA L3 first version does not support MTP" >&2
+        if [[ "${DSA_ENABLED}" != "true" ]]; then
+            echo "ENABLE_L3_WRITE_BEHIND requires RUN_MODE=eager or graph" >&2
             exit 2
         fi
         if [[ ! -f "${MOONCAKE_CONFIG_PATH}" ]]; then
@@ -183,7 +192,7 @@ esac
 
 case "${ENABLE_A5_PACKED_C8_DSA}" in
     true)
-        A5_PACKED_CONFIG_FIELDS='"enable_sparse_sfa_c8":true,"enable_sparse_li_c8":true,'
+        A5_PACKED_CONFIG_FIELDS='"enable_sparse_sfa_c8":true,"enable_sparse_li_c8":true'
         ;;
     false)
         A5_PACKED_CONFIG_FIELDS=""
@@ -218,14 +227,34 @@ case "${ENABLE_PREFIX_CACHING}" in
         ;;
 esac
 
-ADDITIONAL_CONFIG="$(
-    cat <<JSON
-{${A5_PACKED_CONFIG_FIELDS}"dsa_sparse_config":{"enabled":true,"split_indexer_cache":true,"indexer_mla_block_ratio":${DSA_INDEXER_MLA_BLOCK_RATIO},"sparse_activation_tokens":${DSA_SPARSE_ACTIVATION_TOKENS},"prompt_budget_thresholds":[32768,65536],"resident_budget_tokens":${DSA_RESIDENT_BUDGET_TOKENS},"max_active_reqs":${DSA_MAX_ACTIVE_REQS},"hot_cpu_block_multiple":${DSA_HOT_CPU_BLOCK_MULTIPLE},"enable_row_mode_decode_graph":${ENABLE_DSA_GRAPH},"trace_points":{"enabled":false,"points":["first_sample"],"ranks":[0]}}}
-JSON
-)"
+if [[ "${DSA_ENABLED}" == "true" ]]; then
+    DSA_CONFIG_FIELD='"dsa_sparse_config":{"enabled":true,"split_indexer_cache":true,'
+    DSA_CONFIG_FIELD+='"indexer_mla_block_ratio":'"${DSA_INDEXER_MLA_BLOCK_RATIO}"','
+    DSA_CONFIG_FIELD+='"sparse_activation_tokens":'"${DSA_SPARSE_ACTIVATION_TOKENS}"','
+    DSA_CONFIG_FIELD+='"prompt_budget_thresholds":[32768,65536],'
+    DSA_CONFIG_FIELD+='"resident_budget_tokens":'"${DSA_RESIDENT_BUDGET_TOKENS}"','
+    DSA_CONFIG_FIELD+='"max_active_reqs":'"${DSA_MAX_ACTIVE_REQS}"','
+    DSA_CONFIG_FIELD+='"hot_cpu_block_multiple":'"${DSA_HOT_CPU_BLOCK_MULTIPLE}"','
+    DSA_CONFIG_FIELD+='"enable_row_mode_decode_graph":'"${ENABLE_DSA_GRAPH}"'}'
+else
+    DSA_CONFIG_FIELD=""
+fi
+
+if [[ -n "${A5_PACKED_CONFIG_FIELDS}" && -n "${DSA_CONFIG_FIELD}" ]]; then
+    ADDITIONAL_CONFIG="{${A5_PACKED_CONFIG_FIELDS},${DSA_CONFIG_FIELD}}"
+elif [[ -n "${A5_PACKED_CONFIG_FIELDS}" ]]; then
+    ADDITIONAL_CONFIG="{${A5_PACKED_CONFIG_FIELDS}}"
+elif [[ -n "${DSA_CONFIG_FIELD}" ]]; then
+    ADDITIONAL_CONFIG="{${DSA_CONFIG_FIELD}}"
+else
+    ADDITIONAL_CONFIG="{}"
+fi
 
 echo "[dsa-online] mode=${RUN_MODE} model=${MODEL_PATH}"
+echo "[dsa-online] dsa_enabled=${DSA_ENABLED} prefix_cache=${ENABLE_PREFIX_CACHING}"
 echo "[dsa-online] a5_packed_c8=${ENABLE_A5_PACKED_C8_DSA} mtp3=${ENABLE_MTP} safetensors=${SAFETENSORS_LOAD_STRATEGY}"
+echo "[dsa-online] tp=${TENSOR_PARALLEL_SIZE} max_num_seqs=${MAX_NUM_SEQS} max_model_len=${MAX_MODEL_LEN}"
+echo "[dsa-online] max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS} chunked_prefill=${ENABLE_CHUNKED_PREFILL} gpu_memory_utilization=${GPU_MEMORY_UTILIZATION}"
 echo "[dsa-online] l3_write_behind=${ENABLE_L3_WRITE_BEHIND} mooncake_config=${MOONCAKE_CONFIG_PATH}"
 echo "[dsa-online] l3_prefix_loadback=${ENABLE_L3_PREFIX_LOADBACK}"
 echo "[dsa-online] l3_direct_hbm_load=${ENABLE_L3_DIRECT_HBM_LOAD}"

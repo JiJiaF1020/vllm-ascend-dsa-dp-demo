@@ -175,30 +175,29 @@ class DSAL3BackendAdapter:
     ) -> None:
         if self._registered:
             raise RuntimeError("DSA L3 DRAM store was bound twice")
-        indexer_bytes = store.get_l3_component_bytes_per_block(DSAL3Component.INDEXER)
-        mla_bytes = store.get_l3_component_bytes_per_block(DSAL3Component.MLA)
-        indexer_planes = store.get_l3_component_plane_count(DSAL3Component.INDEXER)
-        mla_planes = store.get_l3_component_plane_count(DSAL3Component.MLA)
-        if (
-            indexer_bytes != self.schema.indexer_bytes_per_block
-            or mla_bytes != self.schema.mla_bytes_per_block
-            or indexer_planes != self.schema.indexer_plane_count
-            or mla_planes != self.schema.mla_plane_count
-        ):
+        if store.l3_components != self.schema.active_components:
             raise RuntimeError(
-                "DSA L3 worker payload disagrees with scheduler schema: "
-                "worker=("
-                f"{indexer_planes},{mla_planes},"
-                f"{indexer_bytes},{mla_bytes}), "
-                "schema=("
-                f"{self.schema.indexer_plane_count},"
-                f"{self.schema.mla_plane_count},"
-                f"{self.schema.indexer_bytes_per_block},"
-                f"{self.schema.mla_bytes_per_block})"
+                "DSA L3 worker/schema component sets disagree: "
+                f"worker={store.l3_components}, "
+                f"schema={self.schema.active_components}"
             )
+        component_layout: dict[DSAL3Component, tuple[int, int]] = {}
+        for component in self.schema.active_components:
+            worker_bytes = store.get_l3_component_bytes_per_block(component)
+            worker_planes = store.get_l3_component_plane_count(component)
+            schema_bytes = self.schema.component_bytes_per_block(component)
+            schema_planes = self.schema.component_plane_count(component)
+            if worker_bytes != schema_bytes or worker_planes != schema_planes:
+                raise RuntimeError(
+                    "DSA L3 worker payload disagrees with scheduler schema: "
+                    f"component={component.value}, "
+                    f"worker=(planes={worker_planes},bytes={worker_bytes}), "
+                    f"schema=(planes={schema_planes},bytes={schema_bytes})"
+                )
+            component_layout[component] = (worker_planes, worker_bytes)
         regions = list(store.get_l3_registration_regions())
         if register_hbm:
-            for component in DSAL3Component:
+            for component in self.schema.active_components:
                 hbm_addresses, hbm_sizes = (
                     store.build_l3_hbm_component_payload(
                         component=component,
@@ -206,11 +205,7 @@ class DSAL3BackendAdapter:
                     )
                 )
                 hbm_bytes = sum(hbm_sizes[0])
-                expected = (
-                    self.schema.indexer_bytes_per_block
-                    if component is DSAL3Component.INDEXER
-                    else self.schema.mla_bytes_per_block
-                )
+                expected = self.schema.component_bytes_per_block(component)
                 if hbm_bytes != expected:
                     raise RuntimeError(
                         "DSA direct-HBM payload disagrees with schema: "
@@ -226,11 +221,13 @@ class DSAL3BackendAdapter:
         self._registered = True
         logger.info(
             "DSA L3 buffers registered: regions=%d bytes=%d "
-            "indexer_planes=%d mla_planes=%d direct_hbm=%s",
+            "components=%s direct_hbm=%s",
             len(regions),
             sum(size for _, size in regions),
-            indexer_planes,
-            mla_planes,
+            {
+                component.value: layout
+                for component, layout in component_layout.items()
+            },
             register_hbm,
         )
 
@@ -274,8 +271,12 @@ class DSAL3BackendAdapter:
             operation="exists",
         )
         hit_blocks = 0
-        for offset in range(0, len(exists), 2):
-            if exists[offset] <= 0 or exists[offset + 1] <= 0:
+        component_count = len(self.schema.active_components)
+        for offset in range(0, len(exists), component_count):
+            if any(
+                exists[offset + index] <= 0
+                for index in range(component_count)
+            ):
                 break
             hit_blocks += 1
         return hit_blocks
@@ -323,21 +324,27 @@ class DSAL3BackendAdapter:
         if not self._registered:
             raise RuntimeError("DSA L3 backend is not bound to its DRAM store")
         block_ids = job.source_l2_block_ids
-        indexer_addrs, indexer_sizes = store.build_l3_component_payload(
-            component=DSAL3Component.INDEXER,
-            physical_block_ids=block_ids,
-        )
-        mla_addrs, mla_sizes = store.build_l3_component_payload(
-            component=DSAL3Component.MLA,
-            physical_block_ids=block_ids,
-        )
+        payloads = {
+            component: store.build_l3_component_payload(
+                component=component,
+                physical_block_ids=block_ids,
+            )
+            for component in self.schema.active_components
+        }
         keys: list[str] = []
         addresses: list[list[int]] = []
         sizes: list[list[int]] = []
         for index, block in enumerate(job.blocks):
-            keys.extend((block.indexer_key, block.mla_key))
-            addresses.extend((indexer_addrs[index], mla_addrs[index]))
-            sizes.extend((indexer_sizes[index], mla_sizes[index]))
+            block_keys = block.component_keys
+            if len(block_keys) != len(self.schema.active_components):
+                raise RuntimeError(
+                    "DSA L3 store metadata disagrees with active components"
+                )
+            keys.extend(block_keys)
+            for component in self.schema.active_components:
+                component_addresses, component_sizes = payloads[component]
+                addresses.append(component_addresses[index])
+                sizes.append(component_sizes[index])
         with self._io_lock:
             result = self.backend.exists(keys)
         exists_result = self._validate_result(
@@ -406,37 +413,48 @@ class DSAL3BackendAdapter:
         if not self._registered:
             raise RuntimeError("DSA L3 backend is not bound to its DRAM store")
         if job.direct_hbm:
-            indexer_addrs, indexer_sizes = (
-                store.build_l3_hbm_component_payload(
-                    component=DSAL3Component.INDEXER,
-                    physical_block_ids=(
-                        job.destination_indexer_hbm_block_ids
-                    ),
-                )
-            )
-            mla_addrs, mla_sizes = store.build_l3_hbm_component_payload(
-                component=DSAL3Component.MLA,
-                physical_block_ids=(
+            destination_ids = {
+                DSAL3Component.INDEXER: (
+                    job.destination_indexer_hbm_block_ids
+                ),
+                DSAL3Component.MLA: (
                     job.destination_resident_hbm_block_ids
                 ),
-            )
+            }
+            if self.schema.has_mtp:
+                destination_ids[DSAL3Component.MTP] = (
+                    job.destination_mtp_hbm_block_ids
+                )
+            payloads = {
+                component: store.build_l3_hbm_component_payload(
+                    component=component,
+                    physical_block_ids=destination_ids[component],
+                )
+                for component in self.schema.active_components
+            }
         else:
             block_ids = job.destination_l2_block_ids
-            indexer_addrs, indexer_sizes = store.build_l3_component_payload(
-                component=DSAL3Component.INDEXER,
-                physical_block_ids=block_ids,
-            )
-            mla_addrs, mla_sizes = store.build_l3_component_payload(
-                component=DSAL3Component.MLA,
-                physical_block_ids=block_ids,
-            )
+            payloads = {
+                component: store.build_l3_component_payload(
+                    component=component,
+                    physical_block_ids=block_ids,
+                )
+                for component in self.schema.active_components
+            }
         keys: list[str] = []
         addresses: list[list[int]] = []
         sizes: list[list[int]] = []
         for index, block in enumerate(job.blocks):
-            keys.extend((block.indexer_key, block.mla_key))
-            addresses.extend((indexer_addrs[index], mla_addrs[index]))
-            sizes.extend((indexer_sizes[index], mla_sizes[index]))
+            block_keys = block.component_keys
+            if len(block_keys) != len(self.schema.active_components):
+                raise RuntimeError(
+                    "DSA L3 load metadata disagrees with active components"
+                )
+            keys.extend(block_keys)
+            for component in self.schema.active_components:
+                component_addresses, component_sizes = payloads[component]
+                addresses.append(component_addresses[index])
+                sizes.append(component_sizes[index])
         batches = self._descriptor_batches(addresses)
         logger.info(
             "DSA L3 load backend get: request=%s blocks=%d keys=%d "

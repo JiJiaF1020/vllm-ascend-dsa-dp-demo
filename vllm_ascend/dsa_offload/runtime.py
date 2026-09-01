@@ -9,13 +9,14 @@
 * active DRAM block table；
 * 所有层串行复用的 caller-owned LIDU scratch 输出；
 * 本轮满块 dump 的紧凑 src/dst 列。
-* prefix hit 的 DRAM src 与 target Indexer/MLA HBM dst 固定 restore 列。
+* prefix hit 的 DRAM src 与 target Indexer/MLA/可选 MTP HBM dst 固定 restore 列。
 
 固定 MTP3 使用两块 parity tail，位置映射化简为 ``position % 256``。
 已确认满块在下一 outer step、当前 target 层写 KV 前 dump；每个 target
 物理层只发射一次；logical block id 由 scheduler 分配，worker 只维护固定行
-镜像，同一 assignment 在 target Indexer/MLA arena 间共享。
-MTP proposer 使用原生 BF16 full cache，不绑定本 runtime。
+镜像，同一 assignment 在 target Indexer/MLA/可选 MTP arena 间共享。
+MTP proposer 仍使用原生 BF16 full cache，只绑定不改变 attention 语义的 durable
+full-block copy hook。
 
 所有大 tensor 在 model runner 初始化期预分配。steady step 只刷新 active
 prefix；DRAM 逻辑表未变化时不会重复 H2D。图模式复用这些 owner 的
@@ -86,6 +87,7 @@ class DSAOffloadRuntime:
         packed_c8: bool = False,
         max_decode_query_len: int = 1,
         enable_prefix_caching: bool = False,
+        mtp_durable_offload: bool = False,
     ) -> None:
         self.max_num_reqs = int(max_num_reqs)
         self.max_num_tokens = int(max_num_tokens)
@@ -96,6 +98,11 @@ class DSAOffloadRuntime:
         self.packed_c8 = bool(packed_c8)
         self.max_decode_query_len = int(max_decode_query_len)
         self.enable_prefix_caching = bool(enable_prefix_caching)
+        self.mtp_durable_offload = bool(mtp_durable_offload)
+        if self.mtp_durable_offload and self.max_decode_query_len <= 1:
+            raise ValueError(
+                "DSA MTP durable offload requires an MTP decode query width"
+            )
         if self.max_decode_query_len <= 0:
             raise ValueError("DSA max_decode_query_len must be positive")
         self.resident_token_pool = resident_token_pool
@@ -210,16 +217,28 @@ class DSAOffloadRuntime:
             device=self.device,
             pin_memory=pin_memory,
         )
+        self.dump_mtp_src_block_ids = CpuGpuBuffer(
+            max_dump_jobs,
+            dtype=torch.int32,
+            device=self.device,
+            pin_memory=pin_memory,
+        )
         self.dump_src_block_ids.np.fill(0)
         self.dump_indexer_src_block_ids.np.fill(0)
+        self.dump_mtp_src_block_ids.np.fill(0)
         self.dump_dst_block_ids.np.fill(DSA_DUMP_NOOP_DST_BLOCK_ID)
         self.dump_src_block_ids.gpu.zero_()
         self.dump_indexer_src_block_ids.gpu.zero_()
+        self.dump_mtp_src_block_ids.gpu.zero_()
         self.dump_dst_block_ids.gpu.fill_(DSA_DUMP_NOOP_DST_BLOCK_ID)
         self._dump_pool_indices = np.empty(max_dump_jobs, dtype=np.intp)
         self._dump_logical_indices = np.empty(max_dump_jobs, dtype=np.intp)
         self._dump_source_blocks = np.empty(max_dump_jobs, dtype=np.int32)
         self._dump_indexer_source_blocks = np.empty(
+            max_dump_jobs,
+            dtype=np.int32,
+        )
+        self._dump_mtp_source_blocks = np.empty(
             max_dump_jobs,
             dtype=np.int32,
         )
@@ -273,12 +292,20 @@ class DSAOffloadRuntime:
             device=self.device,
             pin_memory=pin_memory,
         )
+        self.restore_dst_mtp_block_ids = CpuGpuBuffer(
+            max_restore_jobs,
+            dtype=torch.int32,
+            device=self.device,
+            pin_memory=pin_memory,
+        )
         self.restore_src_dram_block_ids.np.fill(0)
         self.restore_dst_indexer_block_ids.np.fill(0)
         self.restore_dst_resident_block_ids.np.fill(0)
+        self.restore_dst_mtp_block_ids.np.fill(0)
         self.restore_src_dram_block_ids.gpu.zero_()
         self.restore_dst_indexer_block_ids.gpu.zero_()
         self.restore_dst_resident_block_ids.gpu.zero_()
+        self.restore_dst_mtp_block_ids.gpu.zero_()
         self._restore_pool_indices = np.empty(
             self.max_num_reqs,
             dtype=np.intp,
@@ -300,6 +327,8 @@ class DSAOffloadRuntime:
             -1,
             dtype=np.int64,
         )
+        self._mtp_layer_dump_epochs: dict[int, int] = {}
+        self._logged_mtp_dump_timings: set[bool] = set()
         self._graph_capture_row_count = 0
         self._dram_table_row_count = 0
         self._dram_table_signature: tuple[int, int, int] | None = None
@@ -363,6 +392,17 @@ class DSAOffloadRuntime:
                 raise RuntimeError(
                     "DSA prefix restore contains inconsistent block columns"
                 )
+            mtp_block_count = len(restore.destination_mtp_block_ids)
+            store_has_mtp = bool(store.mtp_layer_ids)
+            if (
+                (block_count and (mtp_block_count != 0) != store_has_mtp)
+                or mtp_block_count != (block_count if store_has_mtp else 0)
+            ):
+                raise RuntimeError(
+                    "DSA prefix restore MTP column disagrees with the worker "
+                    f"bundle: blocks={block_count}, mtp={mtp_block_count}, "
+                    f"store_has_mtp={store_has_mtp}"
+                )
             logical_start = int(restore.logical_block_start)
             ready_block_count = int(restore.ready_block_count)
             logical_end = logical_start + block_count
@@ -409,6 +449,12 @@ class DSAOffloadRuntime:
             self.restore_dst_resident_block_ids.np[offset:end] = (
                 restore.destination_resident_block_ids
             )
+            if store_has_mtp:
+                self.restore_dst_mtp_block_ids.np[offset:end] = (
+                    restore.destination_mtp_block_ids
+                )
+            else:
+                self.restore_dst_mtp_block_ids.np[offset:end] = 0
             if not np.array_equal(
                 assigned,
                 self.restore_src_dram_block_ids.np[offset:end],
@@ -435,6 +481,10 @@ class DSAOffloadRuntime:
                 self.restore_dst_resident_block_ids.cpu[:offset],
                 non_blocking=True,
             )
+            self.restore_dst_mtp_block_ids.gpu[:offset].copy_(
+                self.restore_dst_mtp_block_ids.cpu[:offset],
+                non_blocking=True,
+            )
         if offset:
             self._execute_prefix_restore_jobs(offset)
         store.commit_durable_full_block_counts(
@@ -443,10 +493,11 @@ class DSAOffloadRuntime:
         )
         logger.info(
             "DSA prefix restore submitted: requests=%d blocks=%d "
-            "target_layers=%d",
+            "target_layers=%d mtp_layers=%d",
             restore_rows,
             offset,
             self.num_layers,
+            len(store.mtp_layer_ids),
         )
 
     def _execute_prefix_restore_jobs(self, job_count: int) -> None:
@@ -462,6 +513,7 @@ class DSAOffloadRuntime:
         indexer_destination_ids = (
             self.restore_dst_indexer_block_ids.gpu[:job_count]
         )
+        mtp_destination_ids = self.restore_dst_mtp_block_ids.gpu[:job_count]
         for layer_id in range(self.num_layers):
             arenas = store.get_layer_arenas(layer_id)
             if len(arenas.resident_source_bytes) != len(
@@ -498,6 +550,23 @@ class DSAOffloadRuntime:
                     src_block_ids=source_ids,
                     dst_block_ids=indexer_destination_ids,
                 )
+        for layer_id in store.mtp_layer_ids:
+            arenas = store.get_mtp_layer_arenas(layer_id)
+            if len(arenas.source_bytes) != len(arenas.dram_bytes):
+                raise RuntimeError(
+                    "DSA MTP HBM/DRAM restore plane count mismatch"
+                )
+            for dram_bytes, mtp_bytes in zip(
+                arenas.dram_bytes,
+                arenas.source_bytes,
+                strict=True,
+            ):
+                copy_full_cache_plane_bytes(
+                    source_bytes=dram_bytes,
+                    destination_bytes=mtp_bytes,
+                    src_block_ids=source_ids,
+                    dst_block_ids=mtp_destination_ids,
+                )
 
     def release_pool_index(self, pool_index: int) -> None:
         store = self.dram_store
@@ -520,6 +589,7 @@ class DSAOffloadRuntime:
         num_tokens: int,
         resident_group_id: int,
         indexer_group_id: int,
+        mtp_group_id: int | None = None,
         decode_forward: bool,
     ) -> torch.Tensor:
         """刷新本轮统一元数据并返回 resident slot-mapping positions。"""
@@ -549,6 +619,7 @@ class DSAOffloadRuntime:
             num_scheduled_tokens=num_scheduled_tokens,
             resident_group_id=resident_group_id,
             indexer_group_id=indexer_group_id,
+            mtp_group_id=mtp_group_id,
         )
         self._refresh_candidate_lens(state)
         # 七列共用一个 owner，仅一次 H2D；后续 tensor 均为该 owner 的 view。
@@ -749,6 +820,8 @@ class DSAOffloadRuntime:
                 tail = slice(self.dump_job_count, launch_count)
                 self.dump_src_block_ids.np[tail] = 0
                 self.dump_indexer_src_block_ids.np[tail] = 0
+                if self.mtp_durable_offload:
+                    self.dump_mtp_src_block_ids.np[tail] = 0
                 self.dump_dst_block_ids.np[tail] = DSA_DUMP_NOOP_DST_BLOCK_ID
 
         if launch_count:
@@ -760,6 +833,11 @@ class DSAOffloadRuntime:
                 self.dump_indexer_src_block_ids.cpu[:launch_count],
                 non_blocking=True,
             )
+            if self.mtp_durable_offload:
+                self.dump_mtp_src_block_ids.gpu[:launch_count].copy_(
+                    self.dump_mtp_src_block_ids.cpu[:launch_count],
+                    non_blocking=True,
+                )
             self.dump_dst_block_ids.gpu[:launch_count].copy_(
                 self.dump_dst_block_ids.cpu[:launch_count],
                 non_blocking=True,
@@ -789,9 +867,13 @@ class DSAOffloadRuntime:
             self.active_dram_block_table.gpu[:row_count].zero_()
             self.dump_src_block_ids.np[:row_count] = 0
             self.dump_indexer_src_block_ids.np[:row_count] = 0
+            if self.mtp_durable_offload:
+                self.dump_mtp_src_block_ids.np[:row_count] = 0
             self.dump_dst_block_ids.np[:row_count] = DSA_DUMP_NOOP_DST_BLOCK_ID
             self.dump_src_block_ids.gpu[:row_count].zero_()
             self.dump_indexer_src_block_ids.gpu[:row_count].zero_()
+            if self.mtp_durable_offload:
+                self.dump_mtp_src_block_ids.gpu[:row_count].zero_()
             self.dump_dst_block_ids.gpu[:row_count].fill_(DSA_DUMP_NOOP_DST_BLOCK_ID)
             self.active_num_reqs = row_count
             self.execution_num_reqs = row_count
@@ -834,6 +916,7 @@ class DSAOffloadRuntime:
         num_scheduled_tokens: np.ndarray,
         resident_group_id: int,
         indexer_group_id: int,
+        mtp_group_id: int | None,
     ) -> None:
         """按 durable 水位差构造本轮紧凑 dump jobs。
 
@@ -844,6 +927,11 @@ class DSAOffloadRuntime:
 
         store = self.dram_store
         assert store is not None
+        if (mtp_group_id is not None) != self.mtp_durable_offload:
+            raise RuntimeError(
+                "DSA MTP durable runtime/group capability disagrees: "
+                f"runtime={self.mtp_durable_offload}, group={mtp_group_id}"
+            )
         num_reqs = self.active_num_reqs
         scheduled = self._scheduled_tokens_i64[:num_reqs]
         computed = self._computed_tokens_i64[:num_reqs]
@@ -898,6 +986,12 @@ class DSAOffloadRuntime:
         indexer_table = input_batch.block_table[int(indexer_group_id)]
         indexer_blocks = indexer_table.get_numpy_array()
         indexer_row_widths = indexer_table.num_blocks_per_row
+        mtp_blocks: np.ndarray | None = None
+        mtp_row_widths: np.ndarray | None = None
+        if mtp_group_id is not None:
+            mtp_table = input_batch.block_table[int(mtp_group_id)]
+            mtp_blocks = mtp_table.get_numpy_array()
+            mtp_row_widths = mtp_table.num_blocks_per_row
         job_count = 0
         for row_value in boundary_rows:
             row = int(row_value)
@@ -925,6 +1019,19 @@ class DSAOffloadRuntime:
                 row,
                 logical_start:logical_end,
             ]
+            if mtp_blocks is not None and mtp_row_widths is not None:
+                if logical_end > int(mtp_row_widths[row]):
+                    raise RuntimeError(
+                        "DSA complete dump references an unallocated MTP "
+                        f"block: row={row}, logical_end={logical_end}, "
+                        f"mtp_blocks={int(mtp_row_widths[row])}"
+                    )
+                self._dump_mtp_source_blocks[jobs] = mtp_blocks[
+                    row,
+                    logical_start:logical_end,
+                ]
+            else:
+                self._dump_mtp_source_blocks[jobs] = 0
             if state.row_modes_cpu[row] == DSA_ROW_MODE_SPARSE:
                 if count > 1:
                     raise RuntimeError(
@@ -978,6 +1085,9 @@ class DSAOffloadRuntime:
         self.dump_indexer_src_block_ids.np[:job_count] = (
             self._dump_indexer_source_blocks[:job_count]
         )
+        self.dump_mtp_src_block_ids.np[:job_count] = (
+            self._dump_mtp_source_blocks[:job_count]
+        )
         self.dump_dst_block_ids.np[:job_count] = (
             physical_block_ids
         )
@@ -1012,6 +1122,92 @@ class DSAOffloadRuntime:
             return False
         self._layer_dump_epochs[layer_id] = self._forward_epoch
         return True
+
+    def claim_mtp_layer_dump(
+        self,
+        *,
+        layer_id: int,
+        before_cache_write: bool,
+    ) -> bool:
+        """同一 outer forward 内让每个 MTP 层只发射一次 full dump。"""
+
+        layer_id = int(layer_id)
+        if bool(before_cache_write) != self.dump_before_cache_write:
+            return False
+        if self.dram_store is None or layer_id not in self.dram_store.mtp_layer_ids:
+            raise IndexError(
+                f"DSA MTP dump layer {layer_id} has no bound DRAM arena"
+            )
+        if self._mtp_layer_dump_epochs.get(layer_id) == self._forward_epoch:
+            return False
+        self._mtp_layer_dump_epochs[layer_id] = self._forward_epoch
+        return True
+
+    def validate_mtp_dump_completion(self) -> None:
+        """Reject publishing a durable bundle with stale MTP cache planes.
+
+        Target Indexer/MLA dumps run inside the target forward, while the MTP
+        cache dump runs later inside the eager proposer.  The L3 connector is
+        finalized only after both model paths.  This guard makes that ordering
+        an explicit correctness contract instead of allowing an incomplete
+        L2 bundle to be published silently.
+        """
+
+        if not self.mtp_durable_offload or self.dump_job_count == 0:
+            return
+        store = self.dram_store
+        if store is None:
+            raise RuntimeError(
+                "DSA MTP dump completion check has no bound DRAM store"
+            )
+        expected_layers = store.mtp_layer_ids
+        if not expected_layers:
+            raise RuntimeError(
+                "DSA MTP durable offload has no bound MTP cache layers"
+            )
+        completed_layers = tuple(
+            layer_id
+            for layer_id in expected_layers
+            if self._mtp_layer_dump_epochs.get(layer_id)
+            == self._forward_epoch
+        )
+        if completed_layers != expected_layers:
+            missing_layers = tuple(
+                layer_id
+                for layer_id in expected_layers
+                if layer_id not in completed_layers
+            )
+            raise RuntimeError(
+                "DSA cannot publish a durable MTP bundle before every MTP "
+                "cache layer is copied: "
+                f"forward_epoch={self._forward_epoch}, "
+                f"dump_jobs={self.dump_job_count}, "
+                f"before_cache_write={self.dump_before_cache_write}, "
+                f"expected_layers={expected_layers}, "
+                f"completed_layers={completed_layers}, "
+                f"missing_layers={missing_layers}, "
+                "first_src_block="
+                f"{int(self.dump_mtp_src_block_ids.np[0])}, "
+                "first_dst_block="
+                f"{int(self.dump_dst_block_ids.np[0])}"
+            )
+        timing = bool(self.dump_before_cache_write)
+        if timing not in self._logged_mtp_dump_timings:
+            last_job = self.dump_job_count - 1
+            logger.info(
+                "DSA MTP durable dump completed: epoch=%d jobs=%d "
+                "layers=%s timing=%s src_blocks=(%d,%d) "
+                "dst_blocks=(%d,%d)",
+                self._forward_epoch,
+                self.dump_job_count,
+                expected_layers,
+                "prewrite" if timing else "postwrite",
+                int(self.dump_mtp_src_block_ids.np[0]),
+                int(self.dump_mtp_src_block_ids.np[last_job]),
+                int(self.dump_dst_block_ids.np[0]),
+                int(self.dump_dst_block_ids.np[last_job]),
+            )
+            self._logged_mtp_dump_timings.add(timing)
 
     def _refresh_active_dram_table(
         self,
@@ -1111,6 +1307,53 @@ class DSAOffloadRuntime:
             )
             self._lidu_output_views[num_reqs] = view
         return view
+
+
+@dataclass(frozen=True)
+class DSAMTPFullCacheOffloadContext:
+    """MTP proposer 的 full-cache 满块持久化钩子。
+
+    它不改变 MTP attention 或 cache slot 语义，只在既有 durable dump
+    boundary 上复制原生 BF16 planes。decode 在第一轮 proposer 写前复制，
+    prefill 在 cache 写后复制；同一 outer step 的后续 draft 调用自动跳过。
+    """
+
+    layer_id: int
+    runtime: DSAOffloadRuntime
+
+    def dump_full_blocks(self, *, before_cache_write: bool) -> None:
+        # GLM-5.x MTP proposer currently remains eager. Use the compact real
+        # job count instead of target FULL-graph padding so steady decode does
+        # not launch three no-op byte copies on every draft step.
+        job_count = self.runtime.dump_job_count
+        if job_count == 0:
+            return
+        if not self.runtime.claim_mtp_layer_dump(
+            layer_id=self.layer_id,
+            before_cache_write=before_cache_write,
+        ):
+            return
+        store = self.runtime.dram_store
+        if store is None:
+            raise RuntimeError("DSA MTP layer has no bound DRAM store")
+        arenas = store.get_mtp_layer_arenas(self.layer_id)
+        if len(arenas.source_bytes) != len(arenas.dram_bytes):
+            raise RuntimeError(
+                "DSA MTP source/DRAM plane count mismatch"
+            )
+        source_ids = self.runtime.dump_mtp_src_block_ids.gpu[:job_count]
+        destination_ids = self.runtime.dump_dst_block_ids.gpu[:job_count]
+        for source_bytes, dram_bytes in zip(
+            arenas.source_bytes,
+            arenas.dram_bytes,
+            strict=True,
+        ):
+            dump_full_cache_plane_bytes(
+                source_bytes=source_bytes,
+                dram_bytes=dram_bytes,
+                src_block_ids=source_ids,
+                dst_block_ids=destination_ids,
+            )
 
 
 @dataclass(frozen=True)

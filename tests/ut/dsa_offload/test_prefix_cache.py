@@ -21,6 +21,7 @@ class _HBMManager:
     def __init__(self, hits=()) -> None:
         self.hits = list(hits)
         self.block_pool = object()
+        self.block_size = 128
         self.calls = []
 
     def find_longest_cache_hit(self, **kwargs):
@@ -340,7 +341,7 @@ def test_dram_prefix_admission_counts_evictable_hits_and_new_suffix() -> None:
     )
 
 
-def test_mtp_effective_hit_limits_target_dram_prefix() -> None:
+def test_mtp_hbm_triple_and_l2_apply_one_boundary_drop() -> None:
     directory = DSASchedulerDRAMBlockDirectory(
         usable_blocks=8,
         max_logical_blocks=8,
@@ -391,8 +392,8 @@ def test_mtp_effective_hit_limits_target_dram_prefix() -> None:
     )
 
     assert hit_tokens == 3 * 128
-    assert groups[0] == []
-    assert groups[1] == []
+    assert groups[0] == coordinator.indexer_manager.hits[:3]
+    assert groups[1] == coordinator.resident_manager.hits[:3]
     assert groups[2] == mtp_blocks
     assert mtp_manager.calls[0]["drop_eagle_block"] is True
     assert mtp_manager.calls[0]["max_length"] == 5 * 128
@@ -402,10 +403,119 @@ def test_mtp_effective_hit_limits_target_dram_prefix() -> None:
     assert plan.mtp_blocks == tuple(mtp_blocks)
 
 
+def test_mtp_complete_l2_bundle_replays_without_mtp_hbm_hit() -> None:
+    directory = DSASchedulerDRAMBlockDirectory(
+        usable_blocks=8,
+        max_logical_blocks=8,
+        block_size=128,
+        enable_caching=True,
+    )
+    hashes = _prime_dram_prefix(directory, 4)
+    coordinator = object.__new__(DSAKVCacheCoordinator)
+    coordinator.dram_directory = directory
+    coordinator.dram_block_size = 128
+    coordinator.scheduler_block_size = 128
+    coordinator.hash_block_size = 128
+    coordinator.num_single_type_manager = 3
+    coordinator.group_ids = SimpleNamespace(
+        indexer=0,
+        resident_mla=1,
+        mtp_full=2,
+    )
+    coordinator.mtp_full_manager = _HBMManager()
+    _bind_target_hbm(coordinator)
+    coordinator._pending_prefix_hits = {}
+    request = SimpleNamespace(request_id="target", block_hashes=hashes)
+
+    groups, hit_tokens = coordinator.prepare_prefix_cache_hit(
+        request,
+        4 * 128,
+    )
+
+    assert hit_tokens == 3 * 128
+    assert groups == ([], [], [])
+    plan = coordinator.get_pending_prefix_hit(request.request_id)
+    assert plan is not None
+    assert len(plan.dram_blocks) == 3
+
+
+def test_mtp_external_suffix_drops_only_its_final_boundary_block() -> None:
+    directory = DSASchedulerDRAMBlockDirectory(
+        usable_blocks=8,
+        max_logical_blocks=8,
+        block_size=128,
+        enable_caching=True,
+    )
+    coordinator = object.__new__(DSAKVCacheCoordinator)
+    coordinator.dram_directory = directory
+    coordinator.dram_block_size = 128
+    coordinator.mtp_full_manager = _HBMManager()
+    coordinator._pending_prefix_hits = {}
+    request = _request("target", 5)
+
+    external_tokens = coordinator.prepare_external_prefix_cache_hit(
+        request,
+        local_computed_tokens=0,
+        external_block_count=5,
+    )
+
+    assert external_tokens == 4 * 128
+    plan = coordinator.get_pending_prefix_hit(request.request_id)
+    assert plan is not None
+    assert len(plan.external_block_hashes) == 4
+
+
+def test_mtp_l2_l3_merged_prefix_drops_one_block_total() -> None:
+    directory = DSASchedulerDRAMBlockDirectory(
+        usable_blocks=8,
+        max_logical_blocks=8,
+        block_size=128,
+        enable_caching=True,
+    )
+    hashes = list(_prime_dram_prefix(directory, 4))
+    hashes.extend((BlockHash(b"prefix-4"), BlockHash(b"prefix-5")))
+    coordinator = object.__new__(DSAKVCacheCoordinator)
+    coordinator.dram_directory = directory
+    coordinator.dram_block_size = 128
+    coordinator.scheduler_block_size = 128
+    coordinator.hash_block_size = 128
+    coordinator.num_single_type_manager = 3
+    coordinator.group_ids = SimpleNamespace(
+        indexer=0,
+        resident_mla=1,
+        mtp_full=2,
+    )
+    coordinator.mtp_full_manager = _HBMManager()
+    _bind_target_hbm(coordinator)
+    coordinator._pending_prefix_hits = {}
+    request = SimpleNamespace(request_id="target", block_hashes=hashes)
+
+    _, local_tokens = coordinator.prepare_prefix_cache_hit(
+        request,
+        6 * 128,
+    )
+    external_tokens = coordinator.prepare_external_prefix_cache_hit(
+        request,
+        local_computed_tokens=local_tokens,
+        # L3 starts at logical block 3 and sees blocks 3, 4, 5.
+        external_block_count=3,
+    )
+
+    assert local_tokens == 3 * 128
+    assert external_tokens == 2 * 128
+    plan = coordinator.get_pending_prefix_hit(request.request_id)
+    assert plan is not None
+    assert plan.num_computed_tokens == 5 * 128
+    assert plan.external_block_hashes == tuple(
+        bytes(block_hash) for block_hash in hashes[3:5]
+    )
+
+
 def test_target_hbm_hashes_only_dense_resident_blocks() -> None:
     class _CacheRecorder:
         def __init__(self) -> None:
             self.calls = []
+            self.block_size = 128
 
         def cache_blocks(self, request, tokens, **kwargs) -> None:
             self.calls.append((request.request_id, tokens, kwargs))
@@ -416,6 +526,7 @@ def test_target_hbm_hashes_only_dense_resident_blocks() -> None:
     coordinator.indexer_manager = indexer
     coordinator.resident_manager = resident
     coordinator.mtp_full_manager = None
+    coordinator.scheduler_block_size = 128
     coordinator.retention_interval = None
     state = SimpleNamespace(stage=DSARequestCacheStage.PREFILL)
     coordinator.request_cache_layout = SimpleNamespace(
@@ -435,6 +546,6 @@ def test_target_hbm_hashes_only_dense_resident_blocks() -> None:
     mtp = _CacheRecorder()
     coordinator.mtp_full_manager = mtp
     coordinator.cache_blocks(request, 512)
-    assert len(indexer.calls) == 2
+    assert len(indexer.calls) == 3
     assert len(resident.calls) == 1
     assert len(mtp.calls) == 1

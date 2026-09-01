@@ -6,10 +6,10 @@
 地址的 swapped-memory payload arena，并把 scheduler 下发的 assignment
 镜像为 ``resident pool row -> logical block -> physical block id``。
 
-该 store 只保存 target transformer 层的 payload。方案二中的 MTP draft
-层使用独立原生 BF16 full cache，不注册 DRAM arena。MTP provisional token
-只会影响 target 的 HBM 双尾块；只有下一 outer step 看到 scheduler 已确认
-长度后，target durable full-block 水位才会推进并规划对应 dump。
+no-MTP 时 store 保存 target transformer payload；MTP prefix 开启后，同一个
+logical block 还保存 proposer 原生 BF16 full-cache planes。MTP 在活跃 sparse
+decode 中仍全量驻留 HBM，不做 token-wise swap；只有 scheduler 已确认前缀内的
+完整块才进入该 arena，provisional tail 永不发布。
 
 prefix cache 的 hash/refcount 真源仍在 scheduler；worker 镜像允许多个 active
 请求行指向同一个只读 DRAM block，只维护用于校验 assignment/release 对称性的
@@ -49,6 +49,14 @@ class DSALayerDRAMArenas:
     resident_dram_bytes: tuple[torch.Tensor, ...] = ()
     indexer_source_bytes: tuple[torch.Tensor, ...] = ()
     indexer_dram_bytes: tuple[torch.Tensor, ...] = ()
+
+
+@dataclass(frozen=True)
+class DSAMTPLayerDRAMArenas:
+    """一个 MTP full-cache 层的原生 HBM 与 swapped-memory byte planes。"""
+
+    source_bytes: tuple[torch.Tensor, ...]
+    dram_bytes: tuple[torch.Tensor, ...]
 
 
 def _allocate_swapped_arena(
@@ -104,6 +112,7 @@ class DSAWorkerDRAMStore:
         self.device = torch.device(device)
         self._arena_factory = arena_factory or _allocate_swapped_arena
         self._layer_arenas: dict[int, DSALayerDRAMArenas] = {}
+        self._mtp_layer_arenas: dict[int, DSAMTPLayerDRAMArenas] = {}
         self.expected_bytes_per_logical_block = (
             int(expected_bytes_per_logical_block)
             if expected_bytes_per_logical_block is not None
@@ -338,6 +347,60 @@ class DSAWorkerDRAMStore:
             "indexer_dram_bytes": tuple(dram_views),
         }
 
+    def add_mtp_layer(
+        self,
+        *,
+        layer_id: int,
+        mtp_full_cache: tuple[torch.Tensor, ...],
+    ) -> None:
+        """为原生 BF16 MTP full-cache 建立 opaque-byte DRAM planes。"""
+
+        layer_id = int(layer_id)
+        if layer_id in self._mtp_layer_arenas:
+            raise RuntimeError(
+                f"DSA MTP DRAM layer {layer_id} was initialized twice"
+            )
+        if len(mtp_full_cache) != 3 or any(
+            plane.dtype != torch.bfloat16 for plane in mtp_full_cache
+        ):
+            raise ValueError(
+                "DSA MTP full-cache must contain three native BF16 planes"
+            )
+        source_views: list[torch.Tensor] = []
+        dram_views: list[torch.Tensor] = []
+        for plane_index, plane in enumerate(mtp_full_cache):
+            if plane.shape[0] <= 0:
+                raise ValueError("DSA MTP cache must contain physical blocks")
+            source = cache_block_byte_view(
+                plane,
+                name=f"mtp_cache[layer={layer_id},plane={plane_index}]",
+            )
+            dram = self._allocate_payload_arena(
+                block_shape=(int(source.shape[1]),),
+                dtype=torch.int8,
+                payload_name=f"mtp[layer={layer_id},plane={plane_index}]",
+            )
+            expected_shape = (self.arena_capacity, int(source.shape[1]))
+            if (
+                dram.dtype != torch.int8
+                or tuple(dram.shape) != expected_shape
+                or not dram.is_contiguous()
+            ):
+                raise RuntimeError(
+                    "DSA MTP DRAM arena factory returned an invalid tensor: "
+                    f"layer={layer_id}, plane={plane_index}, "
+                    f"shape={tuple(dram.shape)}, dtype={dram.dtype}, "
+                    f"contiguous={dram.is_contiguous()}"
+                )
+            dram[DSA_DRAM_NULL_BLOCK_ID].zero_()
+            source_views.append(source)
+            dram_views.append(dram)
+            self._registered_bytes_per_logical_block += int(source.shape[1])
+        self._mtp_layer_arenas[layer_id] = DSAMTPLayerDRAMArenas(
+            source_bytes=tuple(source_views),
+            dram_bytes=tuple(dram_views),
+        )
+
     def finalize_payload_layout(self) -> None:
         """在 worker 启动期确认实际 arena 与 scheduler 字节模型完全一致。"""
 
@@ -358,6 +421,25 @@ class DSAWorkerDRAMStore:
         except KeyError as exc:
             raise RuntimeError(f"DSA DRAM arenas are not initialized for layer {layer_id}") from exc
 
+    def get_mtp_layer_arenas(self, layer_id: int) -> DSAMTPLayerDRAMArenas:
+        try:
+            return self._mtp_layer_arenas[int(layer_id)]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"DSA MTP DRAM arenas are not initialized for layer {layer_id}"
+            ) from exc
+
+    @property
+    def l3_components(self) -> tuple[DSAL3Component, ...]:
+        components = [DSAL3Component.INDEXER, DSAL3Component.MLA]
+        if self._mtp_layer_arenas:
+            components.append(DSAL3Component.MTP)
+        return tuple(components)
+
+    @property
+    def mtp_layer_ids(self) -> tuple[int, ...]:
+        return tuple(sorted(self._mtp_layer_arenas))
+
     def _l3_component_planes(
         self,
         component: DSAL3Component | str,
@@ -366,12 +448,16 @@ class DSAWorkerDRAMStore:
 
         component = DSAL3Component(component)
         planes: list[torch.Tensor] = []
-        for layer_id in sorted(self._layer_arenas):
-            arenas = self._layer_arenas[layer_id]
-            if component is DSAL3Component.INDEXER:
-                planes.extend(arenas.indexer_dram_bytes)
-            else:
-                planes.extend(arenas.resident_dram_bytes)
+        if component is DSAL3Component.MTP:
+            for layer_id in sorted(self._mtp_layer_arenas):
+                planes.extend(self._mtp_layer_arenas[layer_id].dram_bytes)
+        else:
+            for layer_id in sorted(self._layer_arenas):
+                arenas = self._layer_arenas[layer_id]
+                if component is DSAL3Component.INDEXER:
+                    planes.extend(arenas.indexer_dram_bytes)
+                else:
+                    planes.extend(arenas.resident_dram_bytes)
         if not planes:
             raise RuntimeError(
                 f"DSA L3 component {component.value!r} has no DRAM planes"
@@ -398,12 +484,16 @@ class DSAWorkerDRAMStore:
 
         component = DSAL3Component(component)
         planes: list[torch.Tensor] = []
-        for layer_id in sorted(self._layer_arenas):
-            arenas = self._layer_arenas[layer_id]
-            if component is DSAL3Component.INDEXER:
-                planes.extend(arenas.indexer_source_bytes)
-            else:
-                planes.extend(arenas.resident_source_bytes)
+        if component is DSAL3Component.MTP:
+            for layer_id in sorted(self._mtp_layer_arenas):
+                planes.extend(self._mtp_layer_arenas[layer_id].source_bytes)
+        else:
+            for layer_id in sorted(self._layer_arenas):
+                arenas = self._layer_arenas[layer_id]
+                if component is DSAL3Component.INDEXER:
+                    planes.extend(arenas.indexer_source_bytes)
+                else:
+                    planes.extend(arenas.resident_source_bytes)
         if not planes:
             raise RuntimeError(
                 f"DSA L3 component {component.value!r} has no HBM planes"
@@ -427,7 +517,7 @@ class DSAWorkerDRAMStore:
 
         regions: list[tuple[int, int]] = []
         seen_ptrs: set[int] = set()
-        for component in DSAL3Component:
+        for component in self.l3_components:
             for plane in self._l3_component_planes(component):
                 pointer = int(plane.data_ptr())
                 size = int(plane.numel()) * plane.element_size()
@@ -443,7 +533,7 @@ class DSAWorkerDRAMStore:
         """返回 direct-HBM load 需要注册的底层 storage 区间。"""
 
         region_sizes: dict[int, int] = {}
-        for component in DSAL3Component:
+        for component in self.l3_components:
             for plane in self._l3_hbm_component_planes(component):
                 storage = plane.untyped_storage()
                 pointer = int(storage.data_ptr())

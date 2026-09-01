@@ -398,31 +398,52 @@ def build_dsa_kv_cache_config(
 
 def dsa_dram_bytes_per_logical_block(
     kv_cache_groups: list[KVCacheGroupSpec],
+    *,
+    include_mtp: bool = True,
 ) -> int:
-    """返回 target dense Indexer+MLA 一个完整语义块的每-rank 字节数。"""
+    """返回一个完整 DSA durable bundle 的每-rank 字节数。
 
-    target_groups = [
+    no-MTP bundle 由 target dense Indexer+MLA 组成；``include_mtp`` 时额外
+    包含 proposer 原生 BF16 full-cache。MTP 仍不会参与 sparse decode 的
+    token-wise swap；只有 prefix caching 或 L3 开启时，已验证满块才与 target
+    payload 共用一个 L2 logical block。
+    """
+
+    bundle_groups = [
         group
         for group in kv_cache_groups
         if (
             is_dsa_indexer_spec(group.kv_cache_spec)
             or is_dsa_resident_mla_spec(group.kv_cache_spec)
+            or (
+                include_mtp
+                and is_dsa_mtp_full_spec(group.kv_cache_spec)
+            )
         )
     ]
     indexer_groups = [
         group
-        for group in target_groups
+        for group in bundle_groups
         if is_dsa_indexer_spec(group.kv_cache_spec)
     ]
     resident_groups = [
         group
-        for group in target_groups
+        for group in bundle_groups
         if is_dsa_resident_mla_spec(group.kv_cache_spec)
+    ]
+    mtp_groups = [
+        group
+        for group in bundle_groups
+        if is_dsa_mtp_full_spec(group.kv_cache_spec)
     ]
     if len(indexer_groups) != 1 or len(resident_groups) != 1:
         raise RuntimeError(
             "DSA DRAM sizing requires exactly one target Indexer group and "
             "one target resident MLA group"
+        )
+    if len(mtp_groups) > 1:
+        raise RuntimeError(
+            "DSA DRAM sizing supports at most one MTP full-cache group"
         )
     indexer_block_size = int(indexer_groups[0].kv_cache_spec.block_size)
     resident_block_size = int(resident_groups[0].kv_cache_spec.block_size)
@@ -432,14 +453,34 @@ def dsa_dram_bytes_per_logical_block(
             "block sizes: "
             f"indexer={indexer_block_size}, resident={resident_block_size}"
         )
+    if mtp_groups:
+        mtp_block_size = int(mtp_groups[0].kv_cache_spec.block_size)
+        if mtp_block_size != indexer_block_size:
+            raise RuntimeError(
+                "DSA complete DRAM blocks require matching target/MTP block "
+                "sizes: "
+                f"target={indexer_block_size}, mtp={mtp_block_size}"
+            )
     total = sum(
         int(group.kv_cache_spec.page_size_bytes)
         * len(group.layer_names)
-        for group in target_groups
+        for group in bundle_groups
     )
     if total <= 0:
-        raise RuntimeError("DSA complete DRAM block contains no target payload")
+        raise RuntimeError("DSA complete DRAM block contains no payload")
     return total
+
+
+def dsa_mtp_durable_offload_enabled(vllm_config: VllmConfig) -> bool:
+    """Whether verified MTP full blocks need an L2/L3 durable mirror."""
+
+    if bool(vllm_config.cache_config.enable_prefix_caching):
+        return True
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    return bool(
+        kv_transfer_config is not None
+        and kv_transfer_config.kv_connector == "DSAL3Connector"
+    )
 
 
 def _dsa_l3_host_reservation_bytes(
@@ -502,8 +543,12 @@ def finalize_dsa_dram_capacity(
             f"worker_configs={len(dsa_configs)}, tp_size={tp_size}"
         )
 
+    include_mtp = dsa_mtp_durable_offload_enabled(vllm_config)
     bundle_sizes = {
-        dsa_dram_bytes_per_logical_block(config.kv_cache_groups)
+        dsa_dram_bytes_per_logical_block(
+            config.kv_cache_groups,
+            include_mtp=include_mtp,
+        )
         for config in dsa_configs
     }
     if len(bundle_sizes) != 1:
@@ -560,7 +605,7 @@ def finalize_dsa_dram_capacity(
     if plan.was_downsized:
         logger.warning_once(
             "DSA host DRAM cannot satisfy hot_cpu_block_multiple; using "
-            "the largest complete Indexer+MLA pool that fits: "
+            "the largest complete durable-bundle pool that fits: "
             "desired_blocks=%d, selected_blocks=%d, effective_multiple=%.3f",
             plan.desired_usable_blocks,
             plan.usable_blocks,
@@ -574,6 +619,16 @@ def finalize_dsa_dram_capacity(
             plan.usable_blocks,
         )
 
+    mtp_bytes_per_block = sum(
+        int(group.kv_cache_spec.page_size_bytes) * len(group.layer_names)
+        for group in dsa_configs[0].kv_cache_groups
+        if include_mtp and is_dsa_mtp_full_spec(group.kv_cache_spec)
+    )
+    bundle_description = (
+        "target Indexer + MLA + MTP BF16"
+        if mtp_bytes_per_block
+        else "target Indexer + MLA"
+    )
     logger.info_once(
         "\n"
         "================ DSA DRAM CAPACITY REPORT ====================\n"
@@ -582,7 +637,8 @@ def finalize_dsa_dram_capacity(
         "  DSA planning bytes        : %s bytes (%s GiB)\n"
         "  Local TP workers          : %s\n"
         "  Per-rank available bytes  : %s bytes (%s GiB)\n"
-        "  Complete block payload    : %s bytes (target Indexer + MLA)\n"
+        "  Complete block payload    : %s bytes (%s)\n"
+        "  MTP durable payload       : %s\n"
         "  Minimum usable blocks     : %s (per-rank HBM Indexer mirror)\n"
         "  Desired usable blocks     : %s\n"
         "  Selected usable blocks    : %s (effective multiple %.3fx)\n"
@@ -601,6 +657,12 @@ def finalize_dsa_dram_capacity(
         f"{plan.per_rank_available_bytes:,}",
         format_gib(plan.per_rank_available_bytes),
         f"{plan.bytes_per_logical_block:,}",
+        bundle_description,
+        (
+            f"{mtp_bytes_per_block:,} bytes/block"
+            if mtp_bytes_per_block
+            else "disabled"
+        ),
         f"{plan.minimum_usable_blocks:,}",
         f"{plan.desired_usable_blocks:,}",
         f"{plan.usable_blocks:,}",
@@ -611,7 +673,7 @@ def finalize_dsa_dram_capacity(
         format_gib(plan.total_reserved_bytes),
         plan.was_downsized,
         (
-            "enabled (complete Indexer+MLA bundle)"
+            "enabled (complete durable bundle)"
             if vllm_config.cache_config.enable_prefix_caching
             else "disabled"
         ),

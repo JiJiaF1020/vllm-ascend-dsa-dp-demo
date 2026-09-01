@@ -481,6 +481,16 @@ background Python 线程跨 segment 均已通过。`dsa_a5_glm52` 进一步把�
 bytes，MLA packed plane 为 83,968 bytes。该门禁用于判断剩余故障是否与非等长
 descriptor 或同一次 API 的双 key 事务有关；当前该精确门禁已经通过。
 
+固定 MTP3 多级 prefix 在该布局上增加一个三 plane BF16 key，可先将上面命令
+的布局替换为：
+
+```bash
+MOONCAKE_TP_PAYLOAD_LAYOUT=dsa_a5_glm52_mtp
+```
+
+该模式为 123 descriptors、3 keys、7,084,544 bytes/block，分别覆盖 MTP
+NOPE 512、ROPE 64 和 Indexer 128 维 BF16 page，不改变其余 TP/arena 参数。
+
 TP8 框架失败呈现 NPU0-3 与 NPU4-7 的目标 segment 分界，下一轮使用
 `MOONCAKE_TP_TARGET_DEVICE` 指定物理目标卡，使用
 `MOONCAKE_TP_PLACEMENT_MODE=automatic` 复刻 Master 自动放置，并可分别通过

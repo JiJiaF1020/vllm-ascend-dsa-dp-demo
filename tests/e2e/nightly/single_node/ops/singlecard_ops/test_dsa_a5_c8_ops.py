@@ -9,6 +9,7 @@ from vllm_ascend.dsa_offload.contracts import DSA_LIDU_CACHE_ROW_ALIGNMENT
 from vllm_ascend.dsa_offload.ops import (
     quant_lightning_indexer_topk,
     require_dsa_offload_ops,
+    sparse_flash_attention_for_offload_c8,
 )
 from vllm_ascend.utils import (
     AscendDeviceType,
@@ -25,6 +26,26 @@ _PACKED_ROW_BYTES = 656
 _TOPK = 2048
 _COPY_CAPACITY = 16384
 _ATTENTION_CAPACITY = _TOPK + _BLOCK_SIZE
+
+
+def _recycled_resident_block_ids() -> torch.Tensor:
+    """Physical layout observed when the fifth 40K request reuses HBM."""
+
+    return torch.cat(
+        (
+            torch.arange(294, 214, -1, dtype=torch.int32),
+            torch.tensor([295], dtype=torch.int32),
+        )
+    )
+
+
+def _fresh_resident_block_ids() -> torch.Tensor:
+    return torch.cat(
+        (
+            torch.arange(327, 407, dtype=torch.int32),
+            torch.tensor([326], dtype=torch.int32),
+        )
+    )
 
 
 def _cache_row_width(max_model_len: int) -> int:
@@ -892,6 +913,29 @@ def test_packed_c8_mtp_lim_steady_fast_path_updates_union_and_dual_tails(
     assert resident_lengths.tolist() == [budget + 2 * _BLOCK_SIZE]
     assert int(pool_after[-1]) == budget
 
+    expected_attention = outputs[0].clone()
+    expected_resident_lengths = outputs[1].clone()
+    pool_before_repeat = cache_slots.clone()
+    for repeat_index in range(8):
+        repeat_outputs = _allocate_fused_lidu_outputs(
+            batch=1,
+            total_query_rows=queries_per_request,
+        )
+        _launch_mtp_lim(steady_inputs, cache_slots, repeat_outputs)
+        torch.npu.synchronize()
+        repeat_attention = repeat_outputs[0]
+        for route in range(queries_per_request):
+            _assert_exact_int_tensor(
+                torch.sort(repeat_attention[route, 0]).values,
+                torch.sort(expected_attention[route, 0]).values,
+            )
+        assert torch.equal(
+            repeat_outputs[1],
+            expected_resident_lengths,
+        ), f"MTP steady resident lengths changed at repeat {repeat_index}"
+        assert repeat_outputs[-1].cpu().tolist() == [0]
+        assert torch.equal(cache_slots, pool_before_repeat)
+
 
 @pytest.mark.parametrize("heads", [32, 64])
 def test_packed_c8_mtp_lim_steady_fast_path_has_exact_monotonic_topk(
@@ -1061,12 +1105,23 @@ def test_packed_c8_fused_lidu_sparse_first_fill_then_steady(
     assert int(attention[0, 0, _TOPK]) == budget
     assert torch.all(attention[0, 0, _TOPK + 1 :] == -1)
 
-    repeat_outputs = _allocate_fused_lidu_outputs()
+    expected_attention = outputs[0].clone()
+    expected_resident_lengths = outputs[1].clone()
     pool_before_repeat = cache_slots.clone()
-    _launch_fused_lidu(inputs, cache_slots, repeat_outputs)
-    torch.npu.synchronize()
-    assert repeat_outputs[-1].cpu().tolist() == [0]
-    assert torch.equal(cache_slots, pool_before_repeat)
+    for repeat_index in range(8):
+        repeat_outputs = _allocate_fused_lidu_outputs()
+        _launch_fused_lidu(inputs, cache_slots, repeat_outputs)
+        torch.npu.synchronize()
+        assert torch.equal(
+            repeat_outputs[0],
+            expected_attention,
+        ), f"steady attention changed at repeat {repeat_index}"
+        assert torch.equal(
+            repeat_outputs[1],
+            expected_resident_lengths,
+        ), f"steady resident lengths changed at repeat {repeat_index}"
+        assert repeat_outputs[-1].cpu().tolist() == [0]
+        assert torch.equal(cache_slots, pool_before_repeat)
 
 
 def test_packed_c8_fused_lidu_mixed_dense_sparse_and_pad_rows() -> None:
@@ -1415,3 +1470,359 @@ def test_packed_c8_ksc_copies_one_opaque_row() -> None:
     torch.npu.synchronize()
 
     assert torch.equal(hbm[0, 3, 0].cpu(), expected)
+
+
+def test_packed_c8_ksc_honors_permuted_l2_and_hbm_block_tables() -> None:
+    torch.manual_seed(1024)
+    dram_logical_blocks = 325
+    dram_physical_blocks = 326
+    hbm_physical_blocks = 407
+    copy_count = 10240
+    dram_cpu = _make_unique_packed_rows(
+        dram_physical_blocks * _BLOCK_SIZE
+    ).view(
+        dram_physical_blocks,
+        _BLOCK_SIZE,
+        1,
+        _PACKED_ROW_BYTES,
+    )
+    dram = _swapped_arena(tuple(dram_cpu.shape))
+    _write_swapped_arena(dram, dram_cpu)
+    hbm = torch.full(
+        (
+            hbm_physical_blocks,
+            _BLOCK_SIZE,
+            1,
+            _PACKED_ROW_BYTES,
+        ),
+        73,
+        dtype=torch.int8,
+        device="npu",
+    )
+    dram_table_cpu = torch.arange(
+        1,
+        dram_logical_blocks + 1,
+        dtype=torch.int32,
+    ).view(1, -1)
+    hbm_table_cpu = _recycled_resident_block_ids().view(1, -1)
+    source_tokens_cpu = torch.randperm(
+        dram_logical_blocks * _BLOCK_SIZE,
+        dtype=torch.int32,
+    )[:copy_count]
+    destination_slots_cpu = torch.arange(
+        copy_count,
+        dtype=torch.int32,
+    )
+    source_tokens = torch.full(
+        (1, 1, _COPY_CAPACITY),
+        -1,
+        dtype=torch.int32,
+        device="npu",
+    )
+    destination_slots = torch.full_like(source_tokens, -1)
+    source_tokens[0, 0, :copy_count] = source_tokens_cpu.to("npu")
+    destination_slots[0, 0, :copy_count] = (
+        destination_slots_cpu.to("npu")
+    )
+
+    torch.ops._C_ascend.npu_dsa_a5_kvcache_scatter_copy_c8_out(
+        hbm,
+        dram,
+        hbm_table_cpu.to("npu"),
+        dram_table_cpu.to("npu"),
+        source_tokens,
+        destination_slots,
+        torch.tensor(
+            [copy_count],
+            dtype=torch.int32,
+            device="npu",
+        ),
+    )
+    torch.npu.synchronize()
+
+    source_logical_blocks = source_tokens_cpu // _BLOCK_SIZE
+    source_offsets = source_tokens_cpu % _BLOCK_SIZE
+    source_physical_blocks = dram_table_cpu[
+        0,
+        source_logical_blocks.to(torch.int64),
+    ].to(torch.int64)
+    destination_logical_blocks = destination_slots_cpu // _BLOCK_SIZE
+    destination_offsets = destination_slots_cpu % _BLOCK_SIZE
+    destination_physical_blocks = hbm_table_cpu[
+        0,
+        destination_logical_blocks.to(torch.int64),
+    ].to(torch.int64)
+    actual = hbm.cpu()[
+        destination_physical_blocks,
+        destination_offsets.to(torch.int64),
+        0,
+    ]
+    expected = dram_cpu[
+        source_physical_blocks,
+        source_offsets.to(torch.int64),
+        0,
+    ]
+    assert torch.equal(actual, expected)
+
+
+def test_packed_c8_qsfa_honors_permuted_block_table_and_is_repeatable() -> None:
+    torch.manual_seed(1024)
+    logical_blocks = 81
+    physical_capacity = 1625
+    block_table_width = 1024
+    resident_seq_len = 10314
+    query = torch.randn(
+        (1, 64, 512 + 64),
+        dtype=torch.bfloat16,
+        device="npu",
+    )
+    key_nope = torch.randn(
+        (logical_blocks, _BLOCK_SIZE, 1, 512),
+        dtype=torch.float32,
+    ).clamp_(-4.0, 4.0).to(torch.float8_e4m3fn).view(torch.int8)
+    key_rope = torch.randn(
+        (logical_blocks, _BLOCK_SIZE, 1, 64),
+        dtype=torch.bfloat16,
+    )
+    scales = torch.rand(
+        (logical_blocks, _BLOCK_SIZE, 1, 4),
+        dtype=torch.float32,
+    ).add_(0.01)
+    logical_packed_kv = torch.cat(
+        (
+            key_nope,
+            key_rope.contiguous().view(torch.int8),
+            scales.contiguous().view(torch.int8),
+        ),
+        dim=-1,
+    )
+    identity_packed_kv = torch.full(
+        (
+            physical_capacity,
+            _BLOCK_SIZE,
+            1,
+            _PACKED_ROW_BYTES,
+        ),
+        73,
+        dtype=torch.int8,
+    )
+    fresh_block_ids = _fresh_resident_block_ids().to(torch.int64)
+    identity_packed_kv[fresh_block_ids] = logical_packed_kv
+    identity_packed_kv = identity_packed_kv.to("npu").view(
+        torch.float8_e4m3fn
+    )
+    recycled_block_ids = _recycled_resident_block_ids().to(torch.int64)
+    permuted_packed_kv = torch.full(
+        (
+            physical_capacity,
+            _BLOCK_SIZE,
+            1,
+            _PACKED_ROW_BYTES,
+        ),
+        73,
+        dtype=torch.int8,
+    )
+    permuted_packed_kv[recycled_block_ids] = logical_packed_kv
+    permuted_packed_kv = permuted_packed_kv.to("npu").view(
+        torch.float8_e4m3fn
+    )
+    sparse_indices = torch.randperm(
+        resident_seq_len,
+        dtype=torch.int32,
+    )[:_ATTENTION_CAPACITY].view(1, 1, _ATTENTION_CAPACITY).to("npu")
+    identity_block_table = torch.zeros(
+        (1, block_table_width),
+        dtype=torch.int32,
+        device="npu",
+    )
+    identity_block_table[0, :logical_blocks] = fresh_block_ids.to(
+        dtype=torch.int32,
+        device="npu",
+    )
+    permuted_block_table = torch.zeros_like(identity_block_table)
+    permuted_block_table[0, :logical_blocks] = recycled_block_ids.to(
+        dtype=torch.int32,
+        device="npu",
+    )
+    query_lengths = torch.tensor([1], dtype=torch.int32, device="npu")
+    resident_lengths = torch.tensor(
+        [resident_seq_len],
+        dtype=torch.int32,
+        device="npu",
+    )
+
+    def run_qsfa(
+        packed_kv: torch.Tensor,
+        block_table: torch.Tensor,
+    ) -> torch.Tensor:
+        return sparse_flash_attention_for_offload_c8(
+            query=query,
+            packed_kv=packed_kv,
+            sparse_indices=sparse_indices,
+            scale_value=(512 + 64) ** -0.5,
+            block_table=block_table,
+            actual_seq_lengths_query=query_lengths,
+            resident_seq_lengths=resident_lengths,
+        ).cpu()
+
+    expected = run_qsfa(identity_packed_kv, identity_block_table)
+    permuted = run_qsfa(permuted_packed_kv, permuted_block_table)
+    assert torch.isfinite(expected).all()
+    assert torch.isfinite(permuted).all()
+    assert torch.equal(permuted, expected), (
+        "A5 DSA-shape QSFA changed when only physical block placement changed"
+    )
+    for repeat_index in range(8):
+        actual = run_qsfa(permuted_packed_kv, permuted_block_table)
+        if torch.equal(actual, expected):
+            continue
+        mismatch = torch.nonzero(actual != expected, as_tuple=False)
+        first_index = tuple(int(value) for value in mismatch[0].tolist())
+        pytest.fail(
+            "A5 DSA-shape QSFA output is not bitwise repeatable: "
+            f"repeat={repeat_index}, first_index={first_index}, "
+            f"actual={float(actual[first_index])}, "
+            f"expected={float(expected[first_index])}, "
+            f"mismatch_count={int(mismatch.shape[0])}"
+        )
+
+
+def test_packed_c8_ksc_to_qsfa_recycled_blocks_are_ordered() -> None:
+    torch.manual_seed(2048)
+    dram_logical_blocks = 325
+    dram_physical_blocks = 326
+    resident_physical_capacity = 1625
+    block_table_width = 1024
+    budget = 10240
+    resident_seq_len = 10314
+
+    key_nope = torch.randn(
+        (dram_logical_blocks, _BLOCK_SIZE, 1, 512),
+        dtype=torch.float32,
+    ).clamp_(-4.0, 4.0).to(torch.float8_e4m3fn).view(torch.int8)
+    key_rope = torch.randn(
+        (dram_logical_blocks, _BLOCK_SIZE, 1, 64),
+        dtype=torch.bfloat16,
+    )
+    scales = torch.rand(
+        (dram_logical_blocks, _BLOCK_SIZE, 1, 4),
+        dtype=torch.float32,
+    ).add_(0.01)
+    logical_dram = torch.cat(
+        (
+            key_nope,
+            key_rope.contiguous().view(torch.int8),
+            scales.contiguous().view(torch.int8),
+        ),
+        dim=-1,
+    )
+    dram_cpu = torch.zeros(
+        (
+            dram_physical_blocks,
+            _BLOCK_SIZE,
+            1,
+            _PACKED_ROW_BYTES,
+        ),
+        dtype=torch.int8,
+    )
+    dram_cpu[1:] = logical_dram
+    dram = _swapped_arena(tuple(dram_cpu.shape))
+    _write_swapped_arena(dram, dram_cpu)
+
+    source_tokens_cpu = torch.randperm(
+        dram_logical_blocks * _BLOCK_SIZE,
+        dtype=torch.int32,
+    )[:budget]
+    destination_slots_cpu = torch.arange(budget, dtype=torch.int32)
+    source_tokens = torch.full(
+        (1, 1, _COPY_CAPACITY),
+        -1,
+        dtype=torch.int32,
+        device="npu",
+    )
+    destination_slots = torch.full_like(source_tokens, -1)
+    source_tokens[0, 0, :budget] = source_tokens_cpu.to("npu")
+    destination_slots[0, 0, :budget] = destination_slots_cpu.to(
+        "npu"
+    )
+    copy_counts = torch.tensor([budget], dtype=torch.int32, device="npu")
+    dram_block_table = torch.zeros(
+        (1, block_table_width),
+        dtype=torch.int32,
+        device="npu",
+    )
+    dram_block_table[0, :dram_logical_blocks] = torch.arange(
+        1,
+        dram_logical_blocks + 1,
+        dtype=torch.int32,
+        device="npu",
+    )
+    query = torch.randn(
+        (1, 64, 512 + 64),
+        dtype=torch.bfloat16,
+        device="npu",
+    )
+    sparse_indices = torch.randperm(
+        resident_seq_len,
+        dtype=torch.int32,
+    )[:_ATTENTION_CAPACITY].view(1, 1, _ATTENTION_CAPACITY).to("npu")
+    query_lengths = torch.tensor([1], dtype=torch.int32, device="npu")
+    resident_lengths = torch.tensor(
+        [resident_seq_len],
+        dtype=torch.int32,
+        device="npu",
+    )
+    hbm_bytes = torch.empty(
+        (
+            resident_physical_capacity,
+            _BLOCK_SIZE,
+            1,
+            _PACKED_ROW_BYTES,
+        ),
+        dtype=torch.int8,
+        device="npu",
+    )
+    tail_block = logical_dram[-1].to("npu")
+
+    def run_chain(
+        resident_block_ids: torch.Tensor,
+        stale_value: int,
+    ) -> torch.Tensor:
+        resident_block_ids = resident_block_ids.to(torch.int64)
+        hbm_bytes.fill_(stale_value)
+        hbm_bytes[int(resident_block_ids[-1])].copy_(tail_block)
+        hbm_block_table = torch.zeros(
+            (1, block_table_width),
+            dtype=torch.int32,
+            device="npu",
+        )
+        hbm_block_table[0, : resident_block_ids.numel()] = (
+            resident_block_ids.to(dtype=torch.int32, device="npu")
+        )
+        torch.ops._C_ascend.npu_dsa_a5_kvcache_scatter_copy_c8_out(
+            hbm_bytes,
+            dram,
+            hbm_block_table,
+            dram_block_table,
+            source_tokens,
+            destination_slots,
+            copy_counts,
+        )
+        # Deliberately do not synchronize between KSC and its QSFA consumer.
+        return sparse_flash_attention_for_offload_c8(
+            query=query,
+            packed_kv=hbm_bytes.view(torch.float8_e4m3fn),
+            sparse_indices=sparse_indices,
+            scale_value=(512 + 64) ** -0.5,
+            block_table=hbm_block_table,
+            actual_seq_lengths_query=query_lengths,
+            resident_seq_lengths=resident_lengths,
+        ).cpu()
+
+    fresh = run_chain(_fresh_resident_block_ids(), 17)
+    recycled = run_chain(_recycled_resident_block_ids(), 73)
+    assert torch.isfinite(fresh).all()
+    assert torch.isfinite(recycled).all()
+    assert torch.equal(recycled, fresh), (
+        "KSC-to-QSFA changed output when only resident physical reuse changed"
+    )

@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 import torch
 
-from vllm_ascend.dsa_offload.worker_dram_store import DSAWorkerDRAMStore
 from vllm_ascend.dsa_offload.input_batch import (
     DSAInputBatchCacheLayout,
     apply_dsa_cache_layout_projection,
@@ -21,6 +20,7 @@ from vllm_ascend.dsa_offload.scheduler_output import (
     DSARequestCacheLayoutProjection,
     DSAResidentBlockTableReplacement,
 )
+from vllm_ascend.dsa_offload.worker_dram_store import DSAWorkerDRAMStore
 
 
 class _BlockTable:
@@ -29,6 +29,9 @@ class _BlockTable:
 
     def add_row(self, block_ids: list[int], row_idx: int) -> None:
         self.added_rows.append((list(block_ids), row_idx))
+
+    def replace_row(self, block_ids: list[int], row_idx: int) -> None:
+        self.add_row(block_ids, row_idx)
 
 
 class _BoundedBlockTable:
@@ -43,6 +46,9 @@ class _BoundedBlockTable:
         if len(values) > self.capacity:
             raise ValueError("block-table row capacity exceeded")
         self.rows[row_idx] = values
+
+    def replace_row(self, block_ids: list[int], row_idx: int) -> None:
+        self.add_row(block_ids, row_idx)
 
     def append_row(self, block_ids: list[int], row_idx: int) -> None:
         values = self.rows.get(row_idx, []) + list(block_ids)

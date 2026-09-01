@@ -66,9 +66,46 @@ PROMPTS = [
 #       ENABLE_L3_WRITE_BEHIND = False
 #       ENABLE_L3_PREFIX_LOADBACK = False
 #
-# 三组都保持 COMPARE_LAST_TWO_PREFIX_REPLAYS/STRICT_PREFIX_REPLAY_TOKEN_MATCH/
-# ALLOW_MULTI_REQUEST_GRAPH_TOPK_VARIANCE 为 True。Case A 比较
-# Local-L2/L3，Case B 比较 Local-L2/Local-L2。
+#   Case D：固定 MTP3 的 40k 三层 prefix 闭环
+#       PROMPTS = chinese_40k
+#       RUN_MODE = "graph"
+#       MAX_NUM_SEQS = 1
+#       MAX_TOKENS = 5
+#       ENABLE_A5_PACKED_C8_DSA = True
+#       ENABLE_MTP = True
+#       ENABLE_CHUNKED_PREFILL = True
+#       ENABLE_PREFIX_CACHING = True
+#       PREFIX_CACHE_REPLAY_ROUNDS = 3
+#       ENABLE_L3_WRITE_BEHIND = True
+#       ENABLE_L3_PREFIX_LOADBACK = True
+#       ENABLE_L3_DIRECT_HBM_LOAD = False
+#
+#   Case E：固定 MTP3 的混合长度 bsz=4 L3 graph
+#       PROMPTS = chinese_8k + chinese_5k + chinese_70k + chinese_40k
+#       RUN_MODE = "graph"
+#       MAX_NUM_SEQS = 4
+#       MAX_MODEL_LEN = 100000
+#       MAX_NUM_BATCHED_TOKENS = 8192
+#       MAX_TOKENS = 32
+#       ENABLE_A5_PACKED_C8_DSA = True
+#       ENABLE_MTP = True
+#       ENABLE_CHUNKED_PREFILL = True
+#       ENABLE_PREFIX_CACHING = True
+#       PREFIX_CACHE_REPLAY_ROUNDS = 3
+#       ENABLE_L3_WRITE_BEHIND = True
+#       ENABLE_L3_PREFIX_LOADBACK = True
+#       ENABLE_L3_DIRECT_HBM_LOAD = False
+#
+#   Case F：固定 MTP3 decode 跨 128-token durable 边界
+#       复用 Case D，但 MAX_TOKENS = 96、IGNORE_EOS = True。40k 样例 prompt
+#       尾块当前约有 72/128 tokens，因此该长度会越过至少一个新满块；重点
+#       检查 prewrite dump、额外 store job、双尾和 shutdown drain，不把
+#       generated suffix 当作下一请求的 prompt prefix。
+#
+# Case A/B/D/E/F 都保持 COMPARE_LAST_TWO_PREFIX_REPLAYS、
+# STRICT_PREFIX_REPLAY_TOKEN_MATCH、ALLOW_MULTI_REQUEST_GRAPH_TOPK_VARIANCE
+# 为 True。L3 case 比较 Local-L2/L3，关闭 loadback 的 Case B 比较
+# Local-L2/Local-L2。
 
 TENSOR_PARALLEL_SIZE = 16
 DATA_PARALLEL_SIZE = 1
@@ -78,12 +115,17 @@ MAX_NUM_BATCHED_TOKENS = 8192
 ENABLE_CHUNKED_PREFILL = False
 ENABLE_PREFIX_CACHING = False
 PREFIX_CACHE_REPLAY_ROUNDS = 1
+# 开启 L3 loadback 时，最后多少轮在每轮前清空本地 HBM/L2，强制从 L3
+# 回放。默认 1 保持 cold -> Local -> L3；设为 2 且总轮数为 4，可形成
+# cold -> Local -> L3 -> L3 的同介质自对照。
+L3_PREFIX_REPLAY_ROUNDS = 1
 PREFIX_REPLAY_LOGPROBS = 5
 COMPARE_LAST_TWO_PREFIX_REPLAYS = True
 STRICT_PREFIX_REPLAY_TOKEN_MATCH = True
 ALLOW_MULTI_REQUEST_GRAPH_TOPK_VARIANCE = True
 LOGGING_LEVEL = "INFO"
 MAX_TOKENS = 32
+IGNORE_EOS = False
 GPU_MEMORY_UTILIZATION = 0.90
 QUANTIZATION = "ascend"
 ENABLE_EXPERT_PARALLEL = True
@@ -185,8 +227,6 @@ def build_llm_kwargs() -> dict[str, Any]:
         raise ValueError("DSA compromise MTP3 requires ENABLE_A5_PACKED_C8_DSA=True")
     if ENABLE_MTP and MTP_NUM_SPECULATIVE_TOKENS != 3:
         raise ValueError("DSA compromise MTP requires MTP_NUM_SPECULATIVE_TOKENS=3")
-    if ENABLE_L3_WRITE_BEHIND and ENABLE_MTP:
-        raise ValueError("DSA L3 first version does not support MTP")
     if ENABLE_L3_WRITE_BEHIND and RUN_MODE == "disabled":
         raise ValueError("ENABLE_L3_WRITE_BEHIND requires DSA to be enabled")
     if ENABLE_L3_PREFIX_LOADBACK and not ENABLE_L3_WRITE_BEHIND:
@@ -439,6 +479,15 @@ def main() -> None:
         raise ValueError(f"PROMPTS has {len(PROMPTS)} rows but MAX_NUM_SEQS={MAX_NUM_SEQS}")
     if PREFIX_CACHE_REPLAY_ROUNDS <= 0:
         raise ValueError("PREFIX_CACHE_REPLAY_ROUNDS must be positive")
+    if L3_PREFIX_REPLAY_ROUNDS <= 0:
+        raise ValueError("L3_PREFIX_REPLAY_ROUNDS must be positive")
+    if ENABLE_L3_PREFIX_LOADBACK and (
+        PREFIX_CACHE_REPLAY_ROUNDS < L3_PREFIX_REPLAY_ROUNDS + 2
+    ):
+        raise ValueError(
+            "L3 prefix replay requires a cold round, a local round, and "
+            f"{L3_PREFIX_REPLAY_ROUNDS} L3 round(s)"
+        )
     if PREFIX_REPLAY_LOGPROBS < 0:
         raise ValueError("PREFIX_REPLAY_LOGPROBS must be non-negative")
 
@@ -452,7 +501,8 @@ def main() -> None:
         f"l3_prefix_loadback={ENABLE_L3_PREFIX_LOADBACK} "
         f"l3_direct_hbm={ENABLE_L3_DIRECT_HBM_LOAD} "
         f"prefix_cache={ENABLE_PREFIX_CACHING} "
-        f"replay_rounds={PREFIX_CACHE_REPLAY_ROUNDS}"
+        f"replay_rounds={PREFIX_CACHE_REPLAY_ROUNDS} "
+        f"l3_replay_rounds={L3_PREFIX_REPLAY_ROUNDS}"
     )
     llm = LLM(**kwargs)
 
@@ -477,7 +527,7 @@ def main() -> None:
         temperature=0.0,
         max_tokens=MAX_TOKENS,
         min_tokens=0,
-        ignore_eos=False,
+        ignore_eos=IGNORE_EOS,
         logprobs=PREFIX_REPLAY_LOGPROBS or None,
     )
     try:
@@ -492,12 +542,18 @@ def main() -> None:
                     use_tqdm=False,
                 )
             )
+            first_l3_round = (
+                PREFIX_CACHE_REPLAY_ROUNDS - L3_PREFIX_REPLAY_ROUNDS
+            )
+            next_round = round_index + 1
             should_reset_for_l3 = (
-                ENABLE_L3_DIRECT_HBM_LOAD and round_index == 1
-            ) or (
-                ENABLE_L3_PREFIX_LOADBACK
-                and not ENABLE_L3_DIRECT_HBM_LOAD
-                and round_index + 2 == PREFIX_CACHE_REPLAY_ROUNDS
+                (ENABLE_L3_DIRECT_HBM_LOAD and round_index == 1)
+                or (
+                    ENABLE_L3_PREFIX_LOADBACK
+                    and not ENABLE_L3_DIRECT_HBM_LOAD
+                    and first_l3_round <= next_round
+                    < PREFIX_CACHE_REPLAY_ROUNDS
+                )
             )
             if should_reset_for_l3:
                 # P1-W 不阻塞客户端响应。给后台 put 一个显式测试窗口，
@@ -546,7 +602,11 @@ def main() -> None:
                 "direct-L3/post-backfill local replay"
                 if ENABLE_L3_DIRECT_HBM_LOAD
                 else (
-                    "local-L2/L3 replay"
+                    (
+                        "L3/L3 replay"
+                        if L3_PREFIX_REPLAY_ROUNDS >= 2
+                        else "local-L2/L3 replay"
+                    )
                     if ENABLE_L3_PREFIX_LOADBACK
                     else "local-L2/local-L2 replay"
                 )

@@ -438,6 +438,12 @@ def _allocate_sparse_plan(
             )
         resident_blocks = resident_manager.req_to_blocks[request_id]
         budget_blocks = list(resident_blocks[:budget_block_count])
+        # The vLLM free queue intentionally releases request blocks in reverse
+        # eviction order. Once the pool wraps, a DSA ENTER allocation can
+        # therefore switch from ascending to descending physical IDs even
+        # though its logical sparse payload is identical. Canonicalize only
+        # the hashless sparse-budget region; parity tail order remains fixed.
+        budget_blocks.sort(key=lambda block: int(block.block_id))
         new_tail_blocks = iter(resident_blocks[budget_block_count:])
         tail_blocks: list[KVCacheBlock | None] = [
             None

@@ -45,7 +45,10 @@ from vllm_ascend.dsa_offload.ops import (
     DSAOffloadSelectionOutput,
     quant_lightning_indexer_topk,
 )
-from vllm_ascend.dsa_offload.runtime import DSALayerOffloadContext
+from vllm_ascend.dsa_offload.runtime import (
+    DSALayerOffloadContext,
+    DSAMTPFullCacheOffloadContext,
+)
 from vllm_ascend.memcache_comm_fence import (
     record_attention_compute_start,
 )
@@ -686,6 +689,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.local_num_heads = self.num_heads
         self.layer_name = kwargs.get("layer_name")
         self.dsa_offload_context: DSALayerOffloadContext | None = None
+        self.dsa_mtp_full_cache_context: (
+            DSAMTPFullCacheOffloadContext | None
+        ) = None
         dsa_config = ascend_config.dsa_offload_config
         self.is_dsa_mtp_full_cache_layer = False
         if dsa_config.mtp_enabled and self.layer_name is not None:
@@ -870,6 +876,27 @@ class AscendSFAImpl(MLAAttentionImpl):
                     f"declared_shared={declared_shared}"
                 )
         self.dsa_offload_context = context
+
+    def bind_dsa_mtp_full_cache_context(
+        self,
+        context: DSAMTPFullCacheOffloadContext,
+    ) -> None:
+        """绑定 MTP BF16 full-cache 的 durable block copy hook。"""
+
+        if not self.is_dsa_mtp_full_cache_layer:
+            raise RuntimeError(
+                "DSA MTP cache context was bound to a target layer: "
+                f"layer={self.layer_name}"
+            )
+        if self.dsa_offload_context is not None:
+            raise RuntimeError(
+                "DSA MTP and target offload contexts cannot share one layer"
+            )
+        if self.dsa_mtp_full_cache_context is not None:
+            raise RuntimeError(
+                f"DSA MTP cache context for {self.layer_name} was bound twice"
+            )
+        self.dsa_mtp_full_cache_context = context
 
     @staticmethod
     def update_graph_params(
@@ -1948,6 +1975,17 @@ class AscendSFAImpl(MLAAttentionImpl):
                 resident_cache=kv_cache,
                 before_cache_write=True,
             )
+        mtp_cache_context = self.dsa_mtp_full_cache_context
+        if (
+            mtp_cache_context is not None
+            and mtp_cache_context.runtime.dump_job_count
+            and mtp_cache_context.runtime.dump_before_cache_write
+        ):
+            if kv_cache is None:
+                raise RuntimeError(
+                    "DSA MTP full-block dump requires its native cache"
+                )
+            mtp_cache_context.dump_full_blocks(before_cache_write=True)
 
         if self.enable_sfa_prolog_v3 and attn_metadata.attn_state in (
             AscendAttentionState.DecodeOnly,
@@ -2349,6 +2387,18 @@ class AscendSFAImpl(MLAAttentionImpl):
             # 状态。若后续引入异步多流 dump，必须增加事件和可见性状态。
             self.dsa_offload_context.dump_full_blocks(
                 resident_cache=kv_cache,
+                before_cache_write=False,
+            )
+        if (
+            self.dsa_mtp_full_cache_context is not None
+            and self.dsa_mtp_full_cache_context.runtime.dump_job_count
+            and not self.dsa_mtp_full_cache_context.runtime.dump_before_cache_write
+        ):
+            if kv_cache is None:
+                raise RuntimeError(
+                    "DSA MTP full-block dump requires its native cache"
+                )
+            self.dsa_mtp_full_cache_context.dump_full_blocks(
                 before_cache_write=False,
             )
 

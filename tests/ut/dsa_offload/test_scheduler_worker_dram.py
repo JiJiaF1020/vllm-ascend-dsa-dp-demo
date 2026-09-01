@@ -162,6 +162,57 @@ def test_complete_layer_adds_indexer_byte_arenas_without_copy() -> None:
     )
 
 
+def test_mtp_full_cache_extends_the_complete_dram_bundle() -> None:
+    resident_packed = torch.empty(4, 128, 1, 656, dtype=torch.int8)
+    indexer_key = torch.empty(12, 128, 1, 128, dtype=torch.int8)
+    indexer_scale = torch.empty(12, 128, 1, 1, dtype=torch.float32)
+    mtp_cache = (
+        torch.empty(12, 128, 1, 512, dtype=torch.bfloat16),
+        torch.empty(12, 128, 1, 64, dtype=torch.bfloat16),
+        torch.empty(12, 128, 1, 128, dtype=torch.bfloat16),
+    )
+    expected_bytes = sum(
+        tensor[0].numel() * tensor.element_size()
+        for tensor in (
+            resident_packed,
+            indexer_key,
+            indexer_scale,
+            *mtp_cache,
+        )
+    )
+    store = DSAWorkerDRAMStore(
+        usable_blocks=8,
+        storage_rows=3,
+        max_logical_blocks=6,
+        device=torch.device("cpu"),
+        arena_factory=_cpu_arena,
+        expected_bytes_per_logical_block=expected_bytes,
+    )
+
+    store.add_packed_layer(
+        layer_id=0,
+        resident_packed_cache=resident_packed,
+        indexer_cache=(indexer_key, indexer_scale),
+    )
+    store.add_mtp_layer(layer_id=0, mtp_full_cache=mtp_cache)
+    store.finalize_payload_layout()
+
+    arenas = store.get_mtp_layer_arenas(0)
+    assert store.l3_components == (
+        DSAL3Component.INDEXER,
+        DSAL3Component.MLA,
+        DSAL3Component.MTP,
+    )
+    assert store.mtp_layer_ids == (0,)
+    assert tuple(view.data_ptr() for view in arenas.source_bytes) == tuple(
+        tensor.data_ptr() for tensor in mtp_cache
+    )
+    assert store.get_l3_component_plane_count(DSAL3Component.MTP) == 3
+    assert store.get_l3_component_bytes_per_block(
+        DSAL3Component.MTP
+    ) == 128 * (512 + 64 + 128) * 2
+
+
 def test_l3_component_views_use_fixed_arena_addresses() -> None:
     store = _make_store()
     resident_packed = torch.empty(4, 128, 1, 656, dtype=torch.int8)

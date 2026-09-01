@@ -23,6 +23,11 @@ _DSA_A5_GLM52_MLA_LAYERS = 78
 _DSA_A5_INDEXER_CACHE_BYTES = 128 * 128
 _DSA_A5_INDEXER_SCALE_BYTES = 128 * 4
 _DSA_A5_MLA_PACKED_BYTES = 128 * 656
+_DSA_A5_MTP_BF16_BYTES = (
+    128 * 512 * 2,
+    128 * 64 * 2,
+    128 * 128 * 2,
+)
 
 
 def _build_payload_layout(
@@ -48,18 +53,27 @@ def _build_payload_layout(
         )
         return sizes, (("payload", tuple(range(num_buffers))),)
 
-    if layout == "dsa_a5_glm52":
+    if layout in {"dsa_a5_glm52", "dsa_a5_glm52_mtp"}:
         indexer_sizes = (
             _DSA_A5_INDEXER_CACHE_BYTES,
             _DSA_A5_INDEXER_SCALE_BYTES,
         ) * _DSA_A5_GLM52_INDEXER_LAYERS
         mla_sizes = (_DSA_A5_MLA_PACKED_BYTES,) * _DSA_A5_GLM52_MLA_LAYERS
-        sizes = indexer_sizes + mla_sizes
-        indexer_end = len(indexer_sizes)
-        return sizes, (
-            ("indexer", tuple(range(indexer_end))),
-            ("mla", tuple(range(indexer_end, len(sizes)))),
+        mtp_sizes = (
+            _DSA_A5_MTP_BF16_BYTES
+            if layout == "dsa_a5_glm52_mtp"
+            else ()
         )
+        sizes = indexer_sizes + mla_sizes + mtp_sizes
+        indexer_end = len(indexer_sizes)
+        mla_end = indexer_end + len(mla_sizes)
+        groups = [
+            ("indexer", tuple(range(indexer_end))),
+            ("mla", tuple(range(indexer_end, mla_end))),
+        ]
+        if mtp_sizes:
+            groups.append(("mtp", tuple(range(mla_end, len(sizes)))))
+        return sizes, tuple(groups)
 
     raise ValueError(f"unsupported payload layout: {layout!r}")
 
@@ -620,11 +634,12 @@ def main() -> int:
     parser.add_argument("--num-buffers", type=int, default=1)
     parser.add_argument(
         "--payload-layout",
-        choices=("uniform", "dsa_a5_glm52"),
+        choices=("uniform", "dsa_a5_glm52", "dsa_a5_glm52_mtp"),
         default="uniform",
         help=(
             "uniform splits payload-bytes evenly; dsa_a5_glm52 reproduces "
-            "the real 42-plane Indexer plus 78-plane MLA two-key payload"
+            "the real 42-plane Indexer plus 78-plane MLA payload; "
+            "dsa_a5_glm52_mtp adds one native three-plane BF16 MTP layer"
         ),
     )
     parser.add_argument("--arena-blocks", type=int, default=1)

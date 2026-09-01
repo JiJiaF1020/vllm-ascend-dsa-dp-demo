@@ -15,6 +15,7 @@ from vllm_ascend.dsa_offload.request_cache_layout import (
 from vllm_ascend.dsa_offload.resident_pool import DSAResidentTokenPool
 from vllm_ascend.dsa_offload.runtime import (
     DSALayerOffloadContext,
+    DSAMTPFullCacheOffloadContext,
     DSAOffloadRuntime,
 )
 from vllm_ascend.dsa_offload.scheduler_output import (
@@ -42,6 +43,7 @@ def _make_runtime(
     resident_layer_count: int = 2,
     selection_state_count: int = 2,
     enable_prefix_caching: bool = False,
+    mtp_durable_offload: bool = False,
 ) -> tuple[
     DSAResidentTokenPool,
     DSAOffloadRuntime,
@@ -66,6 +68,7 @@ def _make_runtime(
         packed_c8=packed_c8,
         max_decode_query_len=max_decode_query_len,
         enable_prefix_caching=enable_prefix_caching,
+        mtp_durable_offload=mtp_durable_offload,
     )
     store = DSAWorkerDRAMStore(
         usable_blocks=8,
@@ -103,6 +106,7 @@ def test_prefix_dump_metadata_covers_full_history_for_every_request() -> None:
     expected_jobs = 2 * runtime.max_logical_blocks
     assert runtime.dump_src_block_ids.gpu.shape == (expected_jobs,)
     assert runtime.dump_indexer_src_block_ids.gpu.shape == (expected_jobs,)
+    assert runtime.dump_mtp_src_block_ids.gpu.shape == (expected_jobs,)
     assert runtime.dump_dst_block_ids.gpu.shape == (expected_jobs,)
 
 
@@ -203,6 +207,72 @@ def test_prefix_restore_uses_fixed_jobs_and_restores_both_planes(
     assert torch.all(resident_rope[1] == 4)
     assert torch.all(indexer[2] == 5)
     assert store.durable_full_block_counts[pool_index] == 1
+
+
+def test_prefix_restore_includes_mtp_full_cache_planes(monkeypatch) -> None:
+    resident_pool, runtime, store = _make_runtime(
+        resident_layer_count=1,
+        selection_state_count=1,
+        enable_prefix_caching=True,
+        max_decode_query_len=4,
+        mtp_durable_offload=True,
+    )
+    pool_index = resident_pool.acquire("req")
+    store.apply_assignment(
+        pool_index=pool_index,
+        logical_block_start=0,
+        physical_block_ids=(6,),
+    )
+    resident_nope = torch.zeros((4, 128, 1, 2), dtype=torch.bfloat16)
+    resident_rope = torch.zeros((4, 128, 1, 1), dtype=torch.bfloat16)
+    indexer = torch.zeros((4, 128, 1, 2), dtype=torch.int8)
+    mtp_cache = (
+        torch.zeros((4, 128, 1, 2), dtype=torch.bfloat16),
+        torch.zeros((4, 128, 1, 1), dtype=torch.bfloat16),
+        torch.zeros((4, 128, 1, 1), dtype=torch.bfloat16),
+    )
+    store.add_layer(
+        layer_id=0,
+        resident_nope_cache=resident_nope,
+        resident_rope_cache=resident_rope,
+        indexer_cache=indexer,
+    )
+    store.add_mtp_layer(layer_id=0, mtp_full_cache=mtp_cache)
+    mtp_arenas = store.get_mtp_layer_arenas(0)
+    for marker, plane in enumerate(mtp_arenas.dram_bytes, start=7):
+        plane[6].fill_(marker)
+
+    def copy_blocks(
+        *,
+        source_bytes,
+        destination_bytes,
+        src_block_ids,
+        dst_block_ids,
+    ) -> None:
+        destination_bytes[dst_block_ids.long()] = source_bytes[
+            src_block_ids.long()
+        ]
+
+    monkeypatch.setattr(
+        runtime_module,
+        "copy_full_cache_plane_bytes",
+        copy_blocks,
+    )
+    runtime.prepare_prefix_restore_jobs(
+        restores=(
+            DSADRAMBlockRestore(
+                request_id="req",
+                source_dram_block_ids=(6,),
+                destination_indexer_block_ids=(2,),
+                destination_resident_block_ids=(1,),
+                destination_mtp_block_ids=(3,),
+            ),
+        ),
+        state=SimpleNamespace(resident_token_pool=resident_pool),
+    )
+
+    for marker, plane in enumerate(mtp_arenas.source_bytes, start=7):
+        assert torch.all(plane[3] == marker)
 
 
 def test_prefix_restore_can_copy_only_the_l2_suffix(monkeypatch) -> None:
@@ -1113,6 +1183,190 @@ def test_mtp_double_tail_crosses_boundary_and_dumps_on_next_outer_step() -> None
     assert runtime.dump_job_count == 1
     assert runtime.dump_src_block_ids.np[0] == 12
     assert store.durable_full_block_counts[0] == 3
+
+
+def test_mtp_full_cache_dumps_confirmed_block_before_proposer_write(
+    monkeypatch,
+) -> None:
+    resident_pool, runtime, store = _make_runtime(
+        max_decode_query_len=4,
+        mtp_durable_offload=True,
+    )
+    mtp_cache = (
+        torch.arange(4 * 4 * 2).reshape(4, 4, 2).to(torch.bfloat16),
+        torch.arange(4 * 4).reshape(4, 4, 1).to(torch.bfloat16),
+        torch.arange(4 * 4).reshape(4, 4, 1).to(torch.bfloat16),
+    )
+    store.add_mtp_layer(layer_id=0, mtp_full_cache=mtp_cache)
+    state = DSAInputBatchCacheLayout(
+        max_num_reqs=1,
+        device=torch.device("cpu"),
+        pin_memory=False,
+        resident_token_pool=resident_pool,
+    )
+    resident_table = _ResidentBlockTable()
+    indexer_table = _ResidentBlockTable()
+    mtp_table = _ResidentBlockTable()
+    indexer_table._rows = np.array([[0, 1, 2, 3]], dtype=np.int32)
+    indexer_table.num_blocks_per_row[0] = 4
+    mtp_table._rows = np.array([[0, 1, 2, 3]], dtype=np.int32)
+    mtp_table.num_blocks_per_row[0] = 4
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        req_ids=["req-0"],
+        req_id_to_index={"req-0": 0},
+        num_computed_tokens_cpu=np.array([384], dtype=np.int32),
+        block_table=[resident_table, indexer_table, mtp_table],
+    )
+    state.refresh(
+        input_batch=input_batch,
+        projection=DSARequestCacheLayoutProjection(
+            request_ids=("req-0",),
+            stages=(int(DSARequestCacheStage.SPARSE_DECODE),),
+            target_resident_budget_tokens=(256,),
+            sparse_budget_tokens=(256,),
+            resident_valid_tokens=(384,),
+            resident_block_table_replacements=(),
+        ),
+    )
+    store.apply_assignment(
+        pool_index=0,
+        logical_block_start=0,
+        physical_block_ids=(1, 2, 3),
+    )
+    store.commit_durable_full_block_counts(
+        pool_indices=np.array([0], dtype=np.intp),
+        full_block_counts=np.array([2], dtype=np.int32),
+    )
+    runtime.prepare_forward(
+        input_batch=input_batch,
+        state=state,
+        num_scheduled_tokens=np.array([4], dtype=np.int32),
+        req_indices=torch.zeros(4, dtype=torch.int64),
+        positions=torch.arange(384, 388, dtype=torch.int64),
+        num_reqs=1,
+        num_tokens=4,
+        resident_group_id=0,
+        indexer_group_id=1,
+        mtp_group_id=2,
+        decode_forward=True,
+    )
+    runtime.prepare_execution_view(active_num_reqs=1, graph_row_count=None)
+    assert runtime.dump_job_count == 1
+    assert runtime.dump_mtp_src_block_ids.np[0] == 2
+    assert runtime.dump_dst_block_ids.np[0] == 3
+
+    calls = []
+
+    def copy_blocks(
+        *,
+        source_bytes,
+        dram_bytes,
+        src_block_ids,
+        dst_block_ids,
+    ) -> None:
+        calls.append((source_bytes, dram_bytes))
+        dram_bytes[dst_block_ids.long()] = source_bytes[src_block_ids.long()]
+
+    monkeypatch.setattr(
+        runtime_module,
+        "dump_full_cache_plane_bytes",
+        copy_blocks,
+    )
+    context = DSAMTPFullCacheOffloadContext(layer_id=0, runtime=runtime)
+    context.dump_full_blocks(before_cache_write=True)
+    context.dump_full_blocks(before_cache_write=True)
+
+    arenas = store.get_mtp_layer_arenas(0)
+    assert len(calls) == len(mtp_cache)
+    for source, dram in zip(
+        arenas.source_bytes,
+        arenas.dram_bytes,
+        strict=True,
+    ):
+        assert torch.equal(dram[3], source[2])
+
+
+def test_mtp_full_cache_ignores_target_graph_noop_padding(monkeypatch) -> None:
+    _, runtime, store = _make_runtime(
+        max_decode_query_len=4,
+        mtp_durable_offload=True,
+    )
+    store.add_mtp_layer(
+        layer_id=0,
+        mtp_full_cache=(
+            torch.zeros((4, 4, 2), dtype=torch.bfloat16),
+            torch.zeros((4, 4, 1), dtype=torch.bfloat16),
+            torch.zeros((4, 4, 1), dtype=torch.bfloat16),
+        ),
+    )
+    runtime.dump_job_count = 0
+    runtime.dump_launch_count = 4
+    runtime.dump_before_cache_write = True
+
+    monkeypatch.setattr(
+        runtime_module,
+        "dump_full_cache_plane_bytes",
+        lambda **_kwargs: pytest.fail(
+            "MTP eager proposer launched a padded no-op copy"
+        ),
+    )
+
+    DSAMTPFullCacheOffloadContext(
+        layer_id=0,
+        runtime=runtime,
+    ).dump_full_blocks(before_cache_write=True)
+
+
+def test_mtp_dump_completion_rejects_missing_proposer_hook() -> None:
+    _, runtime, store = _make_runtime(
+        max_decode_query_len=4,
+        mtp_durable_offload=True,
+    )
+    store.add_mtp_layer(
+        layer_id=0,
+        mtp_full_cache=(
+            torch.zeros((4, 4, 2), dtype=torch.bfloat16),
+            torch.zeros((4, 4, 1), dtype=torch.bfloat16),
+            torch.zeros((4, 4, 1), dtype=torch.bfloat16),
+        ),
+    )
+    runtime.dump_job_count = 1
+    runtime.dump_mtp_src_block_ids.np[0] = 2
+    runtime.dump_dst_block_ids.np[0] = 3
+    runtime._forward_epoch = 7
+
+    with pytest.raises(
+        RuntimeError,
+        match="missing_layers=\\(0,\\)",
+    ):
+        runtime.validate_mtp_dump_completion()
+
+
+def test_mtp_dump_completion_accepts_current_epoch_hook() -> None:
+    _, runtime, store = _make_runtime(
+        max_decode_query_len=4,
+        mtp_durable_offload=True,
+    )
+    store.add_mtp_layer(
+        layer_id=0,
+        mtp_full_cache=(
+            torch.zeros((4, 4, 2), dtype=torch.bfloat16),
+            torch.zeros((4, 4, 1), dtype=torch.bfloat16),
+            torch.zeros((4, 4, 1), dtype=torch.bfloat16),
+        ),
+    )
+    runtime.dump_job_count = 1
+    runtime.dump_mtp_src_block_ids.np[0] = 2
+    runtime.dump_dst_block_ids.np[0] = 3
+    runtime.dump_before_cache_write = True
+    runtime._forward_epoch = 7
+
+    assert runtime.claim_mtp_layer_dump(
+        layer_id=0,
+        before_cache_write=True,
+    )
+    runtime.validate_mtp_dump_completion()
 
 
 def test_consecutive_prefill_chunks_dump_only_newly_completed_blocks() -> None:

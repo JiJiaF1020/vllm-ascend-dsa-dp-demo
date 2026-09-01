@@ -123,17 +123,25 @@ class BlockTable:
         self.num_blocks_per_row[row_idx] += num_blocks
 
     def add_row(self, block_ids: list[int], row_idx: int) -> None:
+        self.replace_row(block_ids, row_idx)
+
+    def replace_row(self, block_ids: list[int], row_idx: int) -> None:
+        """Replace a shrinking row and null every stale trailing column."""
+
+        self.block_table.np[row_idx].fill(0)
         self.num_blocks_per_row[row_idx] = 0
         self.append_row(block_ids, row_idx)
 
     def clear_row(self, row_idx: int) -> None:
-        num_blocks = self.num_blocks_per_row[row_idx]
-        if num_blocks > 0:
-            self.block_table.np[row_idx, :num_blocks] = 0
+        self.block_table.np[row_idx].fill(0)
         self.num_blocks_per_row[row_idx] = 0
 
     def move_row(self, src: int, tgt: int) -> None:
         num_blocks = self.num_blocks_per_row[src]
+        if src == tgt:
+            self.block_table.np[tgt, num_blocks:].fill(0)
+            return
+        self.block_table.np[tgt].fill(0)
         self.block_table.np[tgt, :num_blocks] = self.block_table.np[src, :num_blocks]
         self.num_blocks_per_row[tgt] = num_blocks
 

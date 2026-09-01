@@ -16,6 +16,7 @@ from examples.dsa_demo.L3_cache_sys_api_test.test_mooncake_tp import (
     _build_payload_layout,
     _resolve_io_roles,
 )
+from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import (
     GlobalTE,
 )
@@ -60,6 +61,25 @@ def test_mooncake_probe_glm52_payload_matches_dsa_worker_contract() -> None:
     assert [(name, len(indices), sum(sizes[index] for index in indices)) for name, indices in groups] == [
         ("indexer", 42, 354_816),
         ("mla", 78, 6_549_504),
+    ]
+
+
+def test_mooncake_probe_glm52_mtp_payload_matches_three_component_bundle() -> None:
+    sizes, groups = _build_payload_layout(
+        "dsa_a5_glm52_mtp",
+        payload_bytes=1,
+        num_buffers=1,
+    )
+
+    assert len(sizes) == 123
+    assert sum(sizes) == 7_084_544
+    assert [
+        (name, len(indices), sum(sizes[index] for index in indices))
+        for name, indices in groups
+    ] == [
+        ("indexer", 42, 354_816),
+        ("mla", 78, 6_549_504),
+        ("mtp", 3, 180_224),
     ]
 
 
@@ -130,6 +150,36 @@ def _make_schema() -> DSAL3KeySchema:
         mla_plane_count=1,
         indexer_bytes_per_block=128 * 128 + 128 * 4,
         mla_bytes_per_block=128 * 656,
+    )
+
+
+def _make_mtp_store() -> DSAWorkerDRAMStore:
+    store = _make_store()
+    store.add_mtp_layer(
+        layer_id=0,
+        mtp_full_cache=(
+            torch.empty(4, 128, 1, 512, dtype=torch.bfloat16),
+            torch.empty(4, 128, 1, 64, dtype=torch.bfloat16),
+            torch.empty(4, 128, 1, 128, dtype=torch.bfloat16),
+        ),
+    )
+    return store
+
+
+def _make_mtp_schema() -> DSAL3KeySchema:
+    base = _make_schema()
+    return DSAL3KeySchema(
+        fingerprint="m" * 32,
+        block_size=base.block_size,
+        indexer_layer_names=base.indexer_layer_names,
+        resident_layer_names=base.resident_layer_names,
+        indexer_plane_count=base.indexer_plane_count,
+        mla_plane_count=base.mla_plane_count,
+        indexer_bytes_per_block=base.indexer_bytes_per_block,
+        mla_bytes_per_block=base.mla_bytes_per_block,
+        mtp_layer_names=("mtp.0",),
+        mtp_plane_count=3,
+        mtp_bytes_per_block=128 * (512 + 64 + 128) * 2,
     )
 
 
@@ -264,6 +314,61 @@ def test_l3_schema_fingerprint_and_component_keys_are_stable() -> None:
     vllm_config.parallel_config.tensor_parallel_size = 16
     changed_tp = DSAL3KeySchema.from_config(vllm_config, kv_config)
     assert changed_tp.fingerprint != left.fingerprint
+
+
+def test_l3_schema_adds_native_mtp_component() -> None:
+    specs = {
+        "model.layers.0.self_attn.indexer.k_cache": DSAIndexerKVSpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+        ),
+        "model.layers.0.self_attn.attn": DSAResidentMLAAttentionSpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=576,
+            sparse_head_dim=(512, 64, 0),
+            dtype=torch.bfloat16,
+            cache_dtype_str="auto",
+        ),
+        "model.layers.1.self_attn.attn": AscendMLAAttentionSpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=704,
+            sparse_head_dim=(512, 64, 128),
+            dtype=torch.bfloat16,
+            cache_dtype_str="auto",
+            cache_sparse_sfa_c8=False,
+            cache_sparse_li_c8=False,
+        ),
+    }
+    groups = build_dsa_kv_cache_groups(specs)
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            model="/models/glm-mtp",
+            revision=None,
+            quantization="ascend",
+            hf_config=SimpleNamespace(
+                architectures=("GlmMoeDsaForCausalLM",),
+                model_type="glm_moe_dsa",
+            ),
+            compute_hash=lambda: "mtp-model",
+        ),
+        parallel_config=SimpleNamespace(tensor_parallel_size=8),
+    )
+
+    schema = DSAL3KeySchema.from_config(
+        vllm_config,
+        SimpleNamespace(kv_cache_groups=groups),
+    )
+
+    assert schema.has_mtp
+    assert schema.mtp_plane_count == 3
+    assert schema.mtp_bytes_per_block == 128 * (512 + 64 + 128) * 2
+    keys = schema.block_keys(BlockHash(b"hash"))
+    assert len(keys) == 3
+    assert f":{schema.fingerprint}:mtp:" in keys[2]
 
 
 def test_dsa_mooncake_config_requires_host_and_device_endpoints(
@@ -450,6 +555,61 @@ def test_backend_adapter_registers_and_puts_both_components() -> None:
     assert backend.put_args is not None
     assert len(backend.put_args[0]) == 2
     assert transferred == 128 * 128 + 128 * 4 + 128 * 656
+
+
+def test_backend_adapter_round_trips_complete_mtp_bundle() -> None:
+    store = _make_mtp_store()
+    schema = _make_mtp_schema()
+    backend = _FakeBackend(result=[0, 0, 0])
+    adapter = DSAL3BackendAdapter(backend=backend, schema=schema)
+    adapter.bind_store(store)
+    block_hash = BlockHash(b"mtp-block")
+    indexer_key, mla_key, mtp_key = schema.block_keys(block_hash)
+    store_job = DSAL3StoreJob(
+        job_id=0,
+        blocks=(
+            DSAL3StoreBlock(
+                request_id="req",
+                logical_block_index=0,
+                source_l2_block_id=1,
+                block_hash=block_hash,
+                indexer_key=indexer_key,
+                mla_key=mla_key,
+                mtp_key=mtp_key,
+            ),
+        ),
+    )
+
+    put_bytes = adapter.put_store_job(job=store_job, store=store)
+    assert backend.registered is not None
+    assert len(backend.registered[0]) == 6
+    assert backend.put_args is not None
+    assert backend.put_args[0] == [indexer_key, mla_key, mtp_key]
+    assert put_bytes == schema.bytes_per_logical_block
+
+    load_job = DSAL3LoadJob(
+        request_id="req",
+        blocks=(
+            DSAL3LoadBlock(
+                logical_block_index=0,
+                destination_l2_block_id=2,
+                destination_indexer_hbm_block_id=1,
+                destination_resident_hbm_block_id=1,
+                destination_mtp_hbm_block_id=1,
+                block_hash=block_hash,
+                indexer_key=indexer_key,
+                mla_key=mla_key,
+                mtp_key=mtp_key,
+            ),
+        ),
+    )
+    load_bytes = adapter.get_load_job(job=load_job, store=store)
+    assert len(backend.get_calls) == 1
+    assert backend.get_calls[0][0] == [indexer_key, mla_key, mtp_key]
+    assert load_bytes == schema.bytes_per_logical_block
+
+    backend.existing = [1, 1, 1, 1, 1, 0]
+    assert adapter.lookup_prefix_blocks((b"first", b"second")) == 1
 
 
 def test_backend_adapter_direct_load_targets_split_hbm_views() -> None:
@@ -816,6 +976,52 @@ def test_scheduler_queries_l3_suffix_and_builds_load_metadata() -> None:
     assert backend.closed
 
 
+def test_scheduler_builds_mtp_component_load_metadata() -> None:
+    schema = _make_mtp_schema()
+    backend = _FakeBackend()
+    backend.existing = [1, 1, 1]
+    adapter = DSAL3BackendAdapter(backend=backend, schema=schema)
+    coordinator = SimpleNamespace(
+        dram_directory=SimpleNamespace(usable_blocks=8),
+        prepare_external_prefix_cache_hit=(
+            lambda request, *, local_computed_tokens, external_block_count: (
+                external_block_count * 128
+            )
+        ),
+        take_external_prefix_load_plan=lambda request_id: SimpleNamespace(
+            request_id=request_id,
+            logical_block_start=0,
+            block_hashes=(b"hash",),
+            destination_dram_block_ids=(2,),
+            destination_indexer_hbm_block_ids=(12,),
+            destination_resident_hbm_block_ids=(22,),
+            destination_mtp_hbm_block_ids=(32,),
+        ),
+    )
+    scheduler = DSAL3StoreScheduler(
+        schema,
+        max_inflight_jobs=2,
+        lookup_backend=adapter,
+        enable_load=True,
+    )
+    scheduler.bind_coordinator(coordinator)
+    request = SimpleNamespace(
+        request_id="req",
+        num_tokens=129,
+        block_hashes=[BlockHash(b"hash")],
+        skip_reading_prefix_cache=False,
+    )
+
+    external_tokens = scheduler.lookup_external_prefix(request, 0)
+    scheduler.stage_external_load("req", external_tokens)
+    job = scheduler.build_connector_meta().load_jobs[0]
+
+    assert external_tokens == 128
+    assert job.destination_mtp_hbm_block_ids == (32,)
+    assert job.blocks[0].mtp_key is not None
+    scheduler.shutdown()
+
+
 @pytest.mark.parametrize(
     ("existing", "expected_external_blocks"),
     [
@@ -924,6 +1130,77 @@ class _FakeEvent:
     def synchronize(self) -> None:
         assert self.recorded
         self.synchronized = True
+
+
+class _RecordingConnectorWorker:
+    def __init__(self) -> None:
+        self.started = 0
+        self.finished: list[DSAL3ConnectorMetadata] = []
+
+    def start_step(self) -> None:
+        self.started += 1
+
+    def finish_step(self, metadata: DSAL3ConnectorMetadata) -> None:
+        self.finished.append(metadata)
+
+
+def _make_recording_worker_connector(
+    *,
+    has_mtp: bool,
+) -> tuple[DSAL3Connector, _RecordingConnectorWorker]:
+    connector = object.__new__(DSAL3Connector)
+    worker = _RecordingConnectorWorker()
+    connector.worker_handler = worker
+    connector.scheduler_handler = None
+    connector._connector_metadata = None
+    connector._has_mtp_component = has_mtp
+    connector._defer_store_until_wait = False
+    connector._deferred_store_metadata = None
+    return connector, worker
+
+
+def test_mtp_connector_submits_store_only_after_proposer_finalize() -> None:
+    connector, worker = _make_recording_worker_connector(has_mtp=True)
+    metadata = DSAL3ConnectorMetadata(store_jobs={0: _make_job()})
+    connector.bind_connector_metadata(metadata)
+
+    connector.start_load_kv(SimpleNamespace(attn_metadata={}))
+    connector.get_finished(set())
+
+    assert worker.started == 1
+    assert worker.finished == []
+    assert connector._deferred_store_metadata is metadata
+
+    connector.wait_for_save()
+
+    assert worker.finished == [metadata]
+    assert connector._deferred_store_metadata is None
+    connector.wait_for_save()
+    assert worker.finished == [metadata]
+
+
+def test_mtp_connector_only_step_submits_store_immediately() -> None:
+    connector, worker = _make_recording_worker_connector(has_mtp=True)
+    metadata = DSAL3ConnectorMetadata(store_jobs={0: _make_job()})
+    connector.bind_connector_metadata(metadata)
+
+    connector.start_load_kv(SimpleNamespace(attn_metadata=None))
+    connector.get_finished(set())
+
+    assert worker.finished == [metadata]
+    assert connector._deferred_store_metadata is None
+
+
+def test_target_only_connector_keeps_immediate_store_submission() -> None:
+    connector, worker = _make_recording_worker_connector(has_mtp=False)
+    metadata = DSAL3ConnectorMetadata(store_jobs={0: _make_job()})
+    connector.bind_connector_metadata(metadata)
+
+    connector.start_load_kv(SimpleNamespace(attn_metadata={}))
+    connector.get_finished(set())
+
+    assert worker.finished == [metadata]
+    assert connector._deferred_store_metadata is None
 
 
 def test_rank0_worker_waits_dump_event_and_reports_explicit_result() -> None:

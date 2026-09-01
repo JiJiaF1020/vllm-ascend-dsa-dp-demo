@@ -550,7 +550,7 @@ def apply_dsa_cache_layout_projection(
     # 所有 ENTER 行先完成校验，再统一改写，避免异常时留下半替换 block 表。
     for resident_block_ids, row, replacement_block_ids in pending_replacements:
         resident_block_ids[:] = replacement_block_ids
-        input_batch.block_table[resident_group_id].add_row(
+        input_batch.block_table[resident_group_id].replace_row(
             resident_block_ids,
             row,
         )

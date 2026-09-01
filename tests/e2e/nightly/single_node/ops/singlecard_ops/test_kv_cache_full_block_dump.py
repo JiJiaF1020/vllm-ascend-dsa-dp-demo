@@ -480,6 +480,70 @@ def test_kv_cache_full_block_dump_bytes_restores_from_swapped_memory() -> None:
 
 
 @torch.inference_mode()
+def test_kv_cache_full_block_dump_bytes_round_trips_mtp_bf16_planes() -> None:
+    """Native MTP MLA/rope/Indexer BF16 pages use only opaque byte IO."""
+
+    block_count = 2
+    head_dims = (512, 64, 128)
+    source_planes = []
+    dram_planes = []
+    restored_planes = []
+    for plane_index, head_dim in enumerate(head_dims):
+        source = (
+            torch.arange(
+                block_count * _BLOCK_SIZE * head_dim,
+                dtype=torch.float32,
+                device="npu",
+            )
+            .remainder(251 + plane_index)
+            .reshape(block_count, _BLOCK_SIZE, 1, head_dim)
+            .to(torch.bfloat16)
+        )
+        source_planes.append(source)
+        dram_planes.append(
+            _swapped_arena(
+                (block_count + 1, source[0].numel() * source.element_size()),
+                torch.int8,
+            )
+        )
+        restored_planes.append(torch.zeros_like(source))
+
+    dump_src = torch.tensor([1], dtype=torch.int32, device="npu")
+    dram_dst = torch.tensor([2], dtype=torch.int32, device="npu")
+    restore_src = torch.tensor([2], dtype=torch.int32, device="npu")
+    hbm_dst = torch.tensor([0], dtype=torch.int32, device="npu")
+    for source, dram, restored in zip(
+        source_planes,
+        dram_planes,
+        restored_planes,
+        strict=True,
+    ):
+        source_bytes = source.view(torch.int8).reshape(block_count, -1)
+        restored_bytes = restored.view(torch.int8).reshape(block_count, -1)
+        torch.ops._C_ascend.kv_cache_full_block_dump_bytes(
+            source_bytes,
+            dram,
+            dump_src,
+            dram_dst,
+        )
+        torch.ops._C_ascend.kv_cache_full_block_dump_bytes(
+            dram,
+            restored_bytes,
+            restore_src,
+            hbm_dst,
+        )
+    torch.npu.synchronize()
+
+    for source, restored in zip(
+        source_planes,
+        restored_planes,
+        strict=True,
+    ):
+        assert torch.equal(restored[0].cpu(), source[1].cpu())
+        assert torch.count_nonzero(restored[1]).item() == 0
+
+
+@torch.inference_mode()
 def test_kv_cache_full_block_dump_bandwidth() -> None:
     """Report effective HBM-to-swapped-DRAM payload bandwidth.
 

@@ -15,7 +15,7 @@ durable full-block 前缀增量分配 DRAM block id；worker 只消费 assignmen
 
 首版 prefix cache 直接复用 ``BlockPool`` 的 hash/refcount/LRU：查询阶段只
 返回候选块，HBM admission 成功后才 touch 并绑定到请求；worker 完成整块
-Indexer+MLA dump 后才发布 hash。请求结束只释放引用，payload/hash 保留到
+完整 durable bundle dump 后才发布 hash。请求结束只释放引用，payload/hash 保留到
 物理块真正被重新分配。preemption 与 KV connector 仍关闭。
 """
 
@@ -143,7 +143,7 @@ def calculate_dram_capacity_plan(
     tensor_parallel_size: int,
     host_available_bytes: int,
 ) -> DSADRAMCapacityPlan:
-    """按完整 Indexer+MLA block 计算每 rank 的固定 DRAM 容量。"""
+    """按完整 durable bundle 计算每 rank 的固定 DRAM 容量。"""
 
     minimum = int(indexer_num_blocks)
     desired = calculate_dram_usable_blocks(minimum, block_multiple)

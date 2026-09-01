@@ -70,6 +70,9 @@ class DSAL3Connector(KVConnectorBase_V1, SupportsHMA):
                 "DSA direct_hbm_load is frozen; use L3->L2->HBM"
             )
         self.direct_hbm_load = direct_hbm_load
+        self._has_mtp_component = schema.has_mtp
+        self._defer_store_until_wait = False
+        self._deferred_store_metadata: DSAL3ConnectorMetadata | None = None
         self.scheduler_handler: DSAL3StoreScheduler | None = None
         self.worker_handler: DSAL3StoreWorker | None = None
         if role == KVConnectorRole.SCHEDULER:
@@ -147,8 +150,26 @@ class DSAL3Connector(KVConnectorBase_V1, SupportsHMA):
         self.worker_handler.prepare_step(kv_connector_metadata)
 
     def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
-        del forward_context, kwargs
+        del kwargs
         assert self.worker_handler is not None
+        if self._deferred_store_metadata is not None:
+            raise RuntimeError(
+                "DSA MTP L3 store metadata survived into the next step; "
+                "the proposer-side connector finalization was skipped"
+            )
+        # ``KVConnectorModelRunnerMixin`` always calls get_finished() when the
+        # target-forward context exits, even when connector finalization is
+        # deferred for speculative decoding.  MTP cache planes are written by
+        # the proposer after that point, so only stage store jobs in
+        # get_finished() and submit them from wait_for_save().  Connector-only
+        # progress steps have no attention metadata and can submit immediately.
+        has_model_forward = bool(
+            forward_context is not None
+            and forward_context.attn_metadata is not None
+        )
+        self._defer_store_until_wait = bool(
+            self._has_mtp_component and has_model_forward
+        )
         self.worker_handler.start_step()
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -164,7 +185,20 @@ class DSAL3Connector(KVConnectorBase_V1, SupportsHMA):
         del layer_name, kv_layer, attn_metadata, kwargs
 
     def wait_for_save(self) -> None:
-        return
+        if self.worker_handler is None:
+            return
+        metadata = self._deferred_store_metadata
+        if metadata is None:
+            return
+        self._deferred_store_metadata = None
+        self._defer_store_until_wait = False
+        logger.info(
+            "DSA MTP L3 store released after proposer completion: "
+            "jobs=%d blocks=%d",
+            len(metadata.store_jobs),
+            sum(len(job.blocks) for job in metadata.store_jobs.values()),
+        )
+        self.worker_handler.finish_step(metadata)
 
     def get_finished(
         self,
@@ -175,7 +209,25 @@ class DSAL3Connector(KVConnectorBase_V1, SupportsHMA):
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, DSAL3ConnectorMetadata):
             raise TypeError("DSA L3 worker metadata is not bound")
-        self.worker_handler.finish_step(metadata)
+        if self._defer_store_until_wait and metadata.store_jobs:
+            if self._deferred_store_metadata is not None:
+                raise RuntimeError(
+                    "DSA MTP L3 received another store batch before the "
+                    "previous proposer-side finalization"
+                )
+            self._deferred_store_metadata = metadata
+            logger.info(
+                "DSA MTP L3 store staged until proposer completion: "
+                "jobs=%d blocks=%d",
+                len(metadata.store_jobs),
+                sum(
+                    len(job.blocks)
+                    for job in metadata.store_jobs.values()
+                ),
+            )
+        else:
+            self.worker_handler.finish_step(metadata)
+        self._defer_store_until_wait = False
         return set(), set()
 
     def build_connector_worker_meta(self) -> DSAL3WorkerMetadata | None:
@@ -276,6 +328,13 @@ class DSAL3Connector(KVConnectorBase_V1, SupportsHMA):
         return self.scheduler_handler.reset_cache()
 
     def shutdown(self) -> None:
+        if self._deferred_store_metadata is not None:
+            logger.warning(
+                "Discarding DSA MTP L3 store jobs because proposer-side "
+                "finalization did not complete: jobs=%d",
+                len(self._deferred_store_metadata.store_jobs),
+            )
+            self._deferred_store_metadata = None
         if self.worker_handler is not None:
             self.worker_handler.shutdown()
         if self.scheduler_handler is not None:

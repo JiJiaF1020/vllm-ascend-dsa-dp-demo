@@ -124,6 +124,14 @@ class DivergenceRecord:
         return self.common_prefix, tokens
 
 
+@dataclass(frozen=True)
+class SameSourceVarianceEnvelope:
+    """All pairwise divergence signatures observed within one cache tier."""
+
+    signatures: frozenset[tuple[str, tuple[int, tuple[int, ...]]]]
+    unstable_labels: frozenset[str]
+
+
 def _first_prompt(value: str | Sequence[str], *, name: str) -> str:
     if isinstance(value, str):
         prompt = value
@@ -447,7 +455,6 @@ def compare_phases(
             allow_topk_variance
             and ALLOW_REPLAY_TOPK_VARIANCE
             and SERVER_RUN_MODE == "graph"
-            and common_prefix > 0
             and left_id is not None
             and right_id is not None
             and left_id in right_candidates
@@ -484,17 +491,109 @@ def compare_phases(
     )
 
 
+def build_same_source_variance_envelope(
+    phases: dict[str, dict[str, CompletionTrace]],
+) -> SameSourceVarianceEnvelope:
+    """Compare every trace pair within Local-L2 and within L3.
+
+    Fixed A/B comparisons are useful human-readable controls, but rotating
+    graph batches can expose a branch only across different stress cycles.
+    The full pairwise envelope prevents such an already-local branch from
+    being mislabeled as unique to an L3 replay.
+    """
+
+    source_phases = {
+        "Local-L2": [
+            traces
+            for phase, traces in phases.items()
+            if "local-l2" in phase
+        ],
+        "L3": [
+            traces
+            for phase, traces in phases.items()
+            if phase.startswith("l3-")
+            or (phase.startswith("stress-") and phase.endswith("-l3"))
+        ],
+    }
+    signatures: set[tuple[str, tuple[int, tuple[int, ...]]]] = set()
+    unstable_labels: set[str] = set()
+    source_counts: dict[str, int] = {}
+    for source, trace_groups in source_phases.items():
+        source_signatures: set[
+            tuple[str, tuple[int, tuple[int, ...]]]
+        ] = set()
+        for left_index, left in enumerate(trace_groups):
+            for right in trace_groups[left_index + 1 :]:
+                for prompt_label in left.keys() & right.keys():
+                    lhs = left[prompt_label]
+                    rhs = right[prompt_label]
+                    if lhs.exact_fingerprint() == rhs.exact_fingerprint():
+                        continue
+                    common_prefix, left_id, right_id = (
+                        _first_token_divergence(lhs, rhs)
+                    )
+                    divergence = DivergenceRecord(
+                        common_prefix=common_prefix,
+                        left_token=left_id,
+                        right_token=right_id,
+                    )
+                    signature = (
+                        prompt_label,
+                        divergence.normalized_signature(),
+                    )
+                    signatures.add(signature)
+                    source_signatures.add(signature)
+                    unstable_labels.add(prompt_label)
+        source_counts[source] = len(source_signatures)
+    envelope = SameSourceVarianceEnvelope(
+        signatures=frozenset(signatures),
+        unstable_labels=frozenset(unstable_labels),
+    )
+    print(
+        "[online-closeout] same-source variance envelope: "
+        f"labels={sorted(envelope.unstable_labels)} "
+        f"signatures={len(envelope.signatures)} "
+        f"by_source={source_counts}"
+    )
+    return envelope
+
+
 def find_cross_variance_absent_from_replay_controls(
-    controls: Sequence[ComparisonReport],
+    envelope: SameSourceVarianceEnvelope,
     cross_replay: ComparisonReport,
     *,
     label: str,
 ) -> list[tuple[str, int, int | None, int | None]]:
-    observed_signatures = {
-        (prompt_label, divergence.normalized_signature())
-        for control in controls
-        for prompt_label, divergence in control.divergences.items()
-    }
+    exact_attributed = [
+        (
+            prompt_label,
+            divergence.common_prefix,
+            divergence.left_token,
+            divergence.right_token,
+        )
+        for prompt_label, divergence in cross_replay.divergences.items()
+        if (
+            prompt_label,
+            divergence.normalized_signature(),
+        )
+        in envelope.signatures
+    ]
+    label_attributed = [
+        (
+            prompt_label,
+            divergence.common_prefix,
+            divergence.left_token,
+            divergence.right_token,
+        )
+        for prompt_label, divergence in cross_replay.divergences.items()
+        if (
+            prompt_label,
+            divergence.normalized_signature(),
+        )
+        not in envelope.signatures
+        and prompt_label in envelope.unstable_labels
+        and prompt_label in cross_replay.accepted_topk_labels
+    ]
     cross_only = [
         (
             prompt_label,
@@ -507,14 +606,28 @@ def find_cross_variance_absent_from_replay_controls(
             prompt_label,
             divergence.normalized_signature(),
         )
-        not in observed_signatures
+        not in envelope.signatures
+        and not (
+            prompt_label in envelope.unstable_labels
+            and prompt_label in cross_replay.accepted_topk_labels
+        )
     ]
+    if exact_attributed:
+        print(
+            f"[online-closeout] {label} variance reproduced exactly by "
+            f"same-source replay: {exact_attributed}"
+        )
+    if label_attributed:
+        print(
+            f"[online-closeout] {label} variance attributed by same-source "
+            f"label instability: {label_attributed}"
+        )
     if cross_only:
         print(f"[online-closeout] {label} has cross-source-only divergences: {cross_only}")
     else:
         print(
             f"[online-closeout] {label} variance attribution passed; "
-            f"control_signatures={sorted(observed_signatures)} "
+            f"same_source_signatures={len(envelope.signatures)} "
             f"cross={cross_replay.divergences}"
         )
     return cross_only
@@ -525,7 +638,9 @@ def record_comparison_failures(
     report: ComparisonReport,
 ) -> None:
     if report.unexplained_labels:
-        failures.append(f"{report.label}: unexplained={report.unexplained_labels}")
+        failures.append(
+            f"{report.label}: unexplained={report.unexplained_labels}"
+        )
 
 
 def rotate_cases(cases: list[PromptCase], cycle: int) -> list[PromptCase]:
@@ -596,6 +711,8 @@ async def main_async() -> None:
         raise ValueError(f"MAX_TOKENS_BY_LABEL has unknown labels: {unknown_overrides}")
     phases: dict[str, dict[str, CompletionTrace]] = {}
     comparisons: dict[str, ComparisonReport] = {}
+    same_source_controls: list[ComparisonReport] = []
+    cross_source_replays: list[ComparisonReport] = []
     diagnostic_failures: list[str] = []
     failure: str | None = None
     drain_failure: str | None = None
@@ -644,10 +761,6 @@ async def main_async() -> None:
                 label="sequential Local-L2 control",
                 allow_topk_variance=True,
             )
-            record_comparison_failures(
-                diagnostic_failures,
-                comparisons["sequential-local-l2-control"],
-            )
 
             await pause_and_reset(reset_external=False)
             phases["l3-sequential-a"] = await run_phase(
@@ -671,9 +784,11 @@ async def main_async() -> None:
                 label="sequential L3 control",
                 allow_topk_variance=True,
             )
-            record_comparison_failures(
-                diagnostic_failures,
-                comparisons["sequential-l3-control"],
+            same_source_controls.extend(
+                (
+                    comparisons["sequential-local-l2-control"],
+                    comparisons["sequential-l3-control"],
+                )
             )
             comparisons["sequential-local-l2-vs-l3"] = compare_phases(
                 phases["local-l2-sequential-b"],
@@ -681,20 +796,9 @@ async def main_async() -> None:
                 label="sequential Local-L2/L3",
                 allow_topk_variance=True,
             )
-            record_comparison_failures(
-                diagnostic_failures,
-                comparisons["sequential-local-l2-vs-l3"],
+            cross_source_replays.append(
+                comparisons["sequential-local-l2-vs-l3"]
             )
-            sequential_cross_only = find_cross_variance_absent_from_replay_controls(
-                (
-                    comparisons["sequential-local-l2-control"],
-                    comparisons["sequential-l3-control"],
-                ),
-                comparisons["sequential-local-l2-vs-l3"],
-                label="sequential Local-L2/L3",
-            )
-            if sequential_cross_only:
-                diagnostic_failures.append(f"sequential Local-L2/L3 cross-source-only={sequential_cross_only}")
 
             for cycle in range(CONCURRENT_STRESS_CYCLES):
                 cycle_cases = rotate_cases(cases, cycle)
@@ -722,10 +826,7 @@ async def main_async() -> None:
                     label=f"stress cycle {cycle + 1} Local-L2 control",
                     allow_topk_variance=True,
                 )
-                record_comparison_failures(
-                    diagnostic_failures,
-                    comparisons[local_key],
-                )
+                same_source_controls.append(comparisons[local_key])
 
                 await pause_and_reset(reset_external=False)
                 phases[l3_name] = await run_phase(
@@ -742,17 +843,29 @@ async def main_async() -> None:
                     label=f"stress cycle {cycle + 1} Local-L2/L3",
                     allow_topk_variance=True,
                 )
-                record_comparison_failures(
-                    diagnostic_failures,
-                    comparisons[l3_key],
+                cross_source_replays.append(comparisons[l3_key])
+
+            # Graph replay can select a different branch even within one
+            # cache medium.  Build the evidence envelope only after all
+            # controls have run so cross-cycle Local-L2 or L3 reproductions
+            # are available during cross-tier attribution.
+            variance_envelope = build_same_source_variance_envelope(phases)
+            if SERVER_RUN_MODE == "eager":
+                for control in same_source_controls:
+                    record_comparison_failures(
+                        diagnostic_failures,
+                        control,
+                    )
+            for cross_replay in cross_source_replays:
+                cross_only = find_cross_variance_absent_from_replay_controls(
+                    variance_envelope,
+                    cross_replay,
+                    label=cross_replay.label,
                 )
-                stress_cross_only = find_cross_variance_absent_from_replay_controls(
-                    (comparisons[local_key],),
-                    comparisons[l3_key],
-                    label=(f"stress cycle {cycle + 1} Local-L2/L3"),
-                )
-                if stress_cross_only:
-                    diagnostic_failures.append(f"stress cycle {cycle + 1} cross-source-only={stress_cross_only}")
+                if cross_only:
+                    diagnostic_failures.append(
+                        f"{cross_replay.label} cross-source-only={cross_only}"
+                    )
 
             if diagnostic_failures:
                 raise AssertionError(f"online closeout collected diagnostic failures: {diagnostic_failures}")

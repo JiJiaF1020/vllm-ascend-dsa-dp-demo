@@ -20,6 +20,7 @@ class DSAL3StoreBlock:
     block_hash: bytes
     indexer_key: str
     mla_key: str
+    mtp_key: str | None = None
 
     def __post_init__(self) -> None:
         if not self.request_id:
@@ -32,6 +33,15 @@ class DSAL3StoreBlock:
             raise ValueError("DSA L3 store block hash cannot be empty")
         if not self.indexer_key or not self.mla_key:
             raise ValueError("DSA L3 store block requires both component keys")
+        if self.mtp_key is not None and not self.mtp_key:
+            raise ValueError("DSA L3 MTP store key cannot be empty")
+
+    @property
+    def component_keys(self) -> tuple[str, ...]:
+        keys = [self.indexer_key, self.mla_key]
+        if self.mtp_key is not None:
+            keys.append(self.mtp_key)
+        return tuple(keys)
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +74,8 @@ class DSAL3LoadBlock:
     block_hash: bytes
     indexer_key: str
     mla_key: str
+    destination_mtp_hbm_block_id: int | None = None
+    mtp_key: str | None = None
 
     def __post_init__(self) -> None:
         if self.logical_block_index < 0:
@@ -81,6 +93,26 @@ class DSAL3LoadBlock:
             raise ValueError("DSA L3 load block hash cannot be empty")
         if not self.indexer_key or not self.mla_key:
             raise ValueError("DSA L3 load block requires both component keys")
+        if self.mtp_key is not None and not self.mtp_key:
+            raise ValueError("DSA L3 MTP load key cannot be empty")
+        if (self.destination_mtp_hbm_block_id is None) != (
+            self.mtp_key is None
+        ):
+            raise ValueError(
+                "DSA L3 MTP key and HBM destination must be both present or absent"
+            )
+        if (
+            self.destination_mtp_hbm_block_id is not None
+            and self.destination_mtp_hbm_block_id <= 0
+        ):
+            raise ValueError("DSA L3 MTP HBM destination must be positive")
+
+    @property
+    def component_keys(self) -> tuple[str, ...]:
+        keys = [self.indexer_key, self.mla_key]
+        if self.mtp_key is not None:
+            keys.append(self.mtp_key)
+        return tuple(keys)
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +164,11 @@ class DSAL3LoadJob:
                     f"DSA L3 load job contains duplicate {name} HBM "
                     "destinations"
                 )
+        mtp_ids = self.destination_mtp_hbm_block_ids
+        if mtp_ids and len(set(mtp_ids)) != len(mtp_ids):
+            raise ValueError(
+                "DSA L3 load job contains duplicate MTP HBM destinations"
+            )
 
     @property
     def destination_l2_block_ids(self) -> tuple[int, ...]:
@@ -152,6 +189,19 @@ class DSAL3LoadJob:
             block.destination_resident_hbm_block_id
             for block in self.blocks
         )
+
+    @property
+    def destination_mtp_hbm_block_ids(self) -> tuple[int, ...]:
+        ids = tuple(
+            block.destination_mtp_hbm_block_id for block in self.blocks
+        )
+        if all(block_id is None for block_id in ids):
+            return ()
+        if any(block_id is None for block_id in ids):
+            raise RuntimeError(
+                "DSA L3 load job mixes MTP and non-MTP destinations"
+            )
+        return tuple(int(block_id) for block_id in ids if block_id is not None)
 
 
 @dataclass(slots=True)

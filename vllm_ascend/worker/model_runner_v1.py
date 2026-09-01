@@ -210,6 +210,7 @@ from vllm_ascend.dsa_offload.kv_cache import (
     DSAKVCacheConfig,
     DSAKVCacheGroupIds,
     DSAResidentMLAAttentionSpec,
+    dsa_mtp_durable_offload_enabled,
     get_dsa_group_num_blocks,
     get_dsa_kv_cache_binding_order,
     get_dsa_kv_cache_group_ids,
@@ -219,6 +220,7 @@ from vllm_ascend.dsa_offload.ops import require_dsa_offload_ops
 from vllm_ascend.dsa_offload.resident_pool import DSAResidentTokenPool
 from vllm_ascend.dsa_offload.runtime import (
     DSALayerOffloadContext,
+    DSAMTPFullCacheOffloadContext,
     DSAOffloadRuntime,
 )
 from vllm_ascend.dsa_offload.scheduler_output import (
@@ -445,6 +447,10 @@ class NPUModelRunner(GPUModelRunner):
                 max_decode_query_len=self.uniform_decode_query_len,
                 enable_prefix_caching=bool(
                     vllm_config.cache_config.enable_prefix_caching
+                ),
+                mtp_durable_offload=(
+                    dsa_config.mtp_enabled
+                    and dsa_mtp_durable_offload_enabled(vllm_config)
                 ),
             )
             if self.dsa_resident_token_pool is not None
@@ -1683,6 +1689,11 @@ class NPUModelRunner(GPUModelRunner):
                 num_tokens=total_num_scheduled_tokens,
                 resident_group_id=group_ids.resident_mla,
                 indexer_group_id=group_ids.indexer,
+                mtp_group_id=(
+                    group_ids.mtp_full
+                    if runtime.mtp_durable_offload
+                    else None
+                ),
                 decode_forward=self._dsa_decode_forward,
             )
 
@@ -3061,6 +3072,9 @@ class NPUModelRunner(GPUModelRunner):
             # forward when speculative decoding is enabled. Finalize here after
             # draft model runs so KV pool save/put can complete.
             if self.speculative_config is not None:
+                dsa_runtime = self.dsa_offload_runtime
+                if dsa_runtime is not None:
+                    dsa_runtime.validate_mtp_dump_completion()
                 self.finalize_kv_connector()
 
         model_runner_output = ModelRunnerOutput(
@@ -5031,6 +5045,37 @@ class NPUModelRunner(GPUModelRunner):
                 f"capacity={resident_pool.num_layers}"
             )
 
+        if dsa_mtp_durable_offload_enabled(self.vllm_config):
+            for mtp_layer_id, layer_name in enumerate(
+                sorted(mtp_full_layers)
+            ):
+                mtp_cache = kv_caches[layer_name]
+                assert isinstance(mtp_cache, tuple)
+                store.add_mtp_layer(
+                    layer_id=mtp_layer_id,
+                    mtp_full_cache=mtp_cache,
+                )
+                mtp_module = forward_context[layer_name]
+                if not isinstance(mtp_module, MLAAttention):
+                    raise RuntimeError(
+                        "DSA MTP full-cache is not bound to MLAAttention: "
+                        f"layer={layer_name}, "
+                        f"module={type(mtp_module).__name__}"
+                    )
+                mtp_impl = mtp_module.impl
+                if not isinstance(mtp_impl, AscendSFAImpl):
+                    raise RuntimeError(
+                        "DSA MTP full-cache requires AscendSFAImpl: "
+                        f"layer={layer_name}, "
+                        f"impl={type(mtp_impl).__name__}"
+                    )
+                mtp_impl.bind_dsa_mtp_full_cache_context(
+                    DSAMTPFullCacheOffloadContext(
+                        layer_id=mtp_layer_id,
+                        runtime=runtime,
+                    )
+                )
+
         store.finalize_payload_layout()
 
         if has_kv_transfer_group():
@@ -6161,8 +6206,13 @@ class NPUModelRunner(GPUModelRunner):
         )
         from vllm.model_executor.models.utils import extract_layer_index
 
-        target_resident_layer_count = self.model_config.get_num_layers(
-            self.parallel_config
+        dsa_offload_enabled = bool(
+            getattr(self, "dsa_offload_enabled", False)
+        )
+        target_resident_layer_count = (
+            self.model_config.get_num_layers(self.parallel_config)
+            if dsa_offload_enabled
+            else 0
         )
         kv_cache_spec: dict[str, list[KVCacheSpec]] = defaultdict(list)
         attn_layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
@@ -6200,14 +6250,18 @@ class NPUModelRunner(GPUModelRunner):
 
                     layer_index = extract_layer_index(layer_name)
                     is_mtp_full_cache_layer = (
-                        self.dsa_offload_enabled
+                        dsa_offload_enabled
                         and self.ascend_config.dsa_offload_config.is_mtp_cache_layer_index(
                             layer_index,
                             target_resident_layer_count,
                         )
                     )
                     if is_mtp_full_cache_layer != bool(
-                        impl.is_dsa_mtp_full_cache_layer
+                        getattr(
+                            impl,
+                            "is_dsa_mtp_full_cache_layer",
+                            False,
+                        )
                     ):
                         raise RuntimeError(
                             "DSA MTP cache-layer classification drifted "
@@ -6215,7 +6269,7 @@ class NPUModelRunner(GPUModelRunner):
                             f"layer={layer_name}, layer_index={layer_index}"
                         )
                     apply_dsa_to_layer = (
-                        self.dsa_offload_enabled
+                        dsa_offload_enabled
                         and not is_mtp_full_cache_layer
                     )
                     if apply_dsa_to_layer:
@@ -6365,7 +6419,7 @@ class NPUModelRunner(GPUModelRunner):
             elif isinstance(attn_module, DeepseekV32IndexerCache):
                 layer_index = extract_layer_index(layer_name)
                 if (
-                    self.dsa_offload_enabled
+                    dsa_offload_enabled
                     and not self.ascend_config.dsa_offload_config.is_mtp_cache_layer_index(
                         layer_index,
                         target_resident_layer_count,

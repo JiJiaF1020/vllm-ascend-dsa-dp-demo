@@ -269,14 +269,19 @@ ENABLE_MTP="true"
 `{"method":"mtp","num_speculative_tokens":3}`。MTP3 只接受
 `temperature=0.0`；target 可复用 uniform FULL graph，GLM proposer 按社区
 基线保持 eager。MTP proposer 使用独立 BF16 full-cache group，不进入 target
-DSA resident/DRAM 数据面；默认 ratio=3 时启动容量报告应显示 target Indexer
-`3N`、target resident `N`、MTP full `3N` 三个物理 pool。
+DSA resident 的 token-wise swap；启用 prefix 时，其 verified full blocks 会作为
+第三个 durable component 进入 L2/L3。默认 ratio=3 时启动容量报告应显示 target
+Indexer `3N`、target resident `N`、MTP full `3N` 三个 HBM pool，并在 DRAM
+complete block bytes 中增加 MTP BF16 page。
+若 prefix caching 与 L3 都关闭，MTP 继续保持原来的纯 HBM 行为，不创建该
+DRAM plane，也不增加 steady proposer copy。
 若修改了 `SERVED_MODEL_NAME`，同步把 `stream_chat_client.py` 顶部的
 `MODEL_NAME` 改成相同值。
 
 DSA L3 P1-W/P1-R 都需要先启动 Mooncake Master。仅验证 write-behind 时设置：
 
 ```bash
+# no-MTP 保持 false；验证固定 MTP3 多级 prefix 时设为 true。
 ENABLE_MTP="false"
 ENABLE_L3_WRITE_BEHIND="true"
 MOONCAKE_CONFIG_PATH="${SCRIPT_DIR}/L3_cache_sys_api_test/baseline_e2e/configs/mooncake-dsa-tcp.json"
@@ -287,7 +292,7 @@ DSA_L3_SHUTDOWN_TIMEOUT_SECONDS="300"
 
 该模式使用 `DSAL3Connector` 和 Mooncake Store-owned TCP。所有 TP rank 都按
 vLLM-Ascend embedded-client 范式贡献一段 `MOONCAKE_GLOBAL_SEGMENT_SIZE`，
-但只有 TP rank0 上传一份完整 Indexer+MLA L2 bundle；request finish 不等待，
+但只有 TP rank0 上传一份完整 durable L2 bundle；request finish 不等待，
 L2 physical block 被复用前才触发相关 job fence。P1-W 使用
 `kv_role=kv_producer`，因此 TTFT 不应出现 external hit。验收时应看到每个 TP rank 的
 `contributes_segment=True`，以及唯一 producer 的 `store planned/submitted/`
@@ -298,9 +303,10 @@ step，待 pending store 完成后再关闭各 rank 的 Mooncake segment。DSA L
 并不改变请求完成时延，只限制进程退出最多等待多久。离线 `LLM` 的默认
 finalizer 不向 MPClient 传递该 timeout，因此 `simple_prompt_test.py` 会在成功
 生成后显式调用 engine-core shutdown；在线 launcher 原生会传递该配置。
-当前 A5 GLM-5.2 一个完整逻辑块包含 42 个 Indexer plane 和 78 个 MLA
-plane。示例按 128 个 Mooncake descriptor 切分 backend put，因此一次传一个完整
-Indexer+MLA 块，避免把 64 块合成 7,680 个 descriptor 后触发 10 秒同步传输
+当前 A5 GLM-5.2 no-MTP 完整逻辑块包含 42 个 Indexer plane 和 78 个 MLA
+plane；MTP3 再增加 3 个 BF16 plane，总计 123 descriptors，仍低于 128 的单块
+预算。示例按 128 个 Mooncake descriptor 切分 backend put，因此一次传一个完整
+bundle，避免把多块合成数千个 descriptor 后触发 10 秒同步传输
 超时；后续性能调优可在实测门禁下提高该预算。TCP 模式不创建外部
 `GlobalTE`，而是由 Mooncake Store 创建 engine，并通过
 `store.register_buffer()` 注册 TP0 固定 L2 arena。配置中的
@@ -358,14 +364,31 @@ DSA prefix restore submitted: ...
 [dsa-smoke] local-L2/L3 replay consistency passed
 ```
 
-P1-R 首版同步执行 `L3 -> 每 rank LocalDRAM -> split HBM`。所有 rank 完成本地
-get 后用预分配状态 tensor 做 TP all-reduce；任一 rank 或任一 Indexer/MLA
-component 失败都会在 forward 前让全体 fail-fast。MTP、DP、异步 load 与
-recompute 仍不支持。Mooncake lookup/load 成功后，第二轮只计算未命中的尾部，
+P1-R 同步执行 `L3 -> 每 rank LocalDRAM -> split HBM`。所有 rank 完成本地
+get 后用预分配状态 tensor 做 TP all-reduce；任一 rank 或任一
+Indexer/MLA/可选 MTP component 失败都会在 forward 前让全体 fail-fast。DP、
+异步 load 与 recompute 仍不支持。Mooncake lookup/load 成功后，第二轮只计算未命中的尾部，
 不把已恢复 prefix 再次当作新增块上传。
 
 L3 key 不包含 TP rank，故 Mooncake 中只有一份池化对象；all-rank load 是同一
 对象向各 rank 本地 L2 的读出扇出，并不会在 L3 再保存 TP 份副本。
+
+固定 MTP3 多级 prefix 使用同一入口：
+
+```python
+ENABLE_MTP = True
+ENABLE_PREFIX_CACHING = True
+ENABLE_L3_WRITE_BEHIND = True
+ENABLE_L3_PREFIX_LOADBACK = True
+ENABLE_L3_DIRECT_HBM_LOAD = False
+PREFIX_CACHE_REPLAY_ROUNDS = 3
+```
+
+此时 GLM-5.2 每个 complete bundle 为 `7,084,544` bytes，L3 每个 block
+包含 `indexer/mla/mtp` 三个 key 和 123 descriptors。第二轮本地 replay 与清
+本地后的第三轮 L3 replay 都会按基线 MTP 语义在最长 raw prefix 末端回退一个
+block；这是重建 proposer 边界状态，不是 cache miss。日志应同时显示非零
+`mtp_blocks`、MTP-aware bundle bytes，以及 L3 load 后 target+MTP restore。
 
 ### P1-R 精度收缩矩阵
 
@@ -571,7 +594,8 @@ DSA L3 prefix lookup: ... local_blocks=max(hbm_pair_blocks,l2_blocks)
 HBM pair 只覆盖同时命中的 Indexer+dense MLA，但不再要求同长度 L2 bundle
 仍存在。若 `hbm_pair_blocks > l2_blocks`，首个 prefill forward 会产生非零
 full-block dump，model output 返回后 L2 ready/hash 才推进到完整 durable
-前缀。L3 suffix 始终打印 `destination=l2`，随后执行既有 restore。MTP、
+前缀。L3 suffix 始终打印 `destination=l2`，随后执行既有 restore。MTP 开启时
+HBM 使用 target pair+MTP triple，L2/L3 使用三 component complete bundle；
 Indexer-only、MLA-only 与逐 component IO 去重仍属于后续阶段。
 
 建议按以下顺序收口：
@@ -686,7 +710,8 @@ LV-Eval 或 CLongEval 官方排行榜分数。正式精度对比应保持相同�
   pair 与 HBM-only L2 backfill 已完成代码改造、待 A5 上板；
 - preemption/resume；
 - 非 MTP speculative method、MTP draft 数不等于 3、非 greedy MTP；
-- MTP 与 L3 组合、L3 的 DP>1、layerwise async load 和 HBM 直通；
+- 固定 MTP3 多级 prefix 尚待 A5 上板；L3 的 DP>1、layerwise async load 和
+  HBM 直通；
 - `DSAL3Connector` 之外的 DSA KV transfer connector，以及非 Mooncake 后端；
 - context parallel 和 pipeline parallel；
 - KV-cache metrics/events；

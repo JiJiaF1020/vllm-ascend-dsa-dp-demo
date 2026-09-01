@@ -13,7 +13,7 @@ vLLM v0.23 的 ``SchedulerOutput`` 对 cached request 只传新增 block IDs，
   request-id→scalar 字典；
 * 只有 ENTER 行携带 resident block IDs 全量快照。
 * DRAM 目录只传本轮新增的连续 assignment 后缀，不重传完整逻辑表。
-* prefix-hit 行额外携带一次性的 Indexer/MLA restore 列；每行 ready 水位
+* prefix-hit 行额外携带一次性的 Indexer/MLA/可选 MTP restore 列；每行 ready 水位
   只供 scheduler 在 worker 成功返回后发布 DRAM hash。
 
 多进程执行器使用 pickle 传递 scheduler output，因此该类型化子类会随普通
@@ -65,7 +65,7 @@ class DSADRAMBlockAssignment:
 
 @dataclass(frozen=True, slots=True)
 class DSADRAMBlockRestore:
-    """一个 prefix-hit 请求的 target DRAM->HBM 分平面恢复任务。
+    """一个 prefix-hit 请求的 durable bundle DRAM->HBM 恢复任务。
 
     ``ready_block_count`` 是恢复完成后 L2 的连续 durable 水位，不要求
     覆盖本次 copy range。HBM-only 本地前缀可能在 L2 中形成待回填缺口；
@@ -77,6 +77,7 @@ class DSADRAMBlockRestore:
     source_dram_block_ids: tuple[int, ...]
     destination_indexer_block_ids: tuple[int, ...]
     destination_resident_block_ids: tuple[int, ...]
+    destination_mtp_block_ids: tuple[int, ...] = ()
     logical_block_start: int = 0
     ready_block_count: int | None = None
 
@@ -90,6 +91,14 @@ class DSADRAMBlockRestore:
             raise ValueError(
                 "DSA DRAM restore planes must have one matching "
                 f"length, got {lengths}"
+            )
+        if self.destination_mtp_block_ids and len(
+            self.destination_mtp_block_ids
+        ) != lengths[0]:
+            raise ValueError(
+                "DSA MTP restore plane has a different length: "
+                f"mtp={len(self.destination_mtp_block_ids)}, "
+                f"bundle={lengths[0]}"
             )
         if self.logical_block_start < 0:
             raise ValueError("DSA DRAM restore start must be non-negative")
@@ -114,6 +123,7 @@ class DSADRAMBlockRestore:
                 self.source_dram_block_ids,
                 self.destination_indexer_block_ids,
                 self.destination_resident_block_ids,
+                self.destination_mtp_block_ids,
             )
             for block_id in block_ids
         ):

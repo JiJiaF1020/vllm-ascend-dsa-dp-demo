@@ -102,10 +102,12 @@ class DSAL3StoreScheduler:
             )
         )
         if usable_blocks > 0:
-            # One logical block owns one Indexer key and one MLA key. Bound
+            # One logical block owns one key per active durable component. Bound
             # the hint cache to the local L2 capacity so a long-running
             # service cannot retain every key ever evicted by Mooncake.
-            self._remote_ready_key_limit = usable_blocks * 2
+            self._remote_ready_key_limit = usable_blocks * len(
+                self.schema.active_components
+            )
 
     def _remember_remote_ready_keys(self, keys: tuple[str, ...]) -> None:
         limit = self._remote_ready_key_limit
@@ -171,11 +173,13 @@ class DSAL3StoreScheduler:
         )
         logger.info(
             "DSA L3 prefix lookup: request=%s local_blocks=%d "
-            "queried_blocks=%d hit_blocks=%d external_tokens=%d",
+            "queried_blocks=%d hit_blocks=%d effective_blocks=%d "
+            "external_tokens=%d",
             request.request_id,
             local_blocks,
             len(candidate_hashes),
             hit_blocks,
+            external_tokens // block_size,
             external_tokens,
         )
         return external_tokens
@@ -203,21 +207,33 @@ class DSAL3StoreScheduler:
                 "DSA L3 external load token count changed after allocation"
             )
         blocks: list[DSAL3LoadBlock] = []
+        mtp_destinations: tuple[int | None, ...]
+        plan_mtp_destinations = tuple(
+            getattr(plan, "destination_mtp_hbm_block_ids", ())
+        )
+        if plan_mtp_destinations:
+            mtp_destinations = plan_mtp_destinations
+        else:
+            mtp_destinations = (None,) * len(plan.block_hashes)
         for offset, (
             block_hash,
             destination_l2,
             destination_indexer,
             destination_resident,
+            destination_mtp,
         ) in enumerate(
             zip(
                 plan.block_hashes,
                 plan.destination_dram_block_ids,
                 plan.destination_indexer_hbm_block_ids,
                 plan.destination_resident_hbm_block_ids,
+                mtp_destinations,
                 strict=True,
             )
         ):
-            indexer_key, mla_key = self.schema.block_keys(block_hash)
+            component_keys = self.schema.block_keys(block_hash)
+            if len(component_keys) != len(self.schema.active_components):
+                raise RuntimeError("DSA L3 schema emitted an invalid key set")
             blocks.append(
                 DSAL3LoadBlock(
                     logical_block_index=(
@@ -231,8 +247,14 @@ class DSAL3StoreScheduler:
                         destination_resident
                     ),
                     block_hash=block_hash,
-                    indexer_key=indexer_key,
-                    mla_key=mla_key,
+                    indexer_key=component_keys[0],
+                    mla_key=component_keys[1],
+                    destination_mtp_hbm_block_id=destination_mtp,
+                    mtp_key=(
+                        component_keys[2]
+                        if self.schema.has_mtp
+                        else None
+                    ),
                 )
             )
         self._pending_load_jobs.append(
@@ -334,8 +356,7 @@ class DSAL3StoreScheduler:
                 block_hash = bytes(request.block_hashes[logical_index])
                 if block_hash in planned_hashes:
                     break
-                indexer_key, mla_key = self.schema.block_keys(block_hash)
-                keys = (indexer_key, mla_key)
+                keys = self.schema.block_keys(block_hash)
                 if all(key in self._remote_ready_keys for key in keys):
                     next_scan = logical_index + 1
                     continue
@@ -348,8 +369,9 @@ class DSAL3StoreScheduler:
                         logical_block_index=logical_index,
                         source_l2_block_id=int(physical_ids[logical_index]),
                         block_hash=block_hash,
-                        indexer_key=indexer_key,
-                        mla_key=mla_key,
+                        indexer_key=keys[0],
+                        mla_key=keys[1],
+                        mtp_key=keys[2] if self.schema.has_mtp else None,
                     )
                 )
                 next_scan = logical_index + 1
@@ -364,8 +386,8 @@ class DSAL3StoreScheduler:
         self._planned_blocks += len(job.blocks)
         metadata.store_jobs[job_id] = job
         for block in job.blocks:
-            self._pending_key_jobs[block.indexer_key] = job_id
-            self._pending_key_jobs[block.mla_key] = job_id
+            for key in block.component_keys:
+                self._pending_key_jobs[key] = job_id
             self._l2_block_jobs[block.source_l2_block_id].add(job_id)
         logger.info(
             "DSA L3 store planned: job=%d blocks=%d requests=%d bytes=%d",
@@ -388,8 +410,8 @@ class DSAL3StoreScheduler:
                 continue
             ready_keys: list[str] = []
             for block in job.blocks:
-                self._pending_key_jobs.pop(block.indexer_key, None)
-                self._pending_key_jobs.pop(block.mla_key, None)
+                for key in block.component_keys:
+                    self._pending_key_jobs.pop(key, None)
                 pending = self._l2_block_jobs.get(block.source_l2_block_id)
                 if pending is not None:
                     pending.discard(job_id)
@@ -399,7 +421,7 @@ class DSAL3StoreScheduler:
                             None,
                         )
                 if result.success:
-                    ready_keys.extend((block.indexer_key, block.mla_key))
+                    ready_keys.extend(block.component_keys)
             if ready_keys:
                 self._remember_remote_ready_keys(tuple(ready_keys))
             self._completed_jobs += 1

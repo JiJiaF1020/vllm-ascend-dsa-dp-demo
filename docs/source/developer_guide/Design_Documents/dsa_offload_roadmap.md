@@ -2,8 +2,9 @@
 
 > - 最后更新：2026-09-01
 > - 基线：vLLM-Ascend v0.23.0 `5cb98caa`
-> - 当前实现基点：DSA custom `4c979ffd`
-> - 当前阶段：P1-HOT 妥协版开发完成，等待成对 HBM-only backfill 上板
+> - 当前实现基点：DSA custom `7e5890a8` + MTP multi-tier working tree
+> - 当前阶段：P1-HOT 已完成离线/在线闭环；P2 MTP 多级 prefix 已通过
+>   A5 TP8 eager/FULL graph 单 40K 与混合 graph 配对控制，继续补在线门禁
 
 ## 1. 文档定位
 
@@ -24,12 +25,12 @@
 | 原 RoadMap 工作项 | 状态 | 当前边界 |
 |---|---|---|
 | scheduler 统一管理 DRAM block | 完成 | scheduler 是 physical-id/hash/refcount 真源 |
-| 完整 Indexer+MLA LocalDRAM bundle | 完成 | worker 只持固定 arena 与 assignment 镜像 |
+| 完整 LocalDRAM bundle | 完成 | no-MTP 为 Indexer+MLA；MTP 增加 BF16 full-cache component |
 | LocalDRAM prefix cache | 第一版完成 | complete bundle 最长连续命中与分平面 restore |
 | L2→L3 write-behind | P1-W 完成 | TP0 异步 put、reuse fence、shutdown drain |
-| L3→L2→HBM loadback | P1-R 完成首版 | no-MTP、Mooncake、同步 all-rank get、fail-fast |
-| HBM target prefix | P1-HOT 妥协版待上板 | HBM pair 可越过 L2；L3 固定经 L2；首 chunk 补 L2 gap |
-| MTP 多级 prefix | 未开始 | L3 当前显式拒绝 MTP |
+| L3→L2→HBM loadback | P1-R 完成 | Mooncake、同步 all-rank get、fail-fast；no-MTP 已上板 |
+| HBM target prefix | P1-HOT 完成 | HBM pair 可越过 L2；L3 固定经 L2；首 chunk 补 L2 gap |
+| MTP 多级 prefix | 离线单/多请求上板通过 | 三 component bundle、verified 满块 dump、两阶段 store、lookup/load/restore；混合 graph 分叉由 Local/Local 配对控制复现，在线待回归 |
 | preemption/resume | 未开始 | scheduler 当前显式失败 |
 | P/D 分离 | 未开始 | 等待 tier/source 与恢复合同稳定 |
 | 理想版动态 MTP | 未开始 | 当前固定 MTP3、greedy、双尾可用 |
@@ -44,6 +45,10 @@ continuous batching：串行跨介质分叉均能由同介质相同签名复现�
 Local-L2 自对照中已经广泛存在，没有形成 L3 独有错误证据。按项目进度将
 L3 数据路径阶段性收口；graph token 确定性、eager 严格回归、FD 长稳和
 external namespace 物理 GC 保留为独立遗留，不作为 P1-HOT 阻塞项。
+
+2026-09-01 在线收口进一步覆盖顺序双回放与并发压力回放：943 个唯一
+prompt bundle 只写一次，三组 L3 replay 每个 TP rank 均加载 2829 blocks，
+所有 HTTP 请求返回 200，未出现重复 store、漏 rank、pending job 或水位错误。
 
 ### 工作项
 
@@ -69,7 +74,7 @@ external namespace 物理 GC 保留为独立遗留，不作为 P1-HOT 阻塞项�
 
 ## 4. P1：HBM target prefix 与 component source
 
-这是完成 P0 后的默认下一功能优先级。
+该阶段已完成 no-MTP 正确性闭环。
 
 当前妥协版先实现完整 HBM pair：无 MTP 时，Indexer 与 dense MLA 同时命中的
 公共前缀直接成为请求 block table 前段，并允许比 L2 complete bundle 更长。
@@ -96,7 +101,7 @@ external_l3_blocks = local_blocks 之后的连续 L3 suffix
 
 本阶段不可放松的最终不变量：请求释放任何 dense MLA block 或进入
 `ENTER/SPARSE` decode 前，L2 ready 前缀必须覆盖请求全部
-`durable_full_blocks`，且每个逻辑块同时包含完整 Indexer+MLA payload。HBM
+`durable_full_blocks`，且每个逻辑块同时包含完整 durable payload。HBM
 命中只减少 restore，不能代替 durable backing；当前 HBM-only 命中必须先
 完成 backfill，再推进 ready 水位和释放 HBM。
 
@@ -126,14 +131,39 @@ external_l3_blocks = local_blocks 之后的连续 L3 suffix
 
 ## 5. P2：MTP 多级 prefix
 
-先支持同进程 HBM/L2 公共命中，再扩展 L3。
+当前冻结为“第三个 MTP component”方案，代码与 A5 TP8 eager/FULL graph
+单 40K 端到端闭环已经通过：
 
-- target Indexer、target MLA 与 MTP full-HBM cache 取公共长度；
-- provisional MTP token 永远不发布 hash；
-- L3 方案需在“第三个 MTP component”与“恢复 target、重算 proposer prefix”
-  之间冻结一个精确合同；
-- MTP cache 未恢复时不能仅凭 target L3 hit 跳过 prefill；
-- 保持固定 MTP3、greedy 和双尾，不在本阶段引入动态验算窗口。
+- active sparse decode 的 MTP proposer 继续使用原生 BF16 full-HBM cache，不做
+  token-wise swap；
+- verified full block 与 target payload 绑定到同一个 L2 logical block，L3 使用
+  `indexer/mla/mtp` 三个内容寻址 key；
+- scheduler durable watermark 在 MTP decode 中减去本轮 provisional query，
+  provisional MTP token 永远不发布 hash；
+- prefill 在 MTP cache 写后 dump，decode 在 proposer 首次写前 dump；同一 outer
+  step 每个 MTP 层只 dump 一次；
+- target forward 的基线 `get_finished()` 只 stage store job；proposer dump
+  完成并通过 epoch 校验后，`wait_for_save()` 才记录 ready event 并提交，避免
+  把陈旧 MTP L2 component 发布到 L3；
+- target Indexer、dense MLA 与 MTP full-HBM 形成完整 HBM triple；L2 bundle
+  独立参与匹配，L3 只补最长本地前缀后的 suffix；
+- L3 all-rank get 先恢复三 component L2 bundle，再统一恢复 target 与 MTP HBM；
+- 对 L1/L2/L3 合并前缀只执行一次基线 Eagle 末块回退，用于重建 drafting
+  边界状态；
+- 保持固定 MTP3、greedy 和 target 双尾，不引入动态验算窗口。
+
+当前证据：全量 DSA UT 与 generic BF16 MTP 三 plane round-trip 通过；eager
+单 40K 的 Local-L2/L3 token 序列严格一致；FULL graph 已完成 cold、
+Local-L2、清本地后的 L3 三轮以及 8K/5K/70K/40K 混合配对控制，并触发
+decode prewrite durable block。在线 FULL graph closeout 已完成 24 个真实
+L3 load plan，均在 TP0～TP7 完成三 component get/restore；跨介质分叉要么
+精确落入同源 trace 的位置/token 签名，要么同时满足 reciprocal top-k 与
+同源 prompt 波动包络。更长 continuous batching、FD 长稳和 DeepSeek-V3.2
+仍属于本阶段后续门禁。
+
+退出门禁包括：容量报告增加 MTP L2 字节、三 key bitwise round-trip、chunked
+prefill、跨满块 decode、双尾拒绝/接受、L2-only、L3-only、L1>L2、L3>L1、
+eager/FULL graph、离线/在线 TP8；必须证明未验证尾块从不进入 L2/L3。
 
 ## 6. P3：preemption/resume
 

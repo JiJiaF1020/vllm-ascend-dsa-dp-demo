@@ -118,6 +118,67 @@ class TestBlockTableComputeSlotMapping(TestBase):
             block_ids = list(range(i * 4, (i + 1) * 4))  # [0,1,2,3], [4,5,6,7], etc.
             block_table.add_row(block_ids, i)
 
+    def test_replace_row_clears_stale_dense_suffix(self):
+        block_table = self.create_block_table(
+            dcp_world_size=1,
+            dcp_rank=0,
+            pcp_world_size=1,
+            pcp_rank=0,
+            cp_kv_cache_interleave_size=1,
+        )
+        block_table.block_table.np[0].fill(99)
+        block_table.add_row([10, 11, 12, 13, 14], 0)
+
+        block_table.replace_row([20, 21, 14], 0)
+
+        self.assertEqual(block_table.num_blocks_per_row[0], 3)
+        self.assertEqual(
+            block_table.block_table.np[0, :3].tolist(),
+            [20, 21, 14],
+        )
+        self.assertTrue(
+            np.all(block_table.block_table.np[0, 3:] == 0)
+        )
+
+    def test_add_move_and_clear_keep_inactive_columns_zero(self):
+        block_table = self.create_block_table(
+            dcp_world_size=1,
+            dcp_rank=0,
+            pcp_world_size=1,
+            pcp_rank=0,
+            cp_kv_cache_interleave_size=1,
+        )
+        block_table.block_table.np[0].fill(99)
+        block_table.add_row([10, 11, 12, 13, 14], 0)
+        self.assertTrue(
+            np.all(block_table.block_table.np[0, 5:] == 0)
+        )
+
+        block_table.add_row([20, 21], 1)
+        block_table.block_table.np[1, 2:].fill(77)
+        block_table.move_row(1, 1)
+        self.assertEqual(
+            block_table.block_table.np[1, :2].tolist(),
+            [20, 21],
+        )
+        self.assertTrue(
+            np.all(block_table.block_table.np[1, 2:] == 0)
+        )
+
+        block_table.move_row(1, 0)
+        self.assertEqual(block_table.num_blocks_per_row[0], 2)
+        self.assertEqual(
+            block_table.block_table.np[0, :2].tolist(),
+            [20, 21],
+        )
+        self.assertTrue(
+            np.all(block_table.block_table.np[0, 2:] == 0)
+        )
+
+        block_table.clear_row(0)
+        self.assertEqual(block_table.num_blocks_per_row[0], 0)
+        self.assertTrue(np.all(block_table.block_table.np[0] == 0))
+
     def _test_slot_mapping_for_ranks(self, dcp_world_size, pcp_world_size, cp_kv_cache_interleave_size, test_configs):
         """Helper method to test slot_mapping across multiple ranks
 

@@ -498,10 +498,6 @@ class DSAOffloadConfig:
                     "DSAL3Connector, got "
                     f"{connector_name!r}"
                 )
-            if speculative_config is not None:
-                raise ValueError(
-                    "DSA L3 first version does not yet support MTP"
-                )
             kv_role = str(kv_transfer_config.kv_role)
             if kv_role not in ("kv_producer", "kv_both"):
                 raise ValueError(

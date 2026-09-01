@@ -12,11 +12,12 @@ admission 时逐 component 检查。
 本模块同时持有请求 cache 布局 planner：manager 先生成不可变布局计划，完成
 各 pool 容量检查和物理修改后再 commit；prefill 输出返回后，薄 Scheduler
 也通过这里释放已卸载的 resident 满块。它仍不复制 Scheduler 主循环。
-本地 prefix cache 给完整 DRAM bundle、无 MTP 时成对的 target HBM block，
-以及可选 MTP full-HBM group 建 hash。HBM pair 可以比 L2 更长，缺失的 L2
-由首个 prefill forward 回填。固定 MTP3 的 target
+本地 prefix cache 给完整 DRAM bundle 与 HBM component 建 hash：no-MTP
+使用 target pair，MTP 使用 target pair+MTP full-cache triple。完整 HBM
+prefix 可以比 L2 更长，缺失的 L2 由首个 prefill forward 回填。固定 MTP3 的 target
 验算仍由 resident 双尾块承接 provisional 写入；MTP proposer 自身则使用
-第三个原生 full-cache group，不进入 DSA resident/DRAM 数据面。
+第三个原生 full-cache group。active decode 不做 MTP token-wise swap，只有
+verified full blocks 进入完整 DRAM/L3 bundle。
 
 这里的 block table 是 scheduler/core 侧逻辑真源。v0.23 原生
 ``SchedulerOutput`` 对 cached request 只表达“追加的新块”，尚不能表达
@@ -128,7 +129,7 @@ class DSABlockPoolView:
 class DSAPrefixCacheHitPlan:
     """查询阶段的零引用候选；只有联合 admission 成功后才能提交。
 
-    ``dram_blocks`` 与成对的 target HBM blocks 分别表示两个独立本地
+    ``dram_blocks`` 与完整 HBM component blocks 分别表示两个独立本地
     tier 的连续前缀。二者允许长度不同；``local_computed_tokens`` 取二者
     的较长者。若 HBM 前缀更长，缺失的 L2 bundle 会在首个 prefill
     forward 中由既有 full-block dump 同步补齐。
@@ -153,6 +154,12 @@ class DSAPrefixCacheHitPlan:
         ):
             raise ValueError(
                 "DSA paired HBM prefix components have different lengths"
+            )
+        if self.mtp_blocks and len(self.mtp_blocks) != len(
+            self.hbm_indexer_blocks
+        ):
+            raise ValueError(
+                "DSA MTP HBM prefix has a different component length"
             )
         if not self.request_id:
             raise ValueError("DSA prefix hit requires a request ID")
@@ -180,6 +187,7 @@ class DSAExternalPrefixLoadPlan:
     destination_dram_block_ids: tuple[int, ...]
     destination_indexer_hbm_block_ids: tuple[int, ...]
     destination_resident_hbm_block_ids: tuple[int, ...]
+    destination_mtp_hbm_block_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.request_id:
@@ -200,6 +208,12 @@ class DSAExternalPrefixLoadPlan:
             raise ValueError(
                 "DSA external prefix HBM destination columns disagree"
             )
+        if self.destination_mtp_hbm_block_ids and len(
+            self.destination_mtp_hbm_block_ids
+        ) != len(self.block_hashes):
+            raise ValueError(
+                "DSA external prefix MTP destination column disagrees"
+            )
         if any(block_id <= 0 for block_id in self.destination_dram_block_ids):
             raise ValueError(
                 "DSA external prefix destinations must be positive"
@@ -209,6 +223,7 @@ class DSAExternalPrefixLoadPlan:
             for block_ids in (
                 self.destination_indexer_hbm_block_ids,
                 self.destination_resident_hbm_block_ids,
+                self.destination_mtp_hbm_block_ids,
             )
             for block_id in block_ids
         ):
@@ -275,17 +290,12 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
                 ),
                 enable_caching=(
                     self.enable_caching
-                    and (
-                        group_id == self.group_ids.mtp_full
-                        or (
-                            not use_eagle
-                            and group_id
-                            in {
-                                self.group_ids.indexer,
-                                self.group_ids.resident_mla,
-                            }
-                        )
-                    )
+                    and group_id
+                    in {
+                        self.group_ids.indexer,
+                        self.group_ids.resident_mla,
+                        self.group_ids.mtp_full,
+                    }
                 ),
                 hash_block_size=hash_block_size,
                 enable_kv_cache_events=enable_kv_cache_events,
@@ -463,6 +473,13 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
         l2_blocks = l2_blocks[
             : l2_tokens // self.dram_block_size
         ]
+        if self.mtp_full_manager is not None and l2_blocks:
+            # EAGLE/MTP replay needs the final cached block to be recomputed in
+            # order to rebuild the drafting boundary state. L2 stores every
+            # durable full block, so convert its raw bundle prefix into the
+            # replayable prefix by dropping exactly one block.
+            l2_blocks = l2_blocks[:-1]
+            l2_tokens = len(l2_blocks) * self.dram_block_size
 
         max_local_tokens = min(
             int(max_cache_hit_length),
@@ -474,13 +491,13 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
             * self.scheduler_block_size
         )
 
-        # 非 MTP 首版只复用成对的 target HBM prefix。两个 HBM component
-        # 任一先 miss 就在较短处截断；但该 pair 不再受 L2 长度约束。
-        # HBM-only 范围的 L2 backfill 由首个 prefill forward 的既有 dump
-        # 完成。单 component source mask 留给后续优化阶段。
+        # 两个 target HBM component 任一先 miss 就在较短处截断；MTP
+        # 开启时再与 proposer full-cache 取公共前缀。该完整 HBM prefix
+        # 不受 L2 长度约束，HBM-only 范围由首个 prefill forward 回填 L2。
+        # 单 component source mask 留给后续优化阶段。
         hbm_indexer_blocks: tuple[KVCacheBlock, ...] = ()
         hbm_resident_blocks: tuple[KVCacheBlock, ...] = ()
-        if max_local_tokens and self.mtp_full_manager is None:
+        if max_local_tokens:
             component_hits: list[tuple[KVCacheBlock, ...]] = []
             for group_id, component_manager in (
                 (self.group_ids.indexer, self.indexer_manager),
@@ -514,17 +531,18 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
             hbm_resident_blocks = component_hits[1][:hbm_block_count]
 
         mtp_blocks: tuple[KVCacheBlock, ...] = ()
-        final_tokens = max(
-            l2_tokens,
-            len(hbm_indexer_blocks) * self.dram_block_size,
-        )
-        if final_tokens and self.mtp_full_manager is not None:
+        if hbm_indexer_blocks and self.mtp_full_manager is not None:
             mtp_group_id = self.group_ids.mtp_full
             assert mtp_group_id is not None
             mtp_spec = self.kv_cache_config.kv_cache_groups[
                 mtp_group_id
             ].kv_cache_spec
             mtp_block_size = int(mtp_spec.block_size)
+            if mtp_block_size != self.dram_block_size:
+                raise RuntimeError(
+                    "DSA MTP multi-tier prefix requires matching block sizes: "
+                    f"mtp={mtp_block_size}, dram={self.dram_block_size}"
+                )
             mtp_hashes = (
                 request.block_hashes
                 if mtp_block_size == self.hash_block_size
@@ -536,8 +554,11 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
             )
             # 与基线 HybridKVCacheCoordinator 一致：EAGLE/MTP 为了在
             # prefix 边界重建 drafting hidden states，多检查一个块后 drop。
+            target_hbm_tokens = (
+                len(hbm_indexer_blocks) * self.dram_block_size
+            )
             mtp_max_length = min(
-                final_tokens + mtp_block_size,
+                target_hbm_tokens + mtp_block_size,
                 int(max_cache_hit_length),
             )
             mtp_hit = self.mtp_full_manager.find_longest_cache_hit(
@@ -549,20 +570,18 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
                 drop_eagle_block=True,
                 alignment_tokens=self.scheduler_block_size,
             )[0]
-            mtp_tokens = len(mtp_hit) * mtp_block_size
-            final_tokens = min(final_tokens, mtp_tokens)
-            l2_blocks = l2_blocks[
-                : final_tokens // self.dram_block_size
-            ]
             hbm_block_count = min(
                 len(hbm_indexer_blocks),
-                final_tokens // self.dram_block_size,
+                len(mtp_hit),
             )
             hbm_indexer_blocks = hbm_indexer_blocks[:hbm_block_count]
             hbm_resident_blocks = hbm_resident_blocks[:hbm_block_count]
-            mtp_blocks = tuple(
-                mtp_hit[: final_tokens // mtp_block_size]
-            )
+            mtp_blocks = tuple(mtp_hit[:hbm_block_count])
+
+        final_tokens = max(
+            l2_tokens,
+            len(hbm_indexer_blocks) * self.dram_block_size,
+        )
 
         hbm_hit_blocks: list[list[KVCacheBlock]] = [
             [] for _ in range(self.num_single_type_manager)
@@ -630,10 +649,14 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
             raise RuntimeError(
                 "DSA found an unexpected local prefix plan for a zero local hit"
             )
+        if self.mtp_full_manager is not None and external_block_count:
+            # The lookup starts at the already replayable local boundary. Its
+            # first remote block is therefore the one-block MTP lookahead that
+            # was dropped locally; dropping the final remote hit applies the
+            # Eagle boundary rule exactly once to the merged L1/L2/L3 prefix.
+            external_block_count -= 1
         if not external_block_count:
             return 0
-        if self.mtp_full_manager is not None:
-            raise RuntimeError("DSA L3 prefix load does not yet support MTP")
         logical_start = local_computed_tokens // self.dram_block_size
         logical_end = logical_start + external_block_count
         if logical_end > len(request.block_hashes):
@@ -783,11 +806,20 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
             )
         indexer_blocks = self.indexer_manager.req_to_blocks[request_id]
         resident_blocks = self.resident_manager.req_to_blocks[request_id]
+        mtp_blocks = (
+            self.mtp_full_manager.req_to_blocks[request_id]
+            if self.mtp_full_manager is not None
+            else []
+        )
         if (
             local_l2_block_count > local_block_count
             or len(plan.external_block_hashes) != external_block_count
             or len(indexer_blocks) < block_count
             or len(resident_blocks) < block_count
+            or (
+                self.mtp_full_manager is not None
+                and len(mtp_blocks) < block_count
+            )
         ):
             raise RuntimeError(
                 "DSA prefix restore block tables do not cover the common "
@@ -796,7 +828,8 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
                 f"local_dram={local_l2_block_count}, "
                 f"external={len(plan.external_block_hashes)}, "
                 f"indexer={len(indexer_blocks)}, "
-                f"resident={len(resident_blocks)}"
+                f"resident={len(resident_blocks)}, "
+                f"mtp={len(mtp_blocks)}"
             )
         hbm_block_count = plan.hbm_block_count
         if hbm_block_count > local_block_count:
@@ -815,7 +848,12 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
                 "DSA paired HBM prefix blocks changed before commit"
             )
         if self.mtp_full_manager is not None:
-            mtp_blocks = self.mtp_full_manager.req_to_blocks[request_id]
+            if len(plan.mtp_blocks) != hbm_block_count:
+                raise RuntimeError(
+                    "DSA MTP prefix plan does not cover the complete HBM "
+                    f"triple: target={hbm_block_count}, "
+                    f"mtp={len(plan.mtp_blocks)}"
+                )
             if tuple(mtp_blocks[: len(plan.mtp_blocks)]) != plan.mtp_blocks:
                 raise RuntimeError(
                     "DSA MTP cached-prefix blocks changed before commit"
@@ -864,6 +902,16 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
                             local_block_count:block_count
                         ]
                     ),
+                    destination_mtp_hbm_block_ids=(
+                        tuple(
+                            block.block_id
+                            for block in mtp_blocks[
+                                local_block_count:block_count
+                            ]
+                        )
+                        if self.mtp_full_manager is not None
+                        else ()
+                    ),
                 )
             )
         restore_start = hbm_block_count
@@ -910,6 +958,14 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
                     block.block_id
                     for block in resident_blocks[restore_start:restore_end]
                 ),
+                destination_mtp_block_ids=(
+                    tuple(
+                        block.block_id
+                        for block in mtp_blocks[restore_start:restore_end]
+                    )
+                    if self.mtp_full_manager is not None
+                    else ()
+                ),
                 logical_block_start=logical_start,
                 ready_block_count=restore_ready_count,
             )
@@ -933,36 +989,46 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
     ) -> None:
         """发布可复用的 HBM dense-context hash。"""
 
-        if self.mtp_full_manager is None:
-            # Indexer 在请求全生命周期中始终保持完整上下文语义。
-            self.indexer_manager.cache_blocks(
+        # Indexer 在请求全生命周期中始终保持完整上下文语义。
+        self.indexer_manager.cache_blocks(
+            request,
+            num_computed_tokens,
+            retention_interval=self.retention_interval,
+        )
+
+        # resident MLA 只有 PREFILL/DENSE 表与文本逻辑块一一对应；ENTER
+        # 后的 budget/tail 是稀疏物理槽，绝不能发布 prefix hash。
+        state = self.request_cache_layout.get_state(request.request_id)
+        if state is None:
+            raise RuntimeError(
+                "DSA cannot cache target HBM blocks before committing "
+                f"its layout: request_id={request.request_id!r}"
+            )
+        if state.stage in (
+            DSARequestCacheStage.PREFILL,
+            DSARequestCacheStage.DENSE_DECODE,
+        ):
+            self.resident_manager.cache_blocks(
                 request,
                 num_computed_tokens,
                 retention_interval=self.retention_interval,
             )
 
-            # resident MLA 只有 PREFILL/DENSE 表与文本逻辑块一一对应；
-            # ENTER 后的 budget/tail 是稀疏物理槽，绝不能发布 prefix hash。
-            state = self.request_cache_layout.get_state(request.request_id)
-            if state is None:
-                raise RuntimeError(
-                    "DSA cannot cache target HBM blocks before committing "
-                    f"its layout: request_id={request.request_id!r}"
-                )
-            if state.stage in (
-                DSARequestCacheStage.PREFILL,
-                DSARequestCacheStage.DENSE_DECODE,
-            ):
-                self.resident_manager.cache_blocks(
-                    request,
-                    num_computed_tokens,
-                    retention_interval=self.retention_interval,
-                )
-
         if self.mtp_full_manager is not None:
+            aligned_tokens = (
+                int(num_computed_tokens)
+                // self.scheduler_block_size
+                * self.scheduler_block_size
+            )
+            mtp_tokens_to_cache = aligned_tokens
+            if aligned_tokens > 0:
+                mtp_tokens_to_cache = min(
+                    int(num_computed_tokens),
+                    aligned_tokens + self.mtp_full_manager.block_size,
+                )
             self.mtp_full_manager.cache_blocks(
                 request,
-                num_computed_tokens,
+                mtp_tokens_to_cache,
                 retention_interval=self.retention_interval,
             )
 
