@@ -24,6 +24,10 @@ table；forward 准备阶段再由同一 owner 批量同步设备镜像。graph 
 metadata。稳定请求行序下七列采用批量刷新；请求增删或重排时，才执行一次
 request-id 映射并同步稳定 resident-pool 行。
 
+DP runtime idle 与启动期 capture 使用不同的临时状态标记，但复用同一
+device 镜像。idle 安装 PAD 行并使用专用 padding pool index，结束后从
+CPU 真源恢复；不会借用或释放真实请求的 resident pool 行。
+
 需要特别区分两种生命周期：vLLM 会把“本轮未调度”的请求临时移出
 persistent ``InputBatch``，但请求本身仍在运行。resident pool 行和 DRAM
 worker 镜像属于完整请求生命周期，只能在 ``finished_req_ids`` 到达时释放，不能
@@ -132,6 +136,7 @@ class DSAInputBatchCacheLayout:
         self.row_count = 0
         self.valid = False
         self._graph_capture_row_count = 0
+        self._runtime_dummy_row_count = 0
 
     @property
     def stages_cpu(self) -> np.ndarray:
@@ -345,6 +350,10 @@ class DSAInputBatchCacheLayout:
     def graph_capture_row_count(self) -> int:
         return self._graph_capture_row_count
 
+    @property
+    def runtime_dummy_row_count(self) -> int:
+        return self._runtime_dummy_row_count
+
     def prepare_graph_capture(
         self,
         *,
@@ -359,8 +368,8 @@ class DSAInputBatchCacheLayout:
         """
 
         row_count = int(row_count)
-        if self._graph_capture_row_count:
-            raise RuntimeError("DSA InputBatch graph-capture state was installed twice")
+        if self._graph_capture_row_count or self._runtime_dummy_row_count:
+            raise RuntimeError("DSA InputBatch dummy state was installed twice")
         if not 0 < row_count <= self.max_num_reqs:
             raise ValueError(
                 "DSA graph-capture row count is outside InputBatch "
@@ -387,6 +396,45 @@ class DSAInputBatchCacheLayout:
             self._graph_capture_row_count = 0
             raise
 
+    def prepare_runtime_dummy(self, *, row_count: int) -> None:
+        """Install PAD rows for a side-effect-free FULL-graph replay.
+
+        Unlike capture, runtime idle may coexist with retained request owners
+        (for example while connector work is pending). Only the device mirror
+        is replaced temporarily; the CPU semantic source and resident rows are
+        left untouched.
+        """
+
+        row_count = int(row_count)
+        if self._graph_capture_row_count or self._runtime_dummy_row_count:
+            raise RuntimeError("DSA InputBatch dummy state was installed twice")
+        if not 0 < row_count <= self.max_num_reqs:
+            raise ValueError(
+                "DSA runtime-dummy row count is outside InputBatch capacity: "
+                f"rows={row_count}, capacity={self.max_num_reqs}"
+            )
+
+        self._runtime_dummy_row_count = row_count
+        try:
+            self.columns.gpu.copy_(self.columns.cpu)
+            rows = slice(0, row_count)
+            self.stages[rows].fill_(
+                int(DSARequestCacheStage.SPARSE_DECODE)
+            )
+            self.target_resident_budget_tokens[rows].zero_()
+            self.sparse_budget_tokens[rows].zero_()
+            self.resident_valid_tokens[rows].zero_()
+            self.row_modes[rows].fill_(DSA_ROW_MODE_PAD)
+            self.resident_pool_indices[rows].fill_(
+                self.resident_token_pool.padding_pool_index
+            )
+            self.candidate_lens[rows].fill_(DSA_SFA_COMPUTE_TOPK)
+        except Exception:
+            with suppress(Exception):
+                self.columns.gpu.copy_(self.columns.cpu)
+            self._runtime_dummy_row_count = 0
+            raise
+
     def restore_after_graph_capture(self) -> None:
         """清除 capture dummy，并恢复当前 CPU 语义真源的 device 镜像。"""
 
@@ -394,6 +442,14 @@ class DSAInputBatchCacheLayout:
             return
         self.columns.gpu.copy_(self.columns.cpu)
         self._graph_capture_row_count = 0
+
+    def restore_after_runtime_dummy(self) -> None:
+        """Restore the device mirror from the untouched CPU owner."""
+
+        if not self._runtime_dummy_row_count:
+            return
+        self.columns.gpu.copy_(self.columns.cpu)
+        self._runtime_dummy_row_count = 0
 
     def _synchronize_resident_pool_rows(
         self,

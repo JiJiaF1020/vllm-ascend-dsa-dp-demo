@@ -527,6 +527,7 @@ class TestNPUWorker(TestBase):
             worker.compilation_config.cudagraph_mode = MagicMock()
             mock_model_runner = MagicMock()
             mock_decode_token_per_req = mock_model_runner.decode_token_per_req
+            mock_model_runner.dsa_offload_enabled = False
             worker.model_runner = mock_model_runner
 
             # Test execute_dummy_batch
@@ -534,7 +535,27 @@ class TestNPUWorker(TestBase):
 
             # Verify call
             mock_model_runner._dummy_run.assert_called_once_with(
-                num_tokens=mock_decode_token_per_req, uniform_decode=True
+                num_tokens=mock_decode_token_per_req,
+                uniform_decode=True,
+            )
+
+    def test_execute_dsa_runtime_dummy_batch(self):
+        """DSA idle DP uses runtime-safe FULL-graph dummy metadata."""
+        from vllm_ascend.worker.worker import NPUWorker
+
+        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+            worker = NPUWorker()
+            worker.log_memory_stats = MagicMock()
+            mock_model_runner = MagicMock()
+            mock_model_runner.dsa_offload_enabled = True
+            worker.model_runner = mock_model_runner
+
+            worker.execute_dummy_batch()
+
+            mock_model_runner._dummy_run.assert_called_once_with(
+                num_tokens=mock_model_runner.decode_token_per_req,
+                uniform_decode=True,
+                runtime_idle=True,
             )
 
     @patch("vllm_ascend.worker.worker.memory_profiling")

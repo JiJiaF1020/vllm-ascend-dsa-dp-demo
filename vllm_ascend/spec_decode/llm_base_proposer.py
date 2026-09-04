@@ -1,4 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Ascend 模型类投机解码的公共 proposer，实现 MTP/EAGLE 等 drafting。
+
+复用基线输入准备、DP token 数协调和 merged-draft 调用顺序，管理 proposer
+自身的输入与逐步 attention metadata。DSA DP 的 runtime idle 由 model runner
+显式标记：proposer 以 eager、无 attention metadata 陪跑，本域 dummy 请求数
+不由对端长 prefill 的 padded token 数反推；模型调用数量与真实 drafting 一致。
+
+DSA 的 MTP full-cache 仍由原生 attention 使用，durable 满块复制由其绑定的
+DSA runtime hook 负责。本模块不持有 Scheduler 的 L2 目录或发布 prefix hash。
+"""
+
 import copy
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -554,6 +565,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         batch_descriptor=None,
         dummy_compute_logits=lambda hidden_states: None,
         is_profile=False,
+        runtime_idle: bool = False,
     ):
         (
             num_tokens,
@@ -563,7 +575,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         pcp_manager = getattr(self.runner, "pcp_manager", None)
 
         multi_steps_attn_metadata = []
-        if not self.use_cuda_graph:
+        if not self.use_cuda_graph or runtime_idle:
             aclgraph_runtime_mode = CUDAGraphMode.NONE
 
         # init block table tensor clone is only available after profile run and is only used for graph mode
@@ -671,6 +683,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         model_positions = self._get_positions(num_tokens)
 
         batch_size = max(num_tokens // (self.num_speculative_tokens + 1), 1)
+        if runtime_idle:
+            # DP 对齐后的 token 数可能来自另一域的长 prefill，不能据此生成
+            # 数千条 dummy 请求。只保留本域有界行数；模型计算仍使用共同
+            # num_tokens，沿原生 merged-draft 路径执行相同数量的 MoE 调用。
+            batch_size = max(1, min(num_reqs, self.runner.max_num_reqs))
+            logger.info_once(
+                "DSA MTP idle proposer: "
+                f"padded_tokens={num_tokens} dummy_reqs={batch_size} "
+                f"draft_steps={self.num_speculative_tokens} attention=none"
+            )
         # TODO: temporarily hack here, we should find out batch_size for profile_run
         if is_profile:
             batch_size = min(batch_size, self.runner.max_num_reqs)
@@ -698,6 +720,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             aclgraph_runtime_mode=aclgraph_runtime_mode,
             is_draft_model=True,
             draft_attn_metadatas=multi_steps_attn_metadata,
+            # Proposer建立独立context，不能丢掉DSA target dummy的禁IO标记。
+            skip_kv_transfer=bool(getattr(self.runner, "dsa_offload_enabled", False)),
         ):
             # Reset MOE layer index before first model call
             forward_context = get_forward_context()

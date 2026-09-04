@@ -1,6 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DSA L3 scheduler 侧 prefix lookup、load plan 与 write-behind。"""
+"""DSA L3 在 Scheduler 主线程中的查询、任务规划与源块生命周期账本。
+
+本地 L1/L2 查询完成后，使用 backend 查询额外的完整 bundle 前缀，并在
+coordinator 完成 admission 后生成 load 任务。卸载侧依据本轮 durable 水位
+规划新增满块的 store，维护在途 key、源 L2 block 与 job 的关系以及去重提示。
+
+若新的 assignment 将复用仍被旧 store 读取的 L2 block，任务中下发
+``jobs_to_flush``，由 worker 在覆盖前等待；请求结束本身不强制等待上传。
+完成结果经 ``KVConnectorOutput`` 回来后，更新在途索引、重试扫描位置和
+远端 ready 提示。后台线程不直接修改这些 Scheduler 状态。
+实际 L3 查询 miss 时会失效对应后缀的旧 ready 提示，允许后续重新上传，
+避免后端已淘汰对象而本地永久去重。
+
+当前 reset 通过轮换内容 namespace 逻辑失效旧对象，不物理删除后端数据，
+有在途任务时拒绝执行。DP L3 当前还在 connector/scheduler 入口拒绝外部
+reset；跨 DP 统一 namespace epoch 尚属后续管理面适配，
+不能把本模块的局部 generation 当成已经协调好的分布式事务。
+"""
 
 from __future__ import annotations
 
@@ -165,6 +182,10 @@ class DSAL3StoreScheduler:
         hit_blocks = self.lookup_backend.lookup_prefix_blocks(
             candidate_hashes
         )
+        # L3 may evict previously confirmed objects. A fresh miss invalidates
+        # dedup hints for the unknown suffix so recomputation can upload again.
+        for block_hash in candidate_hashes[hit_blocks:]:
+            self._remote_ready_keys.difference_update(self.schema.block_keys(block_hash))
         self._lookup_hit_blocks += hit_blocks
         external_tokens = self.coordinator.prepare_external_prefix_cache_hit(
             request,
@@ -435,18 +456,19 @@ class DSAL3StoreScheduler:
                             scanned,
                             block.logical_block_index,
                         )
-                logger.error(
-                    "DSA L3 store job %d failed: %s",
+                log = logger.warning if result.retryable else logger.error
+                log(
+                    "DSA L3 store job %d unsuccessful (retryable=%s): %s",
                     job_id,
+                    result.retryable,
                     result.error,
                 )
 
     def request_finished(self, request_id: str) -> None:
         self._request_scanned_counts.pop(request_id, None)
 
-    def reset_cache(self) -> bool:
-        """Logically invalidate remote objects by rotating the key namespace."""
-
+    def can_reset_cache(self) -> bool:
+        """只读检查namespace切换前是否已排空全部任务及索引。"""
         if self._jobs or self._pending_load_jobs:
             logger.warning(
                 "DSA L3 namespace reset rejected with pending transfers: "
@@ -459,12 +481,22 @@ class DSAL3StoreScheduler:
             raise RuntimeError(
                 "DSA L3 reset found orphaned pending store indexes"
             )
+        return True
+
+    def reset_cache(self, *, namespace_epoch: str | None = None) -> bool:
+        """逻辑失效；DP事务由管理面提供统一epoch，DP1沿用原generation规则。"""
+        if namespace_epoch is not None:
+            if len(namespace_epoch) != 32 or any(ch not in "0123456789abcdef" for ch in namespace_epoch):
+                raise ValueError("DSA namespace epoch must be a 32-character lowercase hex token")
+        if not self.can_reset_cache():
+            return False
+        if namespace_epoch is not None and namespace_epoch == getattr(self, "_namespace_epoch", None):
+            return True
         self._namespace_generation += 1
+        self._namespace_epoch = namespace_epoch
+        suffix = f"epoch:{namespace_epoch}" if namespace_epoch is not None else str(self._namespace_generation)
         fingerprint = hashlib.sha256(
-            (
-                f"{self._base_schema.fingerprint}:"
-                f"{self._namespace_generation}"
-            ).encode()
+            f"{self._base_schema.fingerprint}:{suffix}".encode()
         ).hexdigest()[:32]
         self.schema = replace(
             self._base_schema,
@@ -484,7 +516,7 @@ class DSAL3StoreScheduler:
     def has_pending_jobs(self) -> bool:
         """让 EngineCore 在异步 store 完成前继续推进 connector。"""
 
-        return bool(self._jobs)
+        return bool(self._jobs or self._pending_load_jobs)
 
     def shutdown(self) -> None:
         logger.info(

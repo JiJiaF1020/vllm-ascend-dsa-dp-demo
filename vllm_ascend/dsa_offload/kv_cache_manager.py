@@ -179,7 +179,7 @@ def get_dsa_computed_blocks(
         "effective_tokens=%d hbm_pair_blocks=%d l2_blocks=%d "
         "hbm_only_blocks=%d "
         "mtp_blocks=%d "
-        "request_tokens=%d",
+        "request_tokens=%d dp_rank=%d",
         request.request_id,
         bool(num_computed_tokens),
         num_computed_tokens,
@@ -199,6 +199,7 @@ def get_dsa_computed_blocks(
         ),
         len(prefix_plan.mtp_blocks) if prefix_plan is not None else 0,
         request.num_tokens,
+        getattr(coordinator, "data_parallel_rank", 0),
     )
     if manager.log_stats:
         assert manager.prefix_cache_stats is not None

@@ -1,6 +1,6 @@
 # DSA 稀疏卸载当前设计
 
-> - 最后更新：2026-09-01
+> - 最后更新：2026-09-10（DP L3关闭已确认，剩余退出停留定界到TorchNPU native shutdown）
 > - 目标基线：vLLM v0.23.0 + vLLM-Ascend v0.23.0 正式版
 >   `5cb98caa`（CANN 9.1.0、TorchNPU 2.10.0.post4、
 >   Triton Ascend 3.2.2）
@@ -14,6 +14,13 @@
 >   单 40K 与 5K/8K/40K/70K 在线 FULL graph closeout；在线长稳、
 >   DeepSeek-V3.2 与其余 P2 回归仍待补齐
 > - 首要验收模型：GLM-5.1、GLM-5.2；兼容回归模型：DeepSeek-V3.2
+> - 单机DP进展：DP2/TP4/EP8的基础、Local prefix、MTP Local及共享L3
+>   主路径已有A5验证；P6-A单40k和8k/70k并发通过功能验证。P6-B在线
+>   正常管理八请求闭环也已通过；数值等价、管理故障/退出/长稳与跨机不据此宣称通过。
+> - 单机offline SPMD的Graph+MTP3+L3十二请求三阶段及逻辑IO排空已通过；
+>   后续六请求复测已确认所有worker完成L3资源关闭，原生进程退出仍升级SIGKILL，
+>   已定界为TorchNPU `_C._npu_shutdown(success)`在原生等待窗口内未返回。
+>   单列为已知生命周期限制，不阻塞DP正常功能阶段性收口；不宣称干净退出通过或根因与DSA完全无关。
 
 ## 1. 文档定位
 
@@ -81,6 +88,8 @@ DSA 稀疏卸载最终目标是在长上下文 decode 中实现：
   `L3 -> L2` 同步恢复、TP success consensus 和既有 `L2 -> HBM` restore；
 - no-MTP 下成对 HBM Indexer+dense-MLA prefix 独立参与本地最长命中，允许
   越过 L2 complete bundle，并在首个 prefill forward 中补齐 L2 gap。
+- 单机DP资源预算协调、各域独立L1/L2、共享L3与MTP/dummy组合；复用原生
+  EngineCore、调度、DP模式同步和KVConnector，不另建全局推理scheduler。
 
 正式版基线同时提供并由 DSA 原样继承：
 
@@ -94,7 +103,8 @@ DSA 稀疏卸载最终目标是在长上下文 decode 中实现：
 当前尚未完成：
 
 - Indexer-only/MLA-only 的 component-wise source mask 与精细 IO 去重；
-- L3 FD/连接长稳、layerwise async load、HBM 直通、DP/非 Mooncake backend；
+- L3 FD/连接长稳、layerwise async load、HBM 直通、跨机DP/非Mooncake后端；
+- 单机DP完整精度/故障矩阵及P6-B管理异常、暂停期间退出、长稳的实机验收；
 - prefill/decode mixed、preemption/resume、P/D 分离、非 MTP speculative
   method、MTP draft 数不等于 3/非 greedy MTP、MTP proposer graph、
   async scheduling、KV-cache metrics/events；
@@ -125,13 +135,14 @@ graph token 确定性与 L3 长稳作为遗留继续跟踪，不能直接把项�
 | L3→L2→HBM prefix loadback | P1-R 同步版已完成并初验 |
 | HBM target prefix 与 L2/L3 component-wise source | 完整 pair 已上板；单 component mask 后移 |
 | MTP 多级 prefix | 三 component UT、A5 TP8 eager/FULL graph 单 40K、混合 graph 与在线 closeout 通过；长稳/DeepSeek 待回归 |
+| 单机DP与多级缓存组合 | P0-P6-A及P6-B正常管理主闭环已上板，不等于完整精度/故障/退出矩阵已验收 |
 | preemption/resume | 未实现，scheduler 显式失败 |
 | P/D 分离 | 未开始 |
 | 理想版动态 MTP | 未开始；当前固定 MTP3 可用 |
 | MTP proposer graph | 未实现；target uniform Q=4 FULL graph 已完成 |
 
-默认推进顺序为：先上板收口固定 MTP3 多级 prefix，随后依次处理
-preemption/resume 和 P/D 分离。独立 component source
+当前优先收口单机DP管理和已实现组合的门禁，随后再讨论和适配
+preemption/resume及P/D分离。独立 component source
 mask、L3 layerwise/direct 与理想版 MTP 属于性能或高风险扩展，不应阻塞上述
 主线。详细阶段门禁见
 {doc}`dsa_offload_roadmap`。
@@ -1277,11 +1288,282 @@ condense/reorder 时必须保留该请求的 resident/DRAM 所有权。
 | `dsa_offload/worker_dram_store.py` | 固定 payload arena、共享 active refcount 与 worker 逻辑表镜像 |
 | `dsa_offload/runtime.py` | eager/graph 共用 metadata、preforward restore owner 与逐层上下文 |
 | `dsa_offload/ops.py` | LIDU、KSC、SFA-Offload、双向 byte-block copy tensor ABI |
+| `dsa_offload/dp_context.py` | EngineCore启动期已有DP group引用、同宿主身份与统一L2字节预算；不分配arena |
+| `dsa_offload/dp_control.py` | API前端低频管理协调、全部DP结果确认、暂停/提交/恢复；不执行模型 |
+| `dsa_offload/dp_admin.py` | EngineCore管理参与者、owner锁与本域prepare/commit；复用原生pause/resume |
+| `dsa_offload/l3/connector.py` | 将DSA工作流接入原生KVConnector scheduler/worker回调 |
+| `dsa_offload/l3/schema.py`、`metadata.py` | 完整组件布局与key语义，以及跨进程任务/结果合同 |
+| `dsa_offload/l3/scheduler.py` | L3命中、任务规划、完成回报和namespace状态 |
+| `dsa_offload/l3/worker.py` | 同步回载、TP共识、带event保护的后台上传 |
+| `dsa_offload/l3/backend_adapter.py` | 复用AscendStore后端API、地址映射与IO批次约束 |
+| `patch/platform/patch_dsa_data_parallel.py` | 上游类的窄挂接点，不在patch中建立第二套DP系统 |
 | `core/kv_cache_interface.py` | DSA spec/manager registry 注册 |
 | `worker/npu_input_batch.py` | 可选 DSA buffer owner |
 | `worker/model_runner_v1.py` | cache 初始化、行投影、多 group slot mapping 与 runtime 绑定 |
 | `attention/sfa_v1.py` | DSA attention 算子链和层后满块 dump |
 | `platform.py` | 配置收敛、scheduler 类和启动期校验 |
+
+### 16.1 模块数量与实际新增范围
+
+2026-09-09按本地源码核对：DP开始前的`f56ca08ccc`已有24个Python文件，当前
+`dsa_offload/`含`l3/`及两个`__init__.py`共27个。实际新增是`dp_context.py`、
+`dp_control.py`和P6-B尚未提交的`dp_admin.py`；当时物理行数分别为348、213、150，
+含注释与空行。另有目录外的`patch_dsa_data_parallel.py`。L3、runtime、pool和
+request layout不是DP阶段新建的整套副本，但DP对其中已有实现有必要的增量修改。
+
+整个目录约1.3万物理行，已经是一套带缓存控制面/数据面的运行时，不是几行插件。
+三个新增文件不能掩盖已有大模块的维护成本，也不能把测试/文档/历史诊断文件计成
+新增推理模块。文件数只能辅助判断；更重要的是状态唯一所有者、依赖方向和跨模块合同。
+
+本轮决定保留三个DP模块，不为减少文件数把它们并入已经较大的scheduler/runtime。
+`dp_control`与`dp_admin`合成一个文件在技术上可行，但不能消除跨进程协调协议；
+当前分别定位API端异步流程与EngineCore端同步动作，更利于审查和测试。
+后二者是共享缓存管理能力，不是“开启DP attention计算必然需要写的代码”。
+
+### 16.2 v0.23基线如何组织这些职责
+
+本轮只核对本项目使用的vLLM`0fc695fc6d`（v0.23.0）和Ascend`5cb98caa`，
+未使用外层multi-version仓库或新版社区行为替代当前基线。下面是源码职责分布，
+不是对社区历史PR新增文件数的统计；不能把一个通用文件的总行数都计为DP代码。
+
+| 职责 | v0.23基线落点 | DSA复用/增量 |
+|---|---|---|
+| 创建多个EngineCore | vLLM `v1/engine/utils.py` 的 `launch_core_engines`、`CoreEngineProcManager` | 复用launcher，不自建DP启动器 |
+| 请求路由和负载协调 | vLLM `core_client.py` 的 `DPLBAsyncMPClient`；`coordinator.py` | 复用路由/波次，不建DSA全局请求调度器 |
+| DP执行/暂停/恢复 | vLLM `core.py` 的 `DPEngineCoreProc`、原生pause Future与DP共识 | 复用原语；补L2预算及共享L3管理协议 |
+| NPU图模式与token对齐 | Ascend `worker/model_runner_v1.py` 的 `_sync_metadata_across_dp`、`_dummy_run` | 复用共同模式决议；补DSA PAD/no-op和MTP dummy资源合同 |
+| TP/DP/EP组及专家通信 | vLLM/Ascend `distributed/parallel_state.py`、NPU communicator、MoE模块 | 复用分组与dispatch/combine，不自建DSA通信系统 |
+| 前缀缓存及block生命周期 | vLLM `kv_cache_manager/coordinator`、`single_type_kv_cache_manager` | 独立Indexer/resident/L2/MTP所有权由DSA扩展 |
+| 外部KV pool | Ascend `ascend_store` 的connector、pool_scheduler、pool_worker、coordinator、kv_transfer、backend | 沿用分角色Connector范式和后端API；DSA拥有bundle水位与L2源地址 |
+| P/D直传 | Ascend `kv_p2p/mooncake_connector.py` 等专用Connector及传输线程/握手结构 | 后续参考握手/生命周期，不直接复制GPU或普通HBM数据布局 |
+| 抢占与重算恢复 | vLLM `Scheduler._preempt_request`释放KV、清computed/spec tokens、重新排队 | DSA尚未支持；后续在同一生命周期挂接L2/L3恢复 |
+
+基线同样有多个模块，也把不少DP逻辑放在已有大文件内；没有一份可直接复用的
+“DSA多级缓存DP插件”替我们管理rank-local完整L2、稀疏resident和MTP verified水位。
+官方有CPU offload等缓存实现，不能说它完全没有L2；只是它们不等于当前DSA这组
+所有权与数据布局合同。AscendStore本身就按scheduler/worker/backend拆分，DSA的
+分角色组织并不偏离这种范式。
+
+下面按所在进程和生命周期理解模块，不代表新建了这些进程或线程：
+
+```mermaid
+flowchart LR
+    subgraph API["已有API前端"]
+        LB["vLLM DPLB client"]
+        ADMIN["dp_control：低频管理协调"]
+    end
+    subgraph ENGINE["每个已有EngineCore"]
+        CORE["vLLM DPEngineCoreProc"]
+        BOOT["dp_context：启动预算"]
+        PARTICIPANT["dp_admin：管理参与者"]
+        SCHED["原生Scheduler + DSA缓存状态"]
+    end
+    subgraph WORKER["每个已有Worker"]
+        RUNNER["原生NPUModelRunner"]
+        RUNTIME["统一runtime / InputBatch / ops"]
+        L3["L3 worker / backend adapter"]
+    end
+    LB -->|请求路由| CORE
+    LB -.->|管理请求| ADMIN
+    CORE --> SCHED
+    CORE -.->|启动一次| BOOT
+    ADMIN -.->|原生utility RPC| PARTICIPANT
+    PARTICIPANT -.->|预检及提交| SCHED
+    SCHED -->|原生输出承载DSA metadata| RUNNER
+    RUNNER --> RUNTIME
+    RUNNER --> L3
+    L3 -.->|KVConnectorOutput| SCHED
+```
+
+特别注意两点：vLLM基线已提供DP pause/resume，但DPLB通用utility只返回首域
+结果，不能直接当作统一namespace事务。另如`patch_dp_device_ids.py`虽然存在于
+Ascend源码快照中，其代码由`not vllm_version_is("0.23.0")`控制，不能按文件名
+把它算成当前0.23实际执行的DP适配。
+
+### 16.3 后续扩展的收敛规则
+
+**按所有权/协议扩展，不按功能组合复制模块。** 不创建
+`dp_pd_mtp_runtime.py`、另一套Graph metadata或专用组合block manager。
+
+- preemption/resume优先扩展现有`scheduler.py`、`request_cache_layout.py`、
+  `kv_cache_coordinator/manager`和统一`scheduler_output`；worker沿现有runtime
+  重建resident并恢复durable backing。暂停、请求中断、带L2恢复的抢占不是同一语义，
+  不能通过重用管理pause来冒充抢占恢复，也不能直接照搬基线全量丢缓存重算。
+- PD分离优先复用现有KVConnector、`l3/metadata/schema`、worker IO与L2目录。
+  可先做经L3中转的handoff，再评估直传。若真正引入独立的对端握手、会话所有权、
+  超时/重试协议，允许一个职责明确的适配模块；不因此复制整套scheduler/runtime。
+- DP部署/管理能力横向复用：后续PD实例也使用同一节点预算和管理协调。
+  不再各自增加`pd_dp_context`或`mtp_admin`等组合变体。
+- 拆文件不能凭空减少状态复杂度；合文件也不能消除源块保护、完成回报和候选失效。
+  新模块必须说明新增的资源所有者、独立协议或可替换策略，并列出复用了什么。
+- 不把管理动作/状态塞进只负责算子ABI常量的`contracts.py`；管理RPC的动作/结果
+  可以后续在现有管理模块内进一步类型化，不为少量字段再起一个协议模块。
+- 优先复查大文件的职责漂移，尤其`runtime.py`、`kv_cache_coordinator.py`和
+  `kv_cache.py`，而不是先把清晰的150行管理参与者并进去。需要拆/合时以实际
+  依赖与测试边界为依据，不能为了目录视觉变短做全量import迁移。
+
+P6-B正常管理主闭环已通过端到端验收，异常/退出矩阵尚未完成。结构梳理不移动
+运行时代码；接口收敛应独立且保持行为，不把架构重排、功能新增和上板定位混在同一轮。
+
+### 16.4 DP基线复用与元数据一致性复核
+
+2026-09-09针对DP起点至当前工作区复核，未发现需要在P6-B上板前重写的第二套
+请求调度、DP模式协商或Graph/eager元数据所有者。保留以下边界：
+
+- 真实请求由同一个`DSAOffloadSchedulerOutput`投影进入`DSAInputBatchCacheLayout`，
+  `prepare_execution_view()`统一选择真实行或固定宽度的Graph行；后者补PAD和
+  `dst=-1`，不另建block目录。两种模式仍由同一个`_build_attention_metadata()`消费。
+- capture dummy与runtime idle dummy不是两套真实请求语义。前者用于捕获计算路径，
+  后者不能借用真实resident行或推进durable水位；二者复用设备缓冲区。
+  runtime idle退出后恢复InputBatch的CPU真源，并使临时DRAM表签名失效，
+  下一轮真实请求重新投影。已有UT检查地址不变、请求目录/水位不变及后续回填。
+- `_sync_metadata_across_dp()`继续使用基线的token/mode协商。对端prefill导致
+  FULL降级是原生共同模式选择，不等于DSA复制或分裂元数据；数值一致性仍需独立验证。
+- 管理面复用原生utility RPC、pause Future、DP停波/resume共识及已有TCPStore。
+  新增全部参与者确认、统一namespace epoch和失败关闭属于显式的管理语义扩展，
+  不能宣称与基线行为完全相同；不把这套事务协议插入每轮forward。
+
+本次仅删除无生产调用的`reset_local_prefix_cache_all_dp()`旧转发别名，UT改为
+直接调用生产入口`call_dsa_dp_admin()`。不调整图捕获、算子、调度预算或真实请求IO时序。
+私有方法patch仍绑定v0.23；管理操作不确定失败后仍需重启全部DP。这些是已知边界，
+并非已经完成多机、进程故障恢复或任意抢占续推。CPU隔离UT不能替代真实多进程/NPU
+端到端验收；P6-B正常管理上板结果记录如下，不能外推到未执行的故障场景。
+
+同日上板发现管理拦截边界遗漏：API启动原生调用`AsyncLLM.reset_mm_cache()`，
+P6-B早期版本把MM/encoder reset也列为禁止操作，导致API进程在启动期抛出
+`DSA DP reset_mm_cache is not supported`。这属于DSA集成回归，不是NPU或Mooncake
+传输失败，也说明上述结构检查没有覆盖完整启动调用链。已将这两个独立缓存接口
+移出DSA拦截集合，保留原生广播与清理实现；新增1/2个API客户端到两个DP域的
+原生AsyncMPClient入口、实际DPLB patch及EngineCore清理链UT，仅替代socket传输和
+设备执行端。该测试修复前重现同一ValueError，修复后还检查未触发prefix reset或
+DSA管理任务。后续增加管理拦截必须同时核对原生启动调用者，不能只测手工管理接口。
+
+**P6-B正常管理验收（2026-09-09）**：运行
+`dsa-dp-admin-08506ef24e1c4d88a1bad02c8163b1a3`的8个40k请求全部完成128 tokens。
+首次local reset在DP1 `running=1/l3_pending=True`时进入pause，最后store完成后
+两域才prepare/commit。external reset两域统一从`8ed58c365f5de72bb466fa9965da41f2`
+切到`8be1c295fa8ea9ac60ec63bdd5d195d0`；不同salt的两域请求均变冷，随后双向
+跨域回读命中41472 tokens。4个回读请求各有四TP的非零get及78主干层/1 MTP层
+restore；23个store任务全部配对完成，其中4个为全部key已存在的去重。客户端
+pause状态/请求未完成断言及resume后完成通过。详细日志证据与边界见示例README。
+本轮未比较输出精度，过滤日志未独立证明每轮Graph模式，也未覆盖故障注入/退出。
+
+### 16.5 e6aa62a5单机DP阶段审查
+
+2026-09-09以`e6aa62a5`及父提交`f56ca08ccc`为边界复查，保留工作区上轮验收文档。
+原生launcher、请求路由/波次、DP token/mode协商、专家通信及每域Scheduler仍为
+原有职责；DP扩展未另建Graph/eager状态所有者。L2预算等额的是字节上限；本域
+block ID/目录/完成水位独立，共享L3不把具体rank放入内容key。管理只接管DSA所属
+动作，启动MM/encoder reset已恢复原生路径。没有发现本轮需要更改数据面/算子的
+新阻断缺陷，但以下项目不能由现有在线PASS替代：
+
+| 项目 | 当前证据和剩余工作 |
+|---|---|
+| P0-P2基础与dummy | A5在线eager/Graph主路径及资源/元数据UT已验；不扩展为任意拓扑 |
+| P3-P4 Local/MTP | 在线两域独立冷暖、长短/idle及128token主路径通过；完整精度/长稳仍单列 |
+| P5-P6-A共享L3 | 无MTP/MTP跨域load与并发主路径通过；partial/失败/重试以UT覆盖为主 |
+| P6-B正常管理 | 八请求实机通过，已包含running及pending IO时local reset |
+| 预先pause+排队中reset | A5扩展九请求通过；两次prepare均有DP0 waiting=1，显式resume后新epoch冷算并跨域回读 |
+| 暂停时退出/共享segment释放 | offline已验证两域all drained及全部worker L3关闭回执，随后仍SIGKILL；在线暂停退出仍无正常证据 |
+| offline SPMD | 新版A5 Graph+MTP3+L3十二请求cold/local/reset-cross通过，worker干净退出仍待解决 |
+| 故障/数值/压力 | 不混同于正常功能收口；未证明双40k数值差异完全由基线引起 |
+
+测试入口与完整命令见示例README“单机DP收口补测”。本轮不新增通信组/线程，
+也不实现此前明确后移的多机DP、PD分离、preemption、async scheduling或MTP proposer
+Graph。新增offline测试的父进程Barrier仅控制用例阶段，不能进入生产forward。
+
+在线扩展运行`dsa-dp-admin-e0b3ef2e0aa5443680b25d720d153e92`已通过上述排队中reset
+门禁。28个store任务全部完成，4次回读各有四TP的非零get及78主干/1MTP层restore；
+六次reset均有两域一致commit。附件截止最终pause，不含shutdown，退出项不因
+client打印PASSED而自动完成。明细与日志边界见示例README，离线反馈继续单列。
+
+首次离线反馈显示L3 host reservation为0，四请求cold完成后external reset真实清理
+本地pool，再触发脚本断言。未配置connector时基线允许该操作成功，不能推断为
+DSA DP external-reset guard失效或Mooncake传输失败。已把离线示例改成独立构造
+LLM参数并在请求前核验实际connector/namespace，移除昂贵推理中的external-reset
+负例。新增真实EngineArgs/KVTransferConfig解析、缺配置早失败及无connector时
+原生reset成功的UT；不修改框架策略。具体证据和剩余门禁见示例README。
+
+新版运行`dsa-dp-offline-3be820f3181740a88bfaa70f49f25783`已完整验证12请求及4个
+跨域L3回载，每请求目标域四TP成功get并restore主干/MTP。33个store全部完成，
+两个scheduler inflight=0、全部worker pending_results=0；09:18:43两域all drained
+通过。随后worker仍在基线4秒+4秒退出窗口后被SIGKILL，因此只收口离线推理与
+逻辑IO排空，不把它当作backend已关闭或全部生命周期验收。关闭慢/卡住的根因未定，
+下阶段聚焦注销/Store关闭/后续清理，不重扫已通过的数据面矩阵。数值精度仍独立。
+
+### 16.6 单机DP收口与已知退出限制
+
+2026-09-10以`999c9727`为收尾基点。限定A5单机DP2/TP4/EP8、GLM-5.2
+W4A4C8、Mooncake TCP、固定MTP3/greedy/proposer eager，P0-P6正常功能主线
+已实现，并有在线/离线主路径证据。基础eager/Graph、Local prefix、跨域L3、
+MTP三组件及正常缓存管理可阶段性收口；不外推任意拓扑/模型/开关组合全矩阵通过。
+
+**收口确认（cc328ec9）**：用户反馈最新UT与离线三轮均正常完成，并将预检修复
+及相应测试合入`cc328ec9a2`。对比`ed2e5101`仅新增Master预检一致性修复、UT和
+说明，生产模块与算子无差异。结合此前在线/离线IO实机证据，限定单机DP正常
+功能正式阶段性闭环，目前没有新的必须修改项，不追加同配置模型复测。
+本轮采用用户的通过反馈，未新增逐rank日志或数值统计，因此不扩展为完整精度、
+长稳/故障或干净退出验收；下述已知退出限制继续单列。
+
+**保留的退出协议**：
+
+```text
+原生停止admission并排空本域请求/IO
+  -> 既有DP Store汇总全部域drained
+  -> 原生collective_rpc(shutdown_dsa_l3_worker)，worker队列仍可用
+       -> 同步当前模型流
+       -> 原生ensure_kv_transfer_shutdown
+            -> 注销L2地址、关闭backend、结束上传线程
+            -> 清除原生KVConnector全局引用
+  -> 检查本域全部TP返回True，汇总全DP关闭状态
+  -> 原有最终CPU barrier
+  -> 原生death-pipe、模型/通信组清理和进程退出
+```
+
+这是功能修复，不属于可随意删除的调试代码。它避免L3关闭仅在原生worker的
+4秒+4秒进程终止窗口内执行。没有新增forward collective、第二套metadata、
+通信组或Scheduler。当前模型流同步仅用于退出，不能改成等待SDK常驻通信流
+的全设备同步。RPC使用已有shutdown_timeout，但不承诺每阶段独占完整超时预算。
+
+零timeout的abort保留快速路径；异常、缺rank、False和超时均不能记为closed，
+必须记录failed并交回原生终止。晚到的DSA管理动作在shutdown开始后拒绝；
+status及必要的fail/release仍允许，MM/encoder等原生utility不受影响。
+退出阶段耗时和全rank回执日志继续保留，供定位真正的资源释放失败。
+
+**实机证据与边界**：
+
+| 运行 | 已确认内容 |
+|---|---|
+| `3be820f3181740a88bfaa70f49f25783` | 离线Graph/MTP3/L3四长度12请求；33个store完成，16条TP get/restore，IO排空 |
+| `9bedef1c841d4119b17e8230d47b7b61` | 8k/40k六请求；八worker全部注销123个regions、关闭backend，全DP成功回执 |
+| `98e3407215834cb7af79b374a9e39f3f` | 再次确认数据与L3关闭完成；八worker在atexit后两次快照均停留于TorchNPU native shutdown |
+
+最后一轮3秒快照在empty_cache/模型清理/HCCL registry release，约3.37秒均已
+进入atexit；6秒和9秒快照则均在`runtime_lifecycle.py:15`。实机
+`torch-npu 2.10.0.post6` git版本
+`a8f2f4fda83732c0d02244a46815a81f21fe3439`的
+[对应源码](https://github.com/Ascend/pytorch/blob/a8f2f4fda83732c0d02244a46815a81f21fe3439/torch_npu/_init/core/runtime_lifecycle.py#L15)
+明确为`torch_npu._C._npu_shutdown(success)`。前面的退出同步和Python层通信组
+清理已经返回，但栈不证明success=True，也不证明永久死锁。
+
+对比Ascend基线`5cb98caa`，`_hccl_pg_registry.py`、`patch_distributed.py`、
+`patch_torch_accelerator.py`与`NPUWorker.shutdown`未被DSA修改。
+[原生shutdown绑定](https://github.com/Ascend/pytorch/blob/a8f2f4fda83732c0d02244a46815a81f21fe3439/torch_npu/csrc/InitNpuBindings.cpp)
+内部仍包含通信句柄、host/device/swapped allocator和runtime清理；Python栈尚不能
+定位内部具体步骤。swapped memory与DSA L2的资源类型有关，不能据停在依赖代码
+就断言与DSA使用方式完全无关。现存plog的`NPU shutdown`阶段日志可以继续只读分析。
+
+按用户资源约束，原生退出未在等待窗口内完成作为已知生命周期限制单列，
+不再阻塞单机DP正常功能阶段性收口，也不标为干净退出通过。不得删同步、
+跳过析构、绕过atexit或修改CANN/HCCL来伪造成功。完整数值等价、故障/压力/长稳、
+部分定向缓存组合和在线暂停退出仍单列；跨机DP、PD、preemption、async scheduling
+与MTP proposer Graph是后续独立任务。
+
+**收尾范围**：正式offline示例移除临时faulthandler探针、诊断RPC、zip打包及
+专用pickle开关，仅保留原有配置检查、三阶段推理、本地reset、结果落盘与原生退出。
+已验证的诊断实现可由`999c9727`溯源；正常用例不依赖它。
+本次不更改生产模块、算子、DP模式协商或eager/Graph状态。必要回归为DSA框架UT与
+示例自测，不要求原样重复大模型矩阵；具体命令见示例README“单机DP收尾回归”。
 
 ## 17. 当前验证状态
 

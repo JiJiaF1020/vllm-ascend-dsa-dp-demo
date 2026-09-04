@@ -31,85 +31,9 @@ PROMPTS = [
     "请只回答数字：一加一等于多少？",
 ]
 
-# 当前 L3 精度收缩测试在服务器侧使用 ``novel_dataset``：
-#
-#   Case A：5k 单请求 L3 graph
-#       PROMPTS = chinese_5k
-#       RUN_MODE = "graph"
-#       MAX_NUM_SEQS = 1
-#       MAX_TOKENS = 5
-#       ENABLE_CHUNKED_PREFILL = True
-#       ENABLE_PREFIX_CACHING = True
-#       PREFIX_CACHE_REPLAY_ROUNDS = 3
-#       ENABLE_L3_WRITE_BEHIND = True
-#       ENABLE_L3_PREFIX_LOADBACK = True
-#
-#   Case B：混合 bsz=4 Local-L2 graph 稳定性对照
-#       PROMPTS = chinese_8k + chinese_5k + chinese_70k + chinese_40k
-#       RUN_MODE = "graph"
-#       MAX_NUM_SEQS = 4
-#       MAX_TOKENS = 5
-#       ENABLE_CHUNKED_PREFILL = True
-#       ENABLE_PREFIX_CACHING = True
-#       PREFIX_CACHE_REPLAY_ROUNDS = 3
-#       ENABLE_L3_WRITE_BEHIND = True
-#       ENABLE_L3_PREFIX_LOADBACK = False
-#
-#   Case C：相同混合 bsz=4 的原生 HBM prefix graph 对照
-#       PROMPTS = chinese_8k + chinese_5k + chinese_70k + chinese_40k
-#       RUN_MODE = "disabled"
-#       MAX_NUM_SEQS = 4
-#       MAX_TOKENS = 5
-#       ENABLE_CHUNKED_PREFILL = True
-#       ENABLE_PREFIX_CACHING = True
-#       PREFIX_CACHE_REPLAY_ROUNDS = 3
-#       ENABLE_L3_WRITE_BEHIND = False
-#       ENABLE_L3_PREFIX_LOADBACK = False
-#
-#   Case D：固定 MTP3 的 40k 三层 prefix 闭环
-#       PROMPTS = chinese_40k
-#       RUN_MODE = "graph"
-#       MAX_NUM_SEQS = 1
-#       MAX_TOKENS = 5
-#       ENABLE_A5_PACKED_C8_DSA = True
-#       ENABLE_MTP = True
-#       ENABLE_CHUNKED_PREFILL = True
-#       ENABLE_PREFIX_CACHING = True
-#       PREFIX_CACHE_REPLAY_ROUNDS = 3
-#       ENABLE_L3_WRITE_BEHIND = True
-#       ENABLE_L3_PREFIX_LOADBACK = True
-#       ENABLE_L3_DIRECT_HBM_LOAD = False
-#
-#   Case E：固定 MTP3 的混合长度 bsz=4 L3 graph
-#       PROMPTS = chinese_8k + chinese_5k + chinese_70k + chinese_40k
-#       RUN_MODE = "graph"
-#       MAX_NUM_SEQS = 4
-#       MAX_MODEL_LEN = 100000
-#       MAX_NUM_BATCHED_TOKENS = 8192
-#       MAX_TOKENS = 32
-#       ENABLE_A5_PACKED_C8_DSA = True
-#       ENABLE_MTP = True
-#       ENABLE_CHUNKED_PREFILL = True
-#       ENABLE_PREFIX_CACHING = True
-#       PREFIX_CACHE_REPLAY_ROUNDS = 3
-#       ENABLE_L3_WRITE_BEHIND = True
-#       ENABLE_L3_PREFIX_LOADBACK = True
-#       ENABLE_L3_DIRECT_HBM_LOAD = False
-#
-#   Case F：固定 MTP3 decode 跨 128-token durable 边界
-#       复用 Case D，但 MAX_TOKENS = 96、IGNORE_EOS = True。40k 样例 prompt
-#       尾块当前约有 72/128 tokens，因此该长度会越过至少一个新满块；重点
-#       检查 prewrite dump、额外 store job、双尾和 shutdown drain，不把
-#       generated suffix 当作下一请求的 prompt prefix。
-#
-# Case A/B/D/E/F 都保持 COMPARE_LAST_TWO_PREFIX_REPLAYS、
-# STRICT_PREFIX_REPLAY_TOKEN_MATCH、ALLOW_MULTI_REQUEST_GRAPH_TOPK_VARIANCE
-# 为 True。L3 case 比较 Local-L2/L3，关闭 loadback 的 Case B 比较
-# Local-L2/Local-L2。
-
-TENSOR_PARALLEL_SIZE = 16
+TENSOR_PARALLEL_SIZE = 8
 DATA_PARALLEL_SIZE = 1
-MAX_NUM_SEQS = 2
+MAX_NUM_SEQS = 4
 MAX_MODEL_LEN = 8192
 MAX_NUM_BATCHED_TOKENS = 8192
 ENABLE_CHUNKED_PREFILL = False
@@ -157,9 +81,9 @@ RESULT_JSON: str | None = None
 DSA_SPARSE_ACTIVATION_TOKENS = 6144
 DSA_PROMPT_BUDGET_THRESHOLDS = [32768, 65536]
 DSA_RESIDENT_BUDGET_TOKENS = [6144, 10240, 12288]
-DSA_INDEXER_MLA_BLOCK_RATIO = 3
-DSA_MAX_ACTIVE_REQS = 256
-DSA_HOT_CPU_BLOCK_MULTIPLE = 3.0
+DSA_INDEXER_MLA_BLOCK_RATIO = 2
+DSA_MAX_ACTIVE_REQS = 128
+DSA_HOT_CPU_BLOCK_MULTIPLE = 1.0
 DSA_GRAPH_CAPTURE_SIZES = [1, 2, 4, 8]
 DSA_TRACE_POINTS = {
     # 当前仅解析预留合同，尚无稳定日志 consumer；验收默认关闭。

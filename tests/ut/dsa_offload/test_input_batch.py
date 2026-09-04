@@ -650,3 +650,42 @@ def test_graph_capture_reuses_one_input_owner_across_sizes() -> None:
         state.restore_after_graph_capture()
         assert state.graph_capture_row_count == 0
         assert torch.equal(state.columns.gpu, cpu_before)
+
+
+def test_runtime_dummy_uses_pad_rows_without_touching_request_owner() -> None:
+    state = _make_state()
+    pool = state.resident_token_pool
+    request_row = pool.acquire("held-request")
+    cache_slots = pool.get_cache_slots(0)
+    cache_slots[request_row, :4] = torch.tensor([7, 8, 9, 10])
+    cache_before = cache_slots.clone()
+
+    state.stages_cpu[0] = int(DSARequestCacheStage.SPARSE_DECODE)
+    state.target_resident_budget_tokens_cpu[0] = 4096
+    state.sparse_budget_tokens_cpu[0] = 4096
+    state.resident_valid_tokens_cpu[0] = 4097
+    state.row_modes_cpu[0] = 2
+    state.resident_pool_indices_cpu[0] = request_row
+    state.row_count = 1
+    state.valid = True
+    state.columns.gpu.copy_(state.columns.cpu)
+    cpu_before = state.columns.cpu.clone()
+
+    state.prepare_runtime_dummy(row_count=4)
+
+    assert state.graph_capture_row_count == 0
+    assert state.runtime_dummy_row_count == 4
+    assert torch.equal(state.columns.cpu, cpu_before)
+    assert state.row_modes[:4].tolist() == [0, 0, 0, 0]
+    assert state.resident_pool_indices[:4].tolist() == [
+        pool.padding_pool_index
+    ] * 4
+    assert state.target_resident_budget_tokens[:4].eq(0).all()
+    assert state.sparse_budget_tokens[:4].eq(0).all()
+    assert torch.equal(cache_slots, cache_before)
+
+    state.restore_after_runtime_dummy()
+
+    assert state.runtime_dummy_row_count == 0
+    assert torch.equal(state.columns.gpu, cpu_before)
+    assert torch.equal(cache_slots, cache_before)

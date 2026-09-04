@@ -12,10 +12,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.outputs import KVConnectorOutput
 
-from examples.dsa_demo.L3_cache_sys_api_test.test_mooncake_tp import (
-    _build_payload_layout,
-    _resolve_io_roles,
-)
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import (
     GlobalTE,
@@ -47,55 +43,6 @@ from vllm_ascend.dsa_offload.l3.scheduler import DSAL3StoreScheduler
 from vllm_ascend.dsa_offload.l3.schema import DSAL3KeySchema
 from vllm_ascend.dsa_offload.l3.worker import DSAL3StoreWorker
 from vllm_ascend.dsa_offload.worker_dram_store import DSAWorkerDRAMStore
-
-
-def test_mooncake_probe_glm52_payload_matches_dsa_worker_contract() -> None:
-    sizes, groups = _build_payload_layout(
-        "dsa_a5_glm52",
-        payload_bytes=1,
-        num_buffers=1,
-    )
-
-    assert len(sizes) == 120
-    assert sum(sizes) == 6_904_320
-    assert [(name, len(indices), sum(sizes[index] for index in indices)) for name, indices in groups] == [
-        ("indexer", 42, 354_816),
-        ("mla", 78, 6_549_504),
-    ]
-
-
-def test_mooncake_probe_glm52_mtp_payload_matches_three_component_bundle() -> None:
-    sizes, groups = _build_payload_layout(
-        "dsa_a5_glm52_mtp",
-        payload_bytes=1,
-        num_buffers=1,
-    )
-
-    assert len(sizes) == 123
-    assert sum(sizes) == 7_084_544
-    assert [
-        (name, len(indices), sum(sizes[index] for index in indices))
-        for name, indices in groups
-    ] == [
-        ("indexer", 42, 354_816),
-        ("mla", 78, 6_549_504),
-        ("mtp", 3, 180_224),
-    ]
-
-
-def test_mooncake_probe_supports_independent_producer_and_consumer() -> None:
-    assert _resolve_io_roles(
-        rank=0,
-        world_size=2,
-        producer_rank=1,
-        consumer_rank=0,
-    ) == (False, True, 1)
-    assert _resolve_io_roles(
-        rank=1,
-        world_size=2,
-        producer_rank=1,
-        consumer_rank=0,
-    ) == (True, False, 1)
 
 
 @pytest.mark.parametrize("protocol", ["tcp", "ascend"])
@@ -305,6 +252,9 @@ def test_l3_schema_fingerprint_and_component_keys_are_stable() -> None:
     assert f":{left.fingerprint}:indexer:" in indexer_key
     assert f":{left.fingerprint}:mla:" in mla_key
     assert indexer_key != mla_key
+    vllm_config.parallel_config.data_parallel_rank = 1
+    vllm_config.parallel_config.data_parallel_size = 2
+    assert DSAL3KeySchema.from_config(vllm_config, kv_config).block_keys(b"hash") == left.block_keys(b"hash")
 
     model_config.compute_hash = lambda: "model-config-b"
     changed_model = DSAL3KeySchema.from_config(vllm_config, kv_config)
@@ -356,6 +306,10 @@ def test_l3_schema_adds_native_mtp_component() -> None:
             compute_hash=lambda: "mtp-model",
         ),
         parallel_config=SimpleNamespace(tensor_parallel_size=8),
+        speculative_config=SimpleNamespace(
+            method="mtp", num_speculative_tokens=3,
+            draft_model_config=SimpleNamespace(model="/models/glm-mtp", compute_hash=lambda: "draft-v1"),
+        ),
     )
 
     schema = DSAL3KeySchema.from_config(
@@ -369,6 +323,14 @@ def test_l3_schema_adds_native_mtp_component() -> None:
     keys = schema.block_keys(BlockHash(b"hash"))
     assert len(keys) == 3
     assert f":{schema.fingerprint}:mtp:" in keys[2]
+    vllm_config.parallel_config.data_parallel_rank = 1
+    assert DSAL3KeySchema.from_config(vllm_config, SimpleNamespace(kv_cache_groups=groups)) == schema
+    vllm_config.speculative_config.draft_model_config.compute_hash = lambda: "draft-v2"
+    changed = DSAL3KeySchema.from_config(vllm_config, SimpleNamespace(kv_cache_groups=groups))
+    assert changed.fingerprint != schema.fingerprint
+    vllm_config.speculative_config = None
+    with pytest.raises(ValueError, match="requires speculative model identity"):
+        DSAL3KeySchema.from_config(vllm_config, SimpleNamespace(kv_cache_groups=groups))
 
 
 def test_dsa_mooncake_config_requires_host_and_device_endpoints(
@@ -518,6 +480,7 @@ class _FakeBackend:
         self.get_result: list[int] | None = None
         self.closed = False
         self.existing: list[int] | None = None
+        self.stored_keys: set[str] = set()
 
     def register_buffer(self, ptrs: list[int], sizes: list[int]) -> None:
         self.registered = (ptrs, sizes)
@@ -525,11 +488,14 @@ class _FakeBackend:
     def put(self, keys, addresses, sizes):
         self.put_args = (keys, addresses, sizes)
         self.put_calls.append(self.put_args)
+        if self.result is not None and len(self.result) == len(keys):
+            self.stored_keys.update(key for key, result in zip(keys, self.result) if result >= 0)
         return self.result
 
     def exists(self, keys):
         self.exists_calls.append(list(keys))
-        return self.existing or [0] * len(keys)
+        base = self.existing or [0] * len(keys)
+        return [value if value < 0 else max(value, int(key in self.stored_keys)) for key, value in zip(keys, base)]
 
     def get(self, keys, addresses, sizes):
         self.get_calls.append((keys, addresses, sizes))
@@ -555,6 +521,26 @@ def test_backend_adapter_registers_and_puts_both_components() -> None:
     assert backend.put_args is not None
     assert len(backend.put_args[0]) == 2
     assert transferred == 128 * 128 + 128 * 4 + 128 * 656
+
+
+def test_concurrent_put_success_is_not_published_before_all_components_are_readable() -> None:
+    class CompetingBackend(_FakeBackend):
+        def put(self, keys, addresses, sizes):
+            self.put_calls.append((keys, addresses, sizes))
+            # The peer owns these keys but has not completed the payload.
+            return [0] * len(keys)
+
+    store = _make_store()
+    backend = CompetingBackend()
+    adapter = DSAL3BackendAdapter(backend=backend, schema=_make_schema())
+    adapter.bind_store(store)
+    with pytest.raises(RuntimeError, match="not yet readable"):
+        adapter.put_store_job(job=_make_job(), store=store)
+    assert len(backend.exists_calls) == 2
+    backend.stored_keys.update(_make_job().blocks[0].component_keys)
+    # Retry sees the winner's completed objects and avoids rewriting them.
+    assert adapter.put_store_job(job=_make_job(), store=store) == 0
+    assert len(backend.put_calls) == 1
 
 
 def test_backend_adapter_round_trips_complete_mtp_bundle() -> None:
@@ -864,6 +850,24 @@ def test_scheduler_retries_failed_incremental_store() -> None:
     )
 
     assert tuple(retry.store_jobs) == (1,)
+
+
+def test_fresh_l3_miss_invalidates_old_dedup_hints() -> None:
+    schema = _make_schema()
+    backend = _FakeBackend()
+    backend.existing = [1, 1, 0, 0]
+    adapter = DSAL3BackendAdapter(backend=backend, schema=schema)
+    scheduler = DSAL3StoreScheduler(schema, max_inflight_jobs=2, lookup_backend=adapter, enable_load=True)
+    scheduler.coordinator = SimpleNamespace(
+        prepare_external_prefix_cache_hit=(
+            lambda req, *, local_computed_tokens, external_block_count: external_block_count * 128
+        ),
+    )
+    for block_hash in (b"a", b"b"):
+        scheduler._remember_remote_ready_keys(schema.block_keys(block_hash))
+    req = SimpleNamespace(num_tokens=257, block_hashes=[b"a", b"b"], request_id="req")
+    assert scheduler.lookup_external_prefix(req, 0) == 128
+    assert scheduler._remote_ready_keys == set(schema.block_keys(b"a"))
 
 
 def test_scheduler_bounds_remote_ready_hints_to_l2_capacity() -> None:
@@ -1387,12 +1391,15 @@ def test_rank0_reuse_fence_error_joins_load_consensus() -> None:
     worker.shutdown()
 
 
+@pytest.mark.parametrize("dp_size", [1, 2])
 def test_worker_connector_initializes_backend_on_nonzero_tp_rank(
     monkeypatch: pytest.MonkeyPatch,
+    dp_size: int,
 ) -> None:
     backend = _FakeBackend()
     adapter = DSAL3BackendAdapter(backend=backend, schema=_make_schema())
     config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_rank=dp_size - 1, data_parallel_size=dp_size),
         kv_transfer_config=SimpleNamespace(
             kv_role="kv_producer",
             kv_connector_extra_config={"backend": "mooncake"},
@@ -1413,7 +1420,18 @@ def test_worker_connector_initializes_backend_on_nonzero_tp_rank(
         "get_tensor_model_parallel_rank",
         lambda: 3,
     )
-    monkeypatch.setattr(torch.npu, "current_device", lambda: 3)
+    requested_devices: list[str] = []
+
+    def make_device(spec: str) -> torch.device:
+        requested_devices.append(spec)
+        return torch.device("cpu")
+
+    # Validate NPU selection without requiring native device registration in this UT.
+    monkeypatch.setattr(
+        l3_connector_module,
+        "torch",
+        SimpleNamespace(npu=SimpleNamespace(current_device=lambda: 3), device=make_device),
+    )
 
     connector = DSAL3Connector(
         config,
@@ -1424,18 +1442,26 @@ def test_worker_connector_initializes_backend_on_nonzero_tp_rank(
     assert connector.worker_handler is not None
     assert connector.worker_handler.tp_rank == 3
     assert connector.worker_handler.backend is adapter
+    assert not connector.worker_handler.is_store_rank
+    assert requested_devices == ["npu:3"]
+    assert connector.data_parallel_rank == dp_size - 1
+    assert connector.data_parallel_size == dp_size
+    assert connector.supports_dsa_namespace_reset == (dp_size == 1)
     connector.shutdown()
     assert backend.closed
 
 
+@pytest.mark.parametrize("dp_size", [1, 2])
 def test_scheduler_connector_uses_noncontributing_lookup_client(
     monkeypatch: pytest.MonkeyPatch,
+    dp_size: int,
 ) -> None:
     backend = _FakeBackend()
     adapter = DSAL3BackendAdapter(backend=backend, schema=_make_schema())
     observed: list[bool] = []
     config = SimpleNamespace(
         cache_config=SimpleNamespace(enable_prefix_caching=True),
+        parallel_config=SimpleNamespace(data_parallel_rank=dp_size - 1, data_parallel_size=dp_size),
         kv_transfer_config=SimpleNamespace(
             kv_role="kv_both",
             kv_connector_extra_config={"backend": "mooncake"},
@@ -1469,6 +1495,10 @@ def test_scheduler_connector_uses_noncontributing_lookup_client(
     assert observed == [False]
     assert connector.scheduler_handler is not None
     assert connector.scheduler_handler.enable_load
+    if dp_size > 1:
+        assert not connector.supports_dsa_namespace_reset
+        assert connector.reset_cache() is False
+        assert connector.scheduler_handler._namespace_generation == 0
     connector.shutdown()
     assert backend.closed
 

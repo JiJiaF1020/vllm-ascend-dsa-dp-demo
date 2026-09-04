@@ -510,6 +510,7 @@ class TestMooncakeBackendMethods(unittest.TestCase):
 
         b = MooncakeBackend.__new__(MooncakeBackend)
         b.parallel_config = MagicMock()
+        b.parallel_config.data_parallel_rank = 3
         b.config = _make_mooncake_store_config(
             metadata_server="P2PHANDSHAKE",
             protocol="tcp",
@@ -542,6 +543,40 @@ class TestMooncakeBackendMethods(unittest.TestCase):
         self.assertEqual(kwargs["local_hostname"], "127.0.0.1:51003")
         self.assertEqual(kwargs["global_segment_size"], 0)
         self.assertEqual(kwargs["local_buffer_size"], 0)
+
+    def test_dp_worker_identity_never_falls_back_to_a_local_device(self):
+        pc = MagicMock()
+        pc.data_parallel_size = 2
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend.get_global_rank",
+            side_effect=RuntimeError("not initialized"),
+        ), self.assertRaisesRegex(RuntimeError, "initialized global worker group"):
+            _get_mooncake_client_rank(pc)
+
+    def test_tcp_dp_schedulers_do_not_share_the_worker_device_identity(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend import MooncakeBackend
+
+        endpoints = []
+        for rank in (0, 1):
+            backend = MooncakeBackend.__new__(MooncakeBackend)
+            backend.parallel_config = MagicMock()
+            backend.parallel_config.data_parallel_rank = rank
+            backend.config = _make_mooncake_store_config(protocol="tcp", tcp_segment_port_base=41000)
+            backend._contribute_memory = False
+            backend._store_owns_transfer_engine = True
+            backend._use_fabric_mem = False
+            store = MagicMock()
+            store.setup.return_value = 0
+            with (
+                patch("mooncake.store.MooncakeDistributedStore", return_value=store),
+                patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend.get_ip",
+                      return_value="127.0.0.1"),
+                patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend.get_global_rank",
+                      side_effect=AssertionError("CPU scheduler must not use worker group identity")),
+            ):
+                backend._setup_store()
+            endpoints.append(store.setup.call_args.kwargs["local_hostname"])
+        self.assertEqual(endpoints, ["127.0.0.1:51000", "127.0.0.1:51001"])
 
     def test_tcp_register_and_unregister_use_store(self):
         b = self._make_backend()

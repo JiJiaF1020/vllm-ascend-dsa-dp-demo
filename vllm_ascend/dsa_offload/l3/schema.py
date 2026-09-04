@@ -1,6 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DSA L3 component schema 与内容寻址 key。"""
+"""DSA L3 完整 bundle 的组件布局描述与内容寻址 key 规则。
+
+从模型配置、TP 规模和已定稿 KV-cache spec 提取语义指纹，并记录
+Indexer、MLA 与可选 MTP 各组件的 plane 数量和每块字节数。Scheduler 与
+worker 共用这份 schema，确保同一个 key 的内容解释和地址布局一致。
+
+对象 key 由 schema 指纹、component 类型及 prefix block hash 构成；不包含
+请求 ID、物理 block ID 或具体 TP/DP rank。TP 规模参与兼容性判断，不等于
+为每个 TP rank 保存一份独立 L3 副本。
+
+这里不执行网络查询、分配缓存或管理读写状态；namespace reset 的代际
+推进由 L3 scheduler 负责，不能仅凭 schema 相同断言后端对象已经存在。
+"""
 
 from __future__ import annotations
 
@@ -13,6 +25,7 @@ from typing import Any
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_ascend.dsa_offload.kv_cache import (
+    dsa_mtp_cache_identity,
     is_dsa_indexer_spec,
     is_dsa_mtp_full_spec,
     is_dsa_resident_mla_spec,
@@ -177,7 +190,11 @@ class DSAL3KeySchema:
             },
         }
         if mtp_group is not None:
+            mtp_identity = dsa_mtp_cache_identity(vllm_config)
+            if mtp_identity is None:
+                raise ValueError("DSA L3 MTP cache group requires speculative model identity")
             descriptor["components"][DSAL3Component.MTP] = {
+                "model": mtp_identity,
                 "layers": mtp_layers,
                 "page_size_bytes": int(mtp_group.kv_cache_spec.page_size_bytes),
                 "plane_count": mtp_plane_count,

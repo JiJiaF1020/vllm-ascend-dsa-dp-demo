@@ -13,17 +13,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 用户配置
 # =========================
 
-MODEL_PATH="/mnt/kv_dpc/weight/GLM-5.1-w4a8"
-SERVED_MODEL_NAME="glm-5.1-dsa"
-RUN_MODE="eager"  # disabled / eager / graph
+MODEL_PATH="${MODEL_PATH:-/mnt/kv_dpc/weight/GLM-5.1-w4a8}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-glm-5.1-dsa}"
+RUN_MODE="${RUN_MODE:-eager}"  # disabled / eager / graph
 
 # A5/950 的 W4A4C8 模型设为 true；A3/910C 的 W4A8/BF16 保持 false。
 # A5 DSA 只支持 LI C8 与 SFA C8 同时开启，不提供半开组合。
-ENABLE_A5_PACKED_C8_DSA="false"
-ENABLE_MTP="false"
-ENABLE_L3_WRITE_BEHIND="false"
-ENABLE_L3_PREFIX_LOADBACK="false"
-ENABLE_L3_DIRECT_HBM_LOAD="false"
+ENABLE_A5_PACKED_C8_DSA="${ENABLE_A5_PACKED_C8_DSA:-false}"
+ENABLE_MTP="${ENABLE_MTP:-false}"
+ENABLE_L3_WRITE_BEHIND="${ENABLE_L3_WRITE_BEHIND:-false}"
+ENABLE_L3_PREFIX_LOADBACK="${ENABLE_L3_PREFIX_LOADBACK:-false}"
+ENABLE_L3_DIRECT_HBM_LOAD="${ENABLE_L3_DIRECT_HBM_LOAD:-false}"
 MOONCAKE_CONFIG_PATH="${SCRIPT_DIR}/L3_cache_sys_api_test/baseline_e2e/configs/mooncake-dsa-tcp.json"
 MOONCAKE_GLOBAL_SEGMENT_SIZE="4GB"
 MC_TCP_ENABLE_CONNECTION_POOL="${MC_TCP_ENABLE_CONNECTION_POOL:-1}"
@@ -35,23 +35,25 @@ DSA_L3_MAX_DESCRIPTORS_PER_PUT="128"
 DSA_L3_SHUTDOWN_TIMEOUT_SECONDS="300"
 SAFETENSORS_LOAD_STRATEGY="prefetch"
 
-HOST="0.0.0.0"
-PORT="8000"
-API_KEY="EMPTY"
+HOST="${HOST:-0.0.0.0}"
+PORT="${PORT:-8000}"
+API_KEY="${API_KEY:-EMPTY}"
 
-TENSOR_PARALLEL_SIZE="16"
-MAX_NUM_SEQS="4"
-MAX_MODEL_LEN="131072"
-MAX_NUM_BATCHED_TOKENS="16384"
-GPU_MEMORY_UTILIZATION="0.90"
-ENABLE_CHUNKED_PREFILL="true"
-ENABLE_PREFIX_CACHING="false"
-LOGGING_LEVEL="INFO"
+DATA_PARALLEL_SIZE="${DATA_PARALLEL_SIZE:-1}"
+DATA_PARALLEL_SIZE_LOCAL="${DATA_PARALLEL_SIZE_LOCAL:-${DATA_PARALLEL_SIZE}}"
+TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-16}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-16384}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
+ENABLE_CHUNKED_PREFILL="${ENABLE_CHUNKED_PREFILL:-true}"
+ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-false}"
+LOGGING_LEVEL="${LOGGING_LEVEL:-INFO}"
 
-DSA_SPARSE_ACTIVATION_TOKENS="6144"
-DSA_INDEXER_MLA_BLOCK_RATIO="3"
-DSA_MAX_ACTIVE_REQS="256"
-DSA_HOT_CPU_BLOCK_MULTIPLE="3.0"
+DSA_SPARSE_ACTIVATION_TOKENS="${DSA_SPARSE_ACTIVATION_TOKENS:-6144}"
+DSA_INDEXER_MLA_BLOCK_RATIO="${DSA_INDEXER_MLA_BLOCK_RATIO:-3}"
+DSA_MAX_ACTIVE_REQS="${DSA_MAX_ACTIVE_REQS:-256}"
+DSA_HOT_CPU_BLOCK_MULTIPLE="${DSA_HOT_CPU_BLOCK_MULTIPLE:-3.0}"
 
 export HCCL_OP_EXPANSION_MODE="AIV"
 export HCCL_BUFFSIZE="200"
@@ -107,7 +109,7 @@ case "${ENABLE_MTP}" in
         DSA_RESIDENT_BUDGET_TOKENS='[8192,10240,12288]'
         SPECULATIVE_ARGS=(
             --speculative-config
-            '{"method":"mtp","num_speculative_tokens":3}'
+            '{"method":"mtp","num_speculative_tokens":3,"enforce_eager":true}'
         )
         ;;
     false)
@@ -227,6 +229,13 @@ case "${ENABLE_PREFIX_CACHING}" in
         ;;
 esac
 
+if [[ "${DSA_ENABLED}" == "true" && "${DATA_PARALLEL_SIZE}" -gt 1 ]]; then
+    if [[ "${DATA_PARALLEL_SIZE_LOCAL}" != "${DATA_PARALLEL_SIZE}" ]]; then
+        echo "Initial online DSA DP support requires all DP ranks on one node" >&2
+        exit 2
+    fi
+fi
+
 if [[ "${DSA_ENABLED}" == "true" ]]; then
     DSA_CONFIG_FIELD='"dsa_sparse_config":{"enabled":true,"split_indexer_cache":true,'
     DSA_CONFIG_FIELD+='"indexer_mla_block_ratio":'"${DSA_INDEXER_MLA_BLOCK_RATIO}"','
@@ -253,7 +262,7 @@ fi
 echo "[dsa-online] mode=${RUN_MODE} model=${MODEL_PATH}"
 echo "[dsa-online] dsa_enabled=${DSA_ENABLED} prefix_cache=${ENABLE_PREFIX_CACHING}"
 echo "[dsa-online] a5_packed_c8=${ENABLE_A5_PACKED_C8_DSA} mtp3=${ENABLE_MTP} safetensors=${SAFETENSORS_LOAD_STRATEGY}"
-echo "[dsa-online] tp=${TENSOR_PARALLEL_SIZE} max_num_seqs=${MAX_NUM_SEQS} max_model_len=${MAX_MODEL_LEN}"
+echo "[dsa-online] dp=${DATA_PARALLEL_SIZE} local_dp=${DATA_PARALLEL_SIZE_LOCAL} tp=${TENSOR_PARALLEL_SIZE} max_num_seqs=${MAX_NUM_SEQS} max_model_len=${MAX_MODEL_LEN}"
 echo "[dsa-online] max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS} chunked_prefill=${ENABLE_CHUNKED_PREFILL} gpu_memory_utilization=${GPU_MEMORY_UTILIZATION}"
 echo "[dsa-online] l3_write_behind=${ENABLE_L3_WRITE_BEHIND} mooncake_config=${MOONCAKE_CONFIG_PATH}"
 echo "[dsa-online] l3_prefix_loadback=${ENABLE_L3_PREFIX_LOADBACK}"
@@ -271,7 +280,8 @@ exec vllm serve "${MODEL_PATH}" \
     --api-key "${API_KEY}" \
     --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}" \
     --pipeline-parallel-size 1 \
-    --data-parallel-size 1 \
+    --data-parallel-size "${DATA_PARALLEL_SIZE}" \
+    --data-parallel-size-local "${DATA_PARALLEL_SIZE_LOCAL}" \
     --quantization ascend \
     --safetensors-load-strategy "${SAFETENSORS_LOAD_STRATEGY}" \
     --seed 1024 \
@@ -284,6 +294,7 @@ exec vllm serve "${MODEL_PATH}" \
     --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
     --block-size 128 \
     --no-async-scheduling \
+    --enable-prompt-tokens-details \
     --stream-interval 1 \
     --generation-config vllm \
     --reasoning-parser glm45 \

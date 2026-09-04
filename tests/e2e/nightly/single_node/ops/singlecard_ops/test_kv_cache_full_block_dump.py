@@ -427,6 +427,31 @@ def test_kv_cache_full_block_dump_bytes_copies_opaque_plane() -> None:
     assert torch.all(actual[2] == -1)
 
 
+def test_kv_cache_full_block_dump_bytes_noop_rows_preserve_destination() -> None:
+    """Graph dummy rows use dst=-1 and must not copy any payload."""
+
+    bytes_per_block = 128 * 4
+    source = torch.arange(
+        2 * bytes_per_block,
+        dtype=torch.int32,
+        device="npu",
+    ).to(torch.int8).view(2, bytes_per_block)
+    destination = _swapped_arena((3, bytes_per_block), torch.int8)
+    destination.fill_(-7)
+    src_ids = torch.tensor([0, 1], dtype=torch.int32, device="npu")
+    dst_ids = torch.tensor([-1, -1], dtype=torch.int32, device="npu")
+
+    torch.ops._C_ascend.kv_cache_full_block_dump_bytes(
+        source,
+        destination,
+        src_ids,
+        dst_ids,
+    )
+    torch.npu.synchronize()
+
+    assert torch.all(_read_swapped_arena(destination) == -7)
+
+
 @torch.inference_mode()
 def test_kv_cache_full_block_dump_bytes_restores_from_swapped_memory() -> None:
     """The generic byte kernel must also support DRAM-to-HBM restore."""

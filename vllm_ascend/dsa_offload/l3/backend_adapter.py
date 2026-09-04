@@ -1,12 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DSA 对 AscendStore backend 的严格结果与 buffer 合同。"""
+"""DSA 完整块任务到 AscendStore 存储 API 的适配与结果校验。
+
+上层提供包含 component key 和物理 block ID 的任务；本模块从 worker
+DRAM store 取得各 plane 的地址和大小，调用 backend 的批量 exists/put/get。
+绑定时校验 schema 与实际 payload 布局，注册固定 arena；传输时按地址
+描述符预算组织批次并校验返回值，支持相应接口时还校验 get 的实际字节数。
+put 返回后再次检查完整组件集合可读；并发 writer 尚未完成时用可重试异常
+回报，不能把“对象已存在”形式的零返回值直接当成 ready。
+
+当前后端工厂对接 Mooncake，并在初始化前处理 Ascend/TCP 的传输配置。
+稳定路径只把 L2 地址交给存储后端，direct-HBM 仍被能力检查拒绝；不能因
+保留了实验分支就视为该能力已开放。关闭时注销注册区域并释放 backend。
+
+这里不决定 prefix 命中后的请求长度、不分配 L2 block，也不管理异步 job
+的生命周期；这些职责分别属于 coordinator/scheduler 和 L3 worker。
+"""
 
 from __future__ import annotations
 
 import json
 import os
 import threading
+import time
 from collections.abc import Sequence
 from typing import Any
 
@@ -99,6 +115,10 @@ def validate_dsa_mooncake_direct_hbm(
         )
 
 
+class DSAL3StoreNotReady(RuntimeError):
+    """put 已返回，但并发 writer 持有的部分组件尚未变为可读。"""
+
+
 class DSAL3BackendAdapter:
     """把宽松 Backend API 收敛为 DSA 可判定成败的合同。"""
 
@@ -135,6 +155,9 @@ class DSAL3BackendAdapter:
         )
 
         config = MooncakeStoreConfig.load_from_env()
+        dp_size = int(getattr(vllm_config.parallel_config, "data_parallel_size", 1))
+        if dp_size > 1 and config.protocol != "tcp":
+            raise ValueError("DSA DP L3 currently requires Mooncake protocol='tcp'")
         validate_dsa_mooncake_direct_hbm(
             protocol=config.protocol,
             direct_hbm_load=direct_hbm_load,
@@ -256,7 +279,7 @@ class DSAL3BackendAdapter:
         self,
         block_hashes: Sequence[bytes],
     ) -> int:
-        """返回 Indexer/MLA 均存在的最长连续 block 数。"""
+        """返回全部active组件（含可选MTP）均可读的最长连续block数。"""
 
         if not block_hashes:
             return 0
@@ -395,8 +418,21 @@ class DSAL3BackendAdapter:
                 operation="put",
             )
         transferred_bytes = sum(sum(parts) for parts in missing_sizes)
+        # Mooncake treats OBJECT_ALREADY_EXISTS as put success even if another
+        # producer still owns an incomplete object. Only readable components
+        # may become scheduler ready hints; a failed confirmation is retryable.
+        with self._io_lock:
+            confirmed = self._validate_result(
+                self.backend.exists(keys), expected_count=len(keys), operation="post-put exists",
+            )
+        unconfirmed = [key for key, present in zip(keys, confirmed, strict=True) if present == 0]
+        if unconfirmed:
+            raise DSAL3StoreNotReady(
+                f"DSA L3 store not yet readable: job={job.job_id} "
+                f"unconfirmed_components={len(unconfirmed)}; retry after the competing writer completes"
+            )
         logger.info(
-            "DSA L3 store backend put finished: job=%d bytes=%d",
+            "DSA L3 store backend put finished: job=%d bytes=%d readable=True",
             job.job_id,
             transferred_bytes,
         )
@@ -521,12 +557,20 @@ class DSAL3BackendAdapter:
     def close(self) -> None:
         try:
             if self._registered_regions:
+                started = time.monotonic()
+                logger.info("DSA L3 resource close begin: stage=unregister regions=%d", len(self._registered_regions))
                 unregister = getattr(self.backend, "unregister_buffer", None)
                 if callable(unregister):
                     unregister([pointer for pointer, _ in self._registered_regions])
                 self._registered_regions = ()
                 self._registered = False
+                logger.info(
+                    "DSA L3 resource close completed: stage=unregister elapsed_ms=%.3f",
+                    (time.monotonic() - started) * 1000,
+                )
         finally:
+            started = time.monotonic()
+            logger.info("DSA L3 resource close begin: stage=backend")
             close = getattr(self.backend, "close", None)
             if callable(close):
                 close()
@@ -534,3 +578,7 @@ class DSAL3BackendAdapter:
                 store = getattr(self.backend, "store", None)
                 if store is not None:
                     store.close()
+            logger.info(
+                "DSA L3 resource close completed: stage=backend elapsed_ms=%.3f",
+                (time.monotonic() - started) * 1000,
+            )

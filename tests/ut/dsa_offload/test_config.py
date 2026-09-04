@@ -27,6 +27,13 @@ def _vllm_config(
     decode_context_parallel_size: int = 1,
     prefill_context_parallel_size: int = 1,
     pipeline_parallel_size: int = 1,
+    data_parallel_size: int = 1,
+    tensor_parallel_size: int = 1,
+    enable_expert_parallel: bool = True,
+    data_parallel_backend: str = "mp",
+    enable_elastic_ep: bool = False,
+    data_parallel_external_lb: bool = False,
+    data_parallel_hybrid_lb: bool = False,
     kv_cache_metrics: bool = False,
     enable_kv_cache_events: bool = False,
     compilation_mode: CompilationMode = CompilationMode.NONE,
@@ -63,6 +70,13 @@ def _vllm_config(
             decode_context_parallel_size=decode_context_parallel_size,
             prefill_context_parallel_size=prefill_context_parallel_size,
             pipeline_parallel_size=pipeline_parallel_size,
+            data_parallel_size=data_parallel_size,
+            tensor_parallel_size=tensor_parallel_size,
+            enable_expert_parallel=enable_expert_parallel,
+            data_parallel_backend=data_parallel_backend,
+            enable_elastic_ep=enable_elastic_ep,
+            data_parallel_external_lb=data_parallel_external_lb,
+            data_parallel_hybrid_lb=data_parallel_hybrid_lb,
         ),
         observability_config=SimpleNamespace(
             kv_cache_metrics=kv_cache_metrics,
@@ -88,12 +102,16 @@ def _mtp_config(
     parallel_drafting: bool = False,
     disable_padded_drafter_batch: bool = False,
     num_nextn_predict_layers: int = 1,
+    enforce_eager: bool = True,
+    draft_tensor_parallel_size: int | None = None,
 ):
     return SimpleNamespace(
         method=method,
         num_speculative_tokens=num_speculative_tokens,
         parallel_drafting=parallel_drafting,
         disable_padded_drafter_batch=disable_padded_drafter_batch,
+        enforce_eager=enforce_eager,
+        draft_tensor_parallel_size=draft_tensor_parallel_size,
         draft_model_config=SimpleNamespace(
             hf_config=SimpleNamespace(
                 num_nextn_predict_layers=num_nextn_predict_layers,
@@ -125,6 +143,175 @@ def test_enabled_config_keeps_fractional_dram_multiplier() -> None:
     assert config.hot_cpu_block_multiple == 1.5
     assert config.model_capabilities is not None
     assert config.model_capabilities.architecture == "GlmMoeDsaForCausalLM"
+
+
+def test_single_node_dp_foundation_accepts_internal_ep() -> None:
+    config = DSAOffloadConfig.from_dict(
+        {"enabled": True},
+        vllm_config=_vllm_config(data_parallel_size=2),
+    )
+
+    assert config.enabled
+
+
+@pytest.mark.parametrize(
+    ("config_updates", "message"),
+    [
+        (
+            {
+                "data_parallel_size": 2,
+                "enable_expert_parallel": False,
+            },
+            "enable_expert_parallel=True",
+        ),
+        (
+            {
+                "data_parallel_size": 2,
+                "data_parallel_backend": "ray",
+            },
+            "not Ray",
+        ),
+        (
+            {
+                "data_parallel_size": 2,
+                "data_parallel_external_lb": True,
+            },
+            "internal load balancing or offline SPMD",
+        ),
+    ],
+)
+def test_single_node_dp_foundation_rejects_later_phase_features(
+    config_updates,
+    message,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        DSAOffloadConfig.from_dict(
+            {"enabled": True},
+            vllm_config=_vllm_config(**config_updates),
+        )
+
+
+@pytest.mark.parametrize("prefix", [False, True])
+@pytest.mark.parametrize("graph", [False, True])
+def test_single_node_dp_accepts_fixed_mtp_with_eager_proposer(prefix, graph) -> None:
+    config = DSAOffloadConfig.from_dict(
+        {
+            "enabled": True, "enable_row_mode_decode_graph": graph,
+            "sparse_activation_tokens": 8192,
+            "resident_budget_tokens": [8192, 10240, 12288],
+        },
+        vllm_config=_vllm_config(
+            data_parallel_size=2, tensor_parallel_size=4,
+            speculative_config=_mtp_config(draft_tensor_parallel_size=4),
+            enable_prefix_caching=prefix, enable_chunked_prefill=True,
+            enforce_eager=not graph,
+            cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY if graph else CUDAGraphMode.NONE,
+            cudagraph_capture_sizes=[4, 8, 16] if graph else [],
+        ),
+    )
+    assert config.mtp_enabled
+    assert config.sparse_tail_block_count == 2
+
+
+@pytest.mark.parametrize(("spec", "message"), [
+    (_mtp_config(enforce_eager=False), "enforce_eager=True"),
+    (_mtp_config(draft_tensor_parallel_size=1), "same target and draft"),
+])
+def test_single_node_dp_mtp_rejects_unsupported_proposer_modes(spec, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        DSAOffloadConfig.from_dict(
+            {"enabled": True, "sparse_activation_tokens": 8192, "resident_budget_tokens": [8192, 10240, 12288]},
+            vllm_config=_vllm_config(data_parallel_size=2, tensor_parallel_size=4, speculative_config=spec),
+        )
+
+
+@pytest.mark.parametrize("graph", [False, True])
+def test_single_node_dp_accepts_local_prefix_with_chunked_prefill(graph) -> None:
+    config = DSAOffloadConfig.from_dict(
+        {"enabled": True, "enable_row_mode_decode_graph": graph},
+        vllm_config=_vllm_config(
+            data_parallel_size=2,
+            enable_prefix_caching=True,
+            enable_chunked_prefill=True,
+            enforce_eager=not graph,
+            compilation_mode=CompilationMode.VLLM_COMPILE if graph else CompilationMode.NONE,
+            cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY if graph else CUDAGraphMode.NONE,
+            cudagraph_capture_sizes=[1, 2, 4] if graph else [],
+        ),
+    )
+    assert config.enabled
+    assert not config.mtp_enabled
+
+
+@pytest.mark.parametrize("prefix", [False, True])
+def test_single_node_dp_accepts_l3_without_mtp(prefix, monkeypatch) -> None:
+    monkeypatch.setenv("PYTHONHASHSEED", "114514")
+    config = DSAOffloadConfig.from_dict(
+        {"enabled": True},
+        vllm_config=_vllm_config(
+            data_parallel_size=2,
+            enable_prefix_caching=prefix,
+            shutdown_timeout=300,
+            kv_transfer_config=SimpleNamespace(
+                kv_connector="DSAL3Connector",
+                kv_role="kv_producer",
+                kv_connector_extra_config={"backend": "mooncake"},
+            ),
+        ),
+    )
+    assert config.enabled
+
+
+@pytest.mark.parametrize("seed", [None, "", "random", "-1", "4294967296"])
+def test_dp_shared_l3_rejects_missing_or_nondeterministic_hash_seed(monkeypatch, seed):
+    if seed is None:
+        monkeypatch.delenv("PYTHONHASHSEED", raising=False)
+    else:
+        monkeypatch.setenv("PYTHONHASHSEED", seed)
+    config = _vllm_config(
+        data_parallel_size=2, shutdown_timeout=300,
+        kv_transfer_config=SimpleNamespace(kv_connector="DSAL3Connector", kv_role="kv_producer",
+                                           kv_connector_extra_config={"backend": "mooncake"}),
+    )
+    with pytest.raises(ValueError, match="PYTHONHASHSEED"):
+        DSAOffloadConfig.from_dict({"enabled": True}, vllm_config=config)
+
+
+def test_hash_seed_requirement_does_not_change_local_prefix_or_single_dp_l3(monkeypatch):
+    monkeypatch.delenv("PYTHONHASHSEED", raising=False)
+    assert DSAOffloadConfig.from_dict(
+        {"enabled": True}, vllm_config=_vllm_config(data_parallel_size=2, enable_prefix_caching=True),
+    ).enabled
+    config = _vllm_config(
+        shutdown_timeout=300,
+        kv_transfer_config=SimpleNamespace(kv_connector="DSAL3Connector", kv_role="kv_producer",
+                                           kv_connector_extra_config={"backend": "mooncake"}),
+    )
+    assert DSAOffloadConfig.from_dict({"enabled": True}, vllm_config=config).enabled
+
+
+@pytest.mark.parametrize("graph", [False, True])
+@pytest.mark.parametrize("role,prefix", [("kv_producer", False), ("kv_producer", True), ("kv_both", True)])
+def test_single_node_dp_l3_accepts_mtp_data_path(monkeypatch, graph, role, prefix) -> None:
+    monkeypatch.setenv("PYTHONHASHSEED", "114514")
+    config = DSAOffloadConfig.from_dict(
+        {
+            "enabled": True, "enable_row_mode_decode_graph": graph,
+            "sparse_activation_tokens": 8192, "resident_budget_tokens": [8192, 10240, 12288],
+        },
+        vllm_config=_vllm_config(
+            data_parallel_size=2, tensor_parallel_size=4,
+            speculative_config=_mtp_config(draft_tensor_parallel_size=4), enable_prefix_caching=prefix,
+            enable_chunked_prefill=True, enforce_eager=not graph, shutdown_timeout=300,
+            cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY if graph else CUDAGraphMode.NONE,
+            cudagraph_capture_sizes=[4, 8, 16] if graph else [],
+            kv_transfer_config=SimpleNamespace(
+                kv_connector="DSAL3Connector", kv_role=role, kv_load_failure_policy="fail",
+                kv_connector_extra_config={"backend": "mooncake"},
+            ),
+        ),
+    )
+    assert config.mtp_enabled and config.sparse_tail_block_count == 2
 
 
 def test_non_mtp_does_not_accept_the_mtp_only_8192_tier() -> None:

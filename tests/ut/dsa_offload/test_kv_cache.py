@@ -1,18 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+import vllm_ascend.dsa_offload.dp_context as dp_context
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.dsa_offload import kv_cache as dsa_kv_cache
+from vllm_ascend.dsa_offload.dp_context import (
+    install_dsa_engine_dp_context,
+    reset_dsa_engine_dp_context,
+)
 from vllm_ascend.dsa_offload.kv_cache import (
     DSAIndexerKVSpec,
     DSAKVCacheConfig,
     DSAResidentMLAAttentionSpec,
+    build_dsa_dp_compatibility_signature,
     build_dsa_kv_cache_config,
     build_dsa_kv_cache_groups,
     dsa_dram_bytes_per_logical_block,
@@ -33,6 +42,84 @@ from vllm_ascend.patch.platform.patch_kv_cache_utils import (
     _ascend_get_kv_cache_groups,
     _ascend_resolve_kv_cache_block_sizes,
 )
+
+
+@pytest.fixture
+def capacity_report_locks(monkeypatch, tmp_path):
+    monkeypatch.setattr(dsa_kv_cache.tempfile, "gettempdir", lambda: str(tmp_path))
+    factory = dsa_kv_cache.FileLock
+    locks = []
+
+    def create(*args, **kwargs):
+        lock = factory(*args, **kwargs)
+        locks.append(lock)
+        return lock
+
+    monkeypatch.setattr(dsa_kv_cache, "FileLock", create)
+    return locks
+
+
+def test_capacity_reports_do_not_interleave(monkeypatch, capacity_report_locks) -> None:
+    first_started = Event()
+    lines = []
+
+    def emit(message, rank):
+        for index in range(20):
+            lines.append((rank, index))
+            first_started.set()
+            time.sleep(0.001)
+
+    monkeypatch.setattr(dsa_kv_cache.logger, "info_once", emit)
+    config = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=2))
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(dsa_kv_cache._log_dsa_capacity_report, config, "report %s", 0)
+        assert first_started.wait(timeout=5)
+        second = executor.submit(dsa_kv_cache._log_dsa_capacity_report, config, "report %s", 1)
+        first.result(timeout=5)
+        second.result(timeout=5)
+    assert lines == [(rank, index) for rank in (0, 1) for index in range(20)]
+    assert len(capacity_report_locks) == 2
+    assert len({lock.lock_file for lock in capacity_report_locks}) == 1
+
+
+def test_capacity_report_releases_lock_on_logging_error(monkeypatch, capacity_report_locks) -> None:
+    config = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=2))
+
+    def emit(*args):
+        raise RuntimeError("handler failed")
+
+    monkeypatch.setattr(dsa_kv_cache.logger, "info_once", emit)
+    with pytest.raises(RuntimeError, match="handler failed"):
+        dsa_kv_cache._log_dsa_capacity_report(config, "report")
+    assert not capacity_report_locks[0].is_locked
+    with dsa_kv_cache.FileLock(capacity_report_locks[0].lock_file).acquire(timeout=0):
+        pass
+
+
+@pytest.mark.parametrize("failure", [OSError("read-only lock directory"), dsa_kv_cache.Timeout("busy")])
+def test_capacity_report_lock_failure_does_not_abort_startup(monkeypatch, failure) -> None:
+    output = []
+    warnings = []
+
+    def acquire(**kwargs):
+        raise failure
+
+    monkeypatch.setattr(dsa_kv_cache, "FileLock", lambda *args, **kwargs: SimpleNamespace(acquire=acquire))
+    monkeypatch.setattr(dsa_kv_cache.logger, "info_once", lambda *args: output.append(args))
+    monkeypatch.setattr(dsa_kv_cache.logger, "warning", lambda *args: warnings.append(args))
+    config = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=2))
+    dsa_kv_cache._log_dsa_capacity_report(config, "report %s", 1)
+    assert output == [("report %s", 1)]
+    assert len(warnings) == 1
+
+
+def test_single_dp_capacity_report_does_not_use_file_lock(monkeypatch) -> None:
+    monkeypatch.setattr(dsa_kv_cache, "FileLock", lambda *args, **kwargs: pytest.fail("unexpected lock"))
+    output = []
+    monkeypatch.setattr(dsa_kv_cache.logger, "info_once", lambda *args: output.append(args))
+    config = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=1))
+    dsa_kv_cache._log_dsa_capacity_report(config, "report %s", 0)
+    assert output == [("report %s", 0)]
 
 
 def _make_specs(
@@ -65,6 +152,8 @@ def _make_vllm_config(
     max_model_len: int = 32768,
     override: int | None = None,
     enable_prefix_caching: bool = False,
+    data_parallel_size: int = 1,
+    data_parallel_rank: int = 0,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         cache_config=SimpleNamespace(
@@ -73,12 +162,36 @@ def _make_vllm_config(
             hash_block_size=None,
             enable_prefix_caching=enable_prefix_caching,
         ),
-        model_config=SimpleNamespace(max_model_len=max_model_len),
+        model_config=SimpleNamespace(
+            max_model_len=max_model_len,
+            model="test-model",
+            revision=None,
+            architecture="GlmMoeDsaForCausalLM",
+            hf_config=SimpleNamespace(
+                architectures=("GlmMoeDsaForCausalLM",),
+                model_type="glm_moe_dsa",
+            ),
+            quantization="ascend",
+            enforce_eager=True,
+        ),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=4,
+            max_num_batched_tokens=8192,
+            enable_chunked_prefill=True,
+            scheduler_reserve_full_isl=True,
+        ),
+        compilation_config=SimpleNamespace(
+            mode="NONE",
+            cudagraph_mode="NONE",
+            cudagraph_capture_sizes=(),
+        ),
         kv_transfer_config=None,
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=1,
             prefill_context_parallel_size=1,
             tensor_parallel_size=2,
+            data_parallel_size=data_parallel_size,
+            data_parallel_rank=data_parallel_rank,
         ),
     )
 
@@ -305,6 +418,98 @@ def test_current_dsa_groups_resolve_scheduler_and_hash_to_128(
     ) == (128, 128)
 
 
+def test_dp_l3_signature_compares_shared_backend_settings(monkeypatch) -> None:
+    import sys
+
+    backend_config = SimpleNamespace(
+        protocol="tcp", metadata_server="P2PHANDSHAKE", master_server_address="127.0.0.1:50088",
+        global_segment_size=4 << 30, local_buffer_size=1 << 30, tcp_segment_port_base=45000,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend",
+        SimpleNamespace(MooncakeStoreConfig=SimpleNamespace(load_from_env=lambda: backend_config)),
+    )
+    monkeypatch.setenv("PYTHONHASHSEED", "114514")
+    config = _make_vllm_config(data_parallel_size=2)
+    config.kv_transfer_config = SimpleNamespace(kv_connector="DSAL3Connector", kv_role="kv_both")
+    groups = build_dsa_kv_cache_groups(_make_specs())
+    dsa_config = SimpleNamespace()
+    first = build_dsa_dp_compatibility_signature(config, groups, dsa_config)
+    config.parallel_config.data_parallel_rank = 1
+    assert build_dsa_dp_compatibility_signature(config, groups, dsa_config) == first
+    backend_config.master_server_address = "127.0.0.1:50089"
+    assert build_dsa_dp_compatibility_signature(config, groups, dsa_config) != first
+    backend_config.master_server_address = "127.0.0.1:50088"
+    for seed in ("114515", "0114514"):
+        monkeypatch.setenv("PYTHONHASHSEED", seed)
+        assert build_dsa_dp_compatibility_signature(config, groups, dsa_config) != first
+
+
+def test_dp_l3_signature_does_not_accept_an_unset_hash_seed(monkeypatch):
+    monkeypatch.delenv("PYTHONHASHSEED", raising=False)
+    config = _make_vllm_config(data_parallel_size=2)
+    config.kv_transfer_config = SimpleNamespace(kv_connector="DSAL3Connector", kv_role="kv_both")
+    with pytest.raises(ValueError, match="PYTHONHASHSEED"):
+        build_dsa_dp_compatibility_signature(config, build_dsa_kv_cache_groups(_make_specs()), SimpleNamespace())
+
+
+def test_dp_compatibility_signature_tracks_dsa_semantics() -> None:
+    vllm_config = _make_vllm_config()
+    groups = build_dsa_kv_cache_groups(_make_specs())
+    dsa_config = SimpleNamespace(
+        indexer_mla_block_ratio=3,
+        sparse_activation_tokens=6144,
+        prompt_budget_thresholds=(32768, 65536),
+        resident_budget_tokens=(6144, 10240, 12288),
+        max_active_reqs=256,
+        hot_cpu_block_multiple=1.5,
+        enable_row_mode_decode_graph=False,
+        mtp_num_speculative_tokens=0,
+        mtp_cache_layer_count=0,
+    )
+
+    first = build_dsa_dp_compatibility_signature(
+        vllm_config,
+        groups,
+        dsa_config,
+    )
+    second = build_dsa_dp_compatibility_signature(
+        vllm_config,
+        groups,
+        dsa_config,
+    )
+    changed_config = SimpleNamespace(**vars(dsa_config))
+    changed_config.hot_cpu_block_multiple = 2.0
+    changed = build_dsa_dp_compatibility_signature(
+        vllm_config,
+        groups,
+        changed_config,
+    )
+
+    assert first == second
+    assert first != changed
+
+
+@pytest.mark.parametrize("field,value", [("model", "draft-b"), ("revision", "rev-b"), ("hash", "hash-b")])
+def test_dp_mtp_signature_tracks_draft_identity_but_not_rank(field, value) -> None:
+    config = _make_vllm_config(data_parallel_size=2)
+    draft = SimpleNamespace(model="draft-a", revision="rev-a", compute_hash=lambda: "hash-a")
+    config.speculative_config = SimpleNamespace(
+        method="mtp", num_speculative_tokens=3, draft_model_config=draft,
+        enforce_eager=True, draft_tensor_parallel_size=None,
+    )
+    groups = build_dsa_kv_cache_groups(_make_specs())
+    signature = build_dsa_dp_compatibility_signature(config, groups, SimpleNamespace())
+    config.parallel_config.data_parallel_rank = 1
+    assert build_dsa_dp_compatibility_signature(config, groups, SimpleNamespace()) == signature
+    if field == "hash":
+        draft.compute_hash = lambda: value
+    else:
+        setattr(draft, field, value)
+    assert build_dsa_dp_compatibility_signature(config, groups, SimpleNamespace()) != signature
+
+
 def test_engine_core_finalizes_one_shared_dram_capacity_plan(
     monkeypatch,
 ) -> None:
@@ -341,6 +546,82 @@ def test_engine_core_finalizes_one_shared_dram_capacity_plan(
     assert plan.usable_blocks == desired
     assert all(isinstance(config, DSAKVCacheConfig) for config in configs)
     assert all(config.dram_capacity is plan for config in configs)
+
+
+def test_dp_equal_byte_quota_preserves_each_l1_multiple(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(dsa_kv_cache, "_get_dsa_ratio", lambda: 3)
+    monkeypatch.setattr(
+        "vllm_ascend.ascend_config.get_ascend_config",
+        lambda: SimpleNamespace(
+            dsa_offload_config=SimpleNamespace(
+                hot_cpu_block_multiple=1.5,
+            )
+        ),
+    )
+    monkeypatch.setattr(dp_context.socket, "gethostname", lambda: "node-a")
+    monkeypatch.setattr(dp_context, "_read_host_boot_id", lambda: "11111111-1111-4111-8111-111111111111")
+    groups = build_dsa_kv_cache_groups(_make_specs())
+    bundle_bytes = dsa_dram_bytes_per_logical_block(groups)
+    tp_size = 2
+    max_indexer_blocks = 256 * 3
+    max_desired = int(max_indexer_blocks * 1.5)
+    per_dp_quota = (max_desired + 1) * bundle_bytes * tp_size
+    node_available = per_dp_quota * 2
+
+    def fake_all_gather_object(output, sample, *, group) -> None:
+        output[:] = [
+            replace(sample, rank=0, available_bytes=node_available, l1_indexer_blocks=128 * 3),
+            replace(sample, rank=1, available_bytes=node_available, l1_indexer_blocks=256 * 3),
+        ]
+
+    monkeypatch.setattr(
+        dp_context.dist,
+        "all_gather_object",
+        fake_all_gather_object,
+    )
+
+    plans = []
+    try:
+        for dp_rank, base_blocks in enumerate((128, 256)):
+            reset_dsa_engine_dp_context()
+            install_dsa_engine_dp_context(
+                process_group=object(),
+                rank=dp_rank,
+                world_size=2,
+                local_rank=dp_rank,
+            )
+            vllm_config = _make_vllm_config(
+                data_parallel_size=2,
+                data_parallel_rank=dp_rank,
+            )
+            hbm_bytes = (
+                dsa_pool_bytes_per_base_block(groups) * base_blocks
+            )
+            configs = [
+                build_dsa_kv_cache_config(
+                    vllm_config,
+                    groups,
+                    available_memory=hbm_bytes,
+                )
+                for _ in range(tp_size)
+            ]
+            plan = finalize_dsa_dram_capacity(
+                vllm_config,
+                configs,
+                host_available_bytes=node_available,
+            )
+            assert plan is not None
+            plans.append(plan)
+    finally:
+        reset_dsa_engine_dp_context()
+
+    assert plans[0].per_dp_quota_bytes == per_dp_quota
+    assert plans[1].per_dp_quota_bytes == per_dp_quota
+    assert plans[0].usable_blocks == int(128 * 3 * 1.5)
+    assert plans[1].usable_blocks == int(256 * 3 * 1.5)
+    assert plans[0].usable_blocks != plans[1].usable_blocks
 
 
 def test_engine_core_reserves_l3_host_pools_before_dram_planning(

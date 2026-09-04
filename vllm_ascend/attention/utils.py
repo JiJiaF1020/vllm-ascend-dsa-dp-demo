@@ -462,7 +462,7 @@ def wait_for_kv_layer_from_connector(layer_name: str):
 
     forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata
-    if attn_metadata is None:
+    if attn_metadata is None or getattr(forward_context, "skip_kv_transfer", False):
         return
     # TODO: assert ascendMetadata
     connector.wait_for_layer_load(layer_name)
@@ -479,7 +479,7 @@ def maybe_save_kv_layer_to_connector(
 
     forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata
-    if attn_metadata is None:
+    if attn_metadata is None or getattr(forward_context, "skip_kv_transfer", False):
         return
     # TODO: assert ascendMetadata
     connector.save_kv_layer(layer_name, kv_cache_layer, attn_metadata)
@@ -502,6 +502,8 @@ def notify_kv_cache_written(layer_name: str = ""):
     connector = get_kv_transfer_group()
     on_kv_cache_written = getattr(connector, "on_kv_cache_written", None)
     if on_kv_cache_written is not None:
+        if getattr(get_forward_context(), "skip_kv_transfer", False):
+            return
         on_kv_cache_written(layer_name)
 
 

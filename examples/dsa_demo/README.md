@@ -6,16 +6,26 @@
 | 文件 | 用途 |
 |---|---|
 | `simple_prompt_test.py` | 基线隔离、cache-init、eager 和 graph 冒烟 |
+| `simple_dp_prompt_test.py` | 同事入门用的单机DP离线脚本，顶部按特性分组配置，输出完整文本/token IDs |
 | `qa_dataset_test.py` | LongBench 风格数据集精度回归，可切 disabled/eager/graph |
 | `eval_dataset_acc_score.py` | 对 QA 脚本生成的 JSONL 计算 LongBench 指标 |
 | `serve_dsa.sh` | 以 OpenAI 兼容在线服务拉起 DSA eager/graph |
+| `serve_dp_mtp_l3.sh` | P6-A单机DP2/TP4/EP8、MTP3与共享Mooncake的阶段启动配置 |
 | `stream_chat_client.py` | 交互式多轮流式客户端 |
 | `online_l2_l3_closeout_test.py` | 5k/8k/40k/70k 在线 L2/L3 生命周期收口 |
+| `online_dp_foundation_test.py` | 单机 DP2 基础阶段的混合并发与 real/idle graph smoke |
+| `online_dp_prefix_test.py` | 单机 DP2 Local L1/L2 prefix，显式 DP 路由、冷/热命中断言与持久响应记录 |
+| `online_dp_l3_test.py` | 单机 DP2 共享 Mooncake：跨域首次 load、local reset 后读回与同 key 并发请求 |
+| `online_dp_l3_accuracy_test.py` | 串行或显式双域并发的热缓存/L3精度对照，首差异logprobs及持久JSONL离线分析 |
+| `online_dp_cache_admin_test.py` | 顶部配置直接运行，默认P6-B九请求，结束恢复运行，不停止服务 |
+| `offline_dp_closeout_test.py` | 顶部配置直接运行，默认DP2/TP4 Graph+MTP3+L3六请求，检查正常缓存流程 |
 | `online_long_context_dataset_test.py` | 在线长上下文数据集分桶回归 |
 | `L3_cache_sys_api_test/` | Mooncake/MemCache 独立 API、baseline L3 与后续 DSA 分层缓存测试 |
 
 当前架构和稳定 ABI 见
 [DSA 稀疏卸载详细设计](../../docs/source/developer_guide/Design_Documents/dsa_offload_design.md)。
+该文档第16节包含模块职责、v0.23基线对照和后续PD/打断续推的扩展规则；
+按资源所有权复用现有模块，不按DP/PD/MTP组合复制运行时。
 L3 接入、异步 write-behind 和 HBM 热层后续方案见
 [DSA L1/L2/L3 分层缓存详细设计](../../docs/source/developer_guide/Design_Documents/dsa_l2_l3_cache_design.md)。
 阶段优先级与退出门禁见
@@ -241,9 +251,1004 @@ python examples/dsa_demo/eval_dataset_acc_score.py \
 
 ## 7. 在线流式服务
 
+### DP入门离线脚本
+
+只改`simple_dp_prompt_test.py`顶部配置，然后在实际脚本目录直接运行：
+
+```bash
+python simple_dp_prompt_test.py
+```
+
+配置按长条注释分成输入/采样、基线通用、DP/TP、DSA、prefix/replay、MTP、L3、
+运行环境/结果八组。不导入其他demo的配置，不要求命令行环境变量。
+默认叠加A5八卡DP2/TP4、Graph、chunked prefill、DSA、prefix、MTP3、L3读写，
+每域max_num_seqs=4，生成128 tokens并ignore_eos=True，保存top-5 logprobs。
+三轮依次为冷算、本地prefix复用、清本地后交换DP并从L3回载。
+数据导入和`PROMPTS`完全由使用者维护，不自动选择、加载或替换数据集。当前示例
+保留`chinese_8k + chinese_5k + chinese_70k + chinese_40k`的组合，需提供相应数据模块，
+也可直接替换成自己的字符串列表。运行前仍需核对模型/设备/Mooncake配置并手动启动Master。
+
+常见用法，均直接在脚本内修改：
+
+| 场景 | 设置 |
+|---|---|
+| 基线DP对照 | 关闭`ENABLE_DSA_OFFLOAD`和两个L3开关；MTP按对照需要选择，RUN_MODE可独立选eager/graph |
+| 调整输入 | 直接修改脚本顶部的数据导入及`PROMPTS` |
+| 每个DP跑相同输入 | `PROMPT_DISTRIBUTION="replicate"`，同时关闭`SWAP_DP_ON_LAST_REPLAY` |
+| 仅Local prefix重放 | 关闭两个L3开关及reset/swap，保留prefix，`REPLAY_ROUNDS=2` |
+| 非MTP对照 | `ENABLE_MTP=False`；MTP3默认已开启，proposer固定eager |
+| L3与跨域读取 | 默认即已配置；前两轮保留本地缓存，第三轮清本地并交换域 |
+| 不加载模型的配置检查 | `CHECK_ONLY=True`，先检查配置、路径、依赖以及启用时的Master监听 |
+
+L3当前固定Mooncake TCP，Master需自己启动；MTP proposer固定eager。
+Master预检遵循实际worker的地址优先级：脚本内`NATIVE_RUNTIME_ENV`的覆盖、父进程
+`MOONCAKE_MASTER`环境变量、最后才是配置文件。显式空值会在加载模型前报错，
+不表示取消覆盖；要使用文件地址，应移除对应覆盖项，而不是赋空字符串。
+`CHECK_ONLY=False`才能实际推理，未支持的async scheduling、direct-HBM仍关闭，
+“默认叠加特性”不包含这些尚未支持的分支。只观察短输出/性能时可降低MAX_TOKENS或设LOGPROBS=0。
+`MAX_NUM_SEQS`与token预算均是每域值，输入多于并发上限可以正常排队。
+可见设备数必须等于DP*TP，不按每域手工裁切环境变量；每个客户端由脚本自动设置
+`VLLM_DP_*`，LLM kwargs不重复传data_parallel_size。
+round_robin要求每域至少一条输入，不伪造placeholder。DP=1可作为无L3对照，须同步
+调整TP或可见卡；DP1+L3沿用`simple_prompt_test.py`，避免调用仅DP具备的管理接口。
+首个已验证的DSA拓扑为DP2/TP4/EP8，其他拓扑不据此承诺已通过模型/算子约束。
+
+每次运行结果存于`results/simple_dp/<run_id>/`：配置、LLM参数、实际engine信息及
+逐域JSONL（含原prompt、输出文本、token IDs和可选logprobs）。每轮只打印简要进度，
+主进程最后按DP/轮次统一打印完整输出，避免文本穿插。脚本用全域共享、轮间不变的
+run salt隔离旧实验缓存，不修改prompt文本，也不把DP ID加入内容key。
+
+本脚本供配置探索和学习，不自动放宽/判定数值精度，不把cache hit或COMPLETED
+当成IO字节正确性和worker优雅退出的证明。需要严格功能验收仍使用
+`offline_dp_closeout_test.py`及相应在线测试；已知TorchNPU native退出限制仍适用。
+
+### DP 脚本配置索引
+
+DP 服务统一使用 `serve_dsa.sh`；文中的 `dp_serve_dsa.sh` 指使用者自己的副本，
+不是仓库中的另一套启动入口。下面四个客户端需要同步同一版本的文件：
+
+| 客户端 | 默认请求安排 | 默认生成长度 | 服务要求 |
+|---|---|---|---|
+| `online_dp_foundation_test.py` | 混合5k/8k/40k/70k，再单40k，共5请求，服务自动路由 | 32 | DSA DP2，prefix/MTP/L3关闭 |
+| `online_dp_prefix_test.py` | 显式DP0/1的冷/热、混合、非对称、重入，共16请求 | 32 | Local prefix开启，L3关闭；可选MTP |
+| `online_dp_l3_test.py` | 默认40k共7请求；`--concurrent-pair`每组8请求、交换DP回载 | 32 | P5无MTP；P6-A加`--mtp`并建议生成128 tokens |
+| `online_dp_l3_accuracy_test.py` | 默认DP0串行40k共7请求；`--concurrent-pair`每组14请求 | 64 | 同P5配置；比较热路径，不以冷/热不同直接判失败 |
+
+共用客户端设置实际在 `online_dp_foundation_test.py` 导入时读取。prefix 导入
+这些设置；L3 也显式导入 `MAX_TOKENS`，传给 prefix 的 `_run_case(max_tokens=...)`。
+精度客户端复用连接设置，但单独读取同一个 `DSA_DP_MAX_TOKENS`，以64为默认值。
+因此不用在每个文件中重复写 `os.getenv`；设置必须发生在启动客户端 Python 之前。
+所有入口均固定 `ignore_eos=True`、temperature=0，且禁止HTTP自动重试；精度入口
+另固定请求seed=1024和top5 logprobs，功能入口不进行严格数值对照。
+
+上述环境变量配置说明仅适用于表中四个旧客户端。当前收口入口
+`online_dp_cache_admin_test.py`和`offline_dp_closeout_test.py`改为顶部“用户配置”
+作为默认来源，直接运行即可，不需要DSA_DP_*或MODEL_PATH环境变量。旧CLI可选覆盖。
+
+| 环境变量 | 默认值 | 作用范围 |
+|---|---|---|
+| `DSA_DP_API_BASE` | `http://127.0.0.1:8000/v1` | 全部客户端；服务使用8035时必须显式覆盖 |
+| `DSA_DP_API_KEY` | `EMPTY` | 全部客户端；需与服务端 `API_KEY` 一致，不打印密钥 |
+| `DSA_DP_MODEL_NAME` | 未设置 | 全部客户端；服务只有一个模型时自动从 `/models` 选择 |
+| `DSA_DP_MAX_TOKENS` | 功能入口32，精度入口64 | 全部客户端，至少2；不会改变服务端batch budget |
+| `DSA_DP_REQUEST_TIMEOUT_SECONDS` | 900 | 全部客户端，必须为有限正数 |
+| `DSA_DP_PREFIX_RESULT_DIR` | 脚本旁 `results/dp_prefix` | prefix客户端 |
+| `DSA_DP_L3_LABELS` | `40k` | L3功能客户端；逗号分隔5k/8k/40k/70k |
+| `DSA_DP_L3_STORE_WAIT_SECONDS` | 10 | L3功能和精度客户端；有限非负秒数，等待本身不证明put成功 |
+| `DSA_DP_L3_RESULT_DIR` | 脚本旁 `results/dp_l3` | L3功能客户端 |
+| `DSA_DP_ACCURACY_LABELS` / `DSA_DP_ACCURACY_RANKS` | `40k` / `0` | 精度串行模式；`0,1`仍为顺序测试，并非并发 |
+| `DSA_DP_ACCURACY_RESULT_DIR` | 脚本旁 `results/dp_accuracy` | 精度客户端 |
+
+精度客户端的`--concurrent-pair 8k,70k`左右分别指定DP0/DP1，此时不使用精度串行的
+LABELS/RANKS选择场景；可重复传参。功能L3客户端也支持该参数，但流程不同：
+左右指定初始写入域，跨域读取时交换，两次并发回载共8请求，并忽略`DSA_DP_L3_LABELS`。
+精度客户端的`--analyze <JSONL>`只分析已有结果，
+不连接服务。功能入口没有 `PROMPT_LABELS`、`REPEATS`、`IGNORE_EOS` 开关，
+不要把旧确定性测试脚本的配置复制过来。foundation/prefix会读取四种数据，
+L3/精度入口也通过共用loader读取 `novel_dataset.py` 中的四个条目后再选场景。
+
+服务端配置与客户端环境彼此独立：`PORT`不自动变成`DSA_DP_API_BASE`，
+`SERVED_MODEL_NAME`不自动变成`DSA_DP_MODEL_NAME`；`MAX_NUM_BATCHED_TOKENS`
+控制每个scheduler一轮的token预算，`DSA_DP_MAX_TOKENS`控制每个请求的输出长度。
+只改客户端生成长度、标签或结果目录，不需要重启服务；改服务端DP/TP、模型、
+prefix/MTP/L3开关则需要重启。客户端启动日志会打印实际生效的 `max_tokens`。
+
+`serve_dsa.sh` 支持其 `${NAME:-默认值}` 形式配置项的环境变量覆盖，但以下
+内容在脚本中固定：`PYTHONHASHSEED=114514`、block_size=128、关闭async scheduling、
+EP开启、`mooncake-dsa-tcp.json`路径、每worker的4 GiB segment。JSON中的Master
+地址和1 GiB local buffer需要改配置文件；不能仅在命令前写同名变量就认为已覆盖。
+P6-A已开放单机DP+固定MTP3+TCP L3；P6-B在线internal-DP的协调external reset已
+通过正常管理及暂停排队中reset验证。启用DSAL3时，裸Connector/离线单域external
+reset仍拒绝。未配置connector时沿用基线行为，不适用该拒绝断言。direct-HBM仍拒绝。
+
 先修改 `serve_dsa.sh` 顶部用户配置。首次在线验证建议从
 `RUN_MODE="eager"` 开始，确认请求生命周期、连续请求和流式返回正常后，再
 切换为 `RUN_MODE="graph"`：
+
+### 单机 DP2 基础阶段
+
+DP>1的L2预算用`/proc/sys/kernel/random/boot_id`识别宿主内核内存域，不再用
+hostname判断。同一宿主的不同hostname可以通过；同名但不同boot ID会被拒绝。
+该文件必须在每个EngineCore中可读且反映同一宿主内核；若容器屏蔽或虚拟化它，
+先修正部署视图，不回退到hostname。读取失败会随原有CPU汇总传播后由各域拒绝，
+不新增forward同步。DP1不需要这项检测，单机SPMD也不要求local-DP等于global-DP。
+
+当前支持 DSA + 单机 mp/internal-DP/EP，可选 Local L1/L2 prefix 和固定 MTP3（proposer eager、与 target 相同 TP）。P5 无MTP共享L3已验证单40k Graph闭环，P6-A的DP MTP与L3组合也已通过单40k及8k/70k长短并发功能闭环，完整精度与生命周期仍待验收。下面的 foundation 测试保持 prefix/MTP/L3 关闭，prefix/L3 使用后面的专用客户端。脚本默认仍是 DP1；验证 A5 八卡 `DP2*TP4*EP8` 时设置：
+
+```bash
+MODEL_PATH="/models/GLM-5.2-w4a4c8-mxfp4" \
+SERVED_MODEL_NAME="glm-5.2-dsa-dp2" \
+RUN_MODE="eager" \
+ENABLE_A5_PACKED_C8_DSA="true" \
+DATA_PARALLEL_SIZE=2 \
+DATA_PARALLEL_SIZE_LOCAL=2 \
+TENSOR_PARALLEL_SIZE=4 \
+bash examples/dsa_demo/serve_dsa.sh 2>&1 | tee dsa-dp2-server.log
+```
+
+脚本用户配置需保持：
+
+```bash
+ENABLE_A5_PACKED_C8_DSA="true"
+ENABLE_PREFIX_CACHING="false"
+ENABLE_MTP="false"
+ENABLE_L3_WRITE_BEHIND="false"
+ENABLE_L3_PREFIX_LOADBACK="false"
+```
+
+容量报告应在两个 EngineCore 中给出相同的 node snapshot、per-DP byte quota 和完整 `L1 Indexer blocks by DP`，但各 DP 的 selected L2 blocks 允许随本域 L1 不同。graph 的 D/idle 阶段还应出现：
+
+```text
+DSA runtime idle dummy: graph_mode=FULL ... io=device-pad/noop
+```
+
+该日志表示 idle DP 也重放 FULL 图；是否无副作用仍需结合无异常、真实缓存 canary/算子 UT 与请求结果验收，不能只凭一行日志判定。
+
+提交服务器后先执行：
+
+```bash
+python -m pytest tests/ut/dsa_offload -vv --tb=short
+python -m pytest tests/ut/worker/a2/test_worker_v1.py -vv --tb=short
+python -m pytest \
+  tests/e2e/nightly/single_node/ops/singlecard_ops/test_dsa_a5_c8_ops.py \
+  -k 'graph_replay_pad_row_is_noop' -vv -s --tb=short
+python -m pytest \
+  tests/e2e/nightly/single_node/ops/singlecard_ops/test_kv_cache_full_block_dump.py \
+  -k 'noop_rows_preserve_destination' -vv -s --tb=short
+```
+
+本阶段没有修改自定义算子源码；后两条使用现有 kernel 的 PAD/`dst=-1` 合同，不需要仅为本次 Python 改动全量重编 csrc。
+
+服务就绪后运行一次客户端即可同时制造 mixed real work 和 real/idle：
+
+```bash
+python examples/dsa_demo/online_dp_foundation_test.py \
+  2>&1 | tee dsa-dp2-client.log
+```
+
+服务端提取本阶段证据：
+
+```bash
+grep -E \
+  'DSA DRAM CAPACITY|DP rank / size|Host observations by DP|L1 Indexer blocks by DP|This-DP byte quota|Compatibility signature|DSA runtime idle dummy|Replaying aclgraph|ERROR|Traceback' \
+  dsa-dp2-server.log
+```
+
+### 单机 DP2 Local L1/L2 Prefix（P3）
+
+基础 eager/Graph 冒烟之后，开启 Local prefix。以下配置保留两域独立
+Scheduler、HBM/L2 block manager 和请求级水位；不共享 L2，不取跨 DP
+prefix 长度的 Min。HBM pair 与 L2 bundle 复用、首个真实 prefill 的
+HBM-only 回填继续走既有数据面，eager/Graph 使用相同 metadata owner。
+
+在项目根目录执行，模型路径按实际位置修改：
+
+```bash
+MODEL_PATH=/mnt/share/weights/GLM-5.2-w4a4c8-mxfp4 \
+SERVED_MODEL_NAME=glm-5.2-dsa PORT=8035 \
+RUN_MODE=graph ENABLE_A5_PACKED_C8_DSA=true \
+DATA_PARALLEL_SIZE=2 DATA_PARALLEL_SIZE_LOCAL=2 TENSOR_PARALLEL_SIZE=4 \
+MAX_NUM_SEQS=4 MAX_MODEL_LEN=131072 MAX_NUM_BATCHED_TOKENS=16384 \
+ENABLE_CHUNKED_PREFILL=true GPU_MEMORY_UTILIZATION=0.9 \
+DSA_INDEXER_MLA_BLOCK_RATIO=2 DSA_HOT_CPU_BLOCK_MULTIPLE=1.0 \
+ENABLE_PREFIX_CACHING=true ENABLE_MTP=false \
+ENABLE_L3_WRITE_BEHIND=false ENABLE_L3_PREFIX_LOADBACK=false \
+bash examples/dsa_demo/serve_dsa.sh 2>&1 | tee dsa-dp2-prefix-server.log
+```
+
+同一配置改 `RUN_MODE=eager` 可做 eager 对照。脚本已加入基线参数
+`--enable-prompt-tokens-details`，用于返回每请求的 `cached_tokens`；若沿用
+自建的 `dp_serve_dsa.sh`，也需补这个参数，并去掉旧的 DP prefix 禁用判断。
+其余 DP/MTP/L3 约束保持上述配置，普通 `--enable-prefix-caching` 就是本轮开关。
+
+先运行 UT（不需要为本轮重编自定义算子）：
+
+```bash
+python -m pytest tests/ut/dsa_offload -vv --tb=short
+```
+
+服务就绪后，在项目根目录执行：
+
+```bash
+DSA_DP_API_BASE=http://127.0.0.1:8035/v1 DSA_DP_MAX_TOKENS=32 \
+python examples/dsa_demo/online_dp_prefix_test.py 2>&1 | tee dsa-dp2-prefix-client.log
+```
+
+脚本固定面向两个 DP，共 16 请求：
+
+1. 40k 在 DP0 冷算后同域热重放；相同 salt 的 40k 再路由到 DP1，仍应先冷后热。
+2. 5k/8k/40k/70k 按显式路由并发冷算，再按相同路由并发热重放。
+3. DP0 冷 70k 与 DP1 热 40k 并发，制造不同 prefill 工作量和 real/idle 转换。
+4. DP0、DP1 分别再次执行热 40k，覆盖 idle 后重新入场。
+
+显式路由复用 vLLM 的 `X-data-parallel-rank` 请求头，没有修改服务端 LB。
+每次脚本运行产生独立 `cache_salt`，同一轮对比的 prompt/salt 保持一致，
+不会向文本添加编号，也不依赖全局清缓存才能重跑。16 请求是顺序阶段中的
+总数，最大并发仍为 4；不要求四条 mixed 请求落在同一 forward。
+
+客户端冷请求必须 `cached_tokens=0`，热请求必须 `cached_tokens>0`，
+命中长度按 128 对齐且短于 prompt；全部请求须完成指定 token 数。
+基线冷命中会省略 `prompt_tokens_details`，按 0 处理；若热请求也缺该字段，
+客户端会失败并提醒检查服务参数。`cached_tokens` 是 Local 命中总数，
+区分 HBM pair 与 L2 restore 仍需查看服务端 `hbm_pair_blocks/l2_blocks`。
+
+响应、token ID、request ID、路由和 usage 逐条写入
+`examples/dsa_demo/results/dp_prefix/<run-id>.jsonl`，可用
+`DSA_DP_PREFIX_RESULT_DIR` 指向其他持久目录。断言前先保存响应，便于追溯。
+脚本不把不同 batch/冷算/复用的 token 不一致直接判为缓存功能失败，也不声明
+这种差异必然来自硬件；精度检查是独立验收项。
+
+服务端证据可过滤：
+
+```bash
+grep -E 'DSA prefix lookup|DSA prefix restore submitted|DSA runtime idle dummy|Replaying aclgraph|ERROR|Traceback' \
+  dsa-dp2-prefix-server.log
+```
+
+`DSA prefix lookup` 现在末尾有 `dp_rank`，可与 client request ID 对齐。
+本轮负载不保证自然产生 HBM-only/L2-only 的每种容量组合；相同物理编号的
+跨 DP 隔离、L1/L2 长度组合、ENTER 与 dummy 后回填由 `test_dp_prefix.py`
+和 `test_runtime.py` 覆盖。Graph 还需已有 PAD/dump no-op 的 A5 算子 UT 证据。
+
+管理面说明：DSA internal-DP 的 local reset 会等待并检查所有 EngineCore
+结果；任一拒绝/失败将抛出异常，使 HTTP 接口不再返回误导性的 200。
+上述为P3时的结果聚合边界；P6-B实现后，在线internal-DP reset统一走下述
+暂停、全域预检和提交协议。offline入口不自动获得该协调能力。
+若某域繁忙导致部分清理失败，可在排空后重试；本轮客户端不调用 reset。
+`reset_running_requests=true` 遇到运行中请求会在队列修改前拒绝，DSA
+尚不支持抢占恢复。共享 L3 namespace 的统一 epoch/quiesce 协议仍在后续阶段。
+
+### 单机 DP2 MTP + Local Prefix（P4）
+
+P4 延用 P3 的独立 L1/L2 目录与统一元数据，启用固定 MTP3、target 双尾与
+MTP BF16 满块持久化。proposer 必须 eager，draft TP 与 target TP 一致；
+target 仍可使用 FULL decode 图。DP 下 L3、抢占恢复与 async scheduling
+继续关闭。新增的 idle proposer 没有真实 attention metadata，但仍沿基线
+merged-draft 执行三次模型调用，与真实域保持所需 collective 次序。
+
+本阶段框架 UT：
+
+```bash
+python -m pytest tests/ut/dsa_offload -vv --tb=short
+python -m pytest tests/ut/spec_decode/test_llm_base_proposer.py -vv --tb=short
+```
+
+本轮修改均在 Python 框架/测试层，不需要重新编译自定义算子。
+在已验证 P3 的服务配置上设置 `ENABLE_MTP=true` 并重启；例如：
+
+```bash
+MODEL_PATH=/mnt/share/weights/GLM-5.2-w4a4c8-mxfp4 \
+SERVED_MODEL_NAME=glm-5.2-dsa PORT=8035 \
+RUN_MODE=graph ENABLE_A5_PACKED_C8_DSA=true \
+DATA_PARALLEL_SIZE=2 DATA_PARALLEL_SIZE_LOCAL=2 TENSOR_PARALLEL_SIZE=4 \
+MAX_NUM_SEQS=4 MAX_MODEL_LEN=131072 MAX_NUM_BATCHED_TOKENS=16384 \
+ENABLE_CHUNKED_PREFILL=true GPU_MEMORY_UTILIZATION=0.9 \
+DSA_INDEXER_MLA_BLOCK_RATIO=2 DSA_HOT_CPU_BLOCK_MULTIPLE=1.0 \
+ENABLE_PREFIX_CACHING=true ENABLE_MTP=true \
+ENABLE_L3_WRITE_BEHIND=false ENABLE_L3_PREFIX_LOADBACK=false \
+bash examples/dsa_demo/serve_dsa.sh 2>&1 | tee dsa-dp2-mtp-prefix-server.log
+```
+
+启动脚本为 MTP 明确传入
+`{"method":"mtp","num_speculative_tokens":3,"enforce_eager":true}`，将
+最小 sparse 阈值/预算设为 8,192，并捕获 target `[4,8,16]` token 图。
+`enforce_eager` 在此只约束 proposer，不改变 `RUN_MODE=graph` 的 target。
+若使用自建 `dp_serve_dsa.sh`，同步这些配置及移除旧的 DP MTP 禁用判断；
+不要移除 L3 gate。
+
+沿用显式路由客户端，生成 128 tokens 覆盖 40k/70k 的满块边界和后续 dump：
+
+```bash
+DSA_DP_API_BASE=http://127.0.0.1:8035/v1 DSA_DP_MAX_TOKENS=128 \
+python examples/dsa_demo/online_dp_prefix_test.py 2>&1 | tee dsa-dp2-mtp-prefix-client.log
+```
+
+仍是 16 请求、最大并发 4，`ignore_eos=True` 已在脚本内设置；无需改脚本。
+MTP 的热前缀会按 Eagle 边界回退一个满块。缓存足够时，对当前数据集通常
+可见 5k/8k/40k/70k 分别命中 4,736/7,552/41,472/73,344 tokens；实际验收
+仍以非零、块对齐及服务端 component 命中信息为准。
+
+```bash
+grep -E 'DSA prefix lookup|DSA prefix restore submitted|DSA MTP durable dump|DSA MTP idle proposer|DSA runtime idle dummy|Replaying aclgraph|ERROR|Traceback' \
+  dsa-dp2-mtp-prefix-server.log
+```
+
+期望两域均能完成请求并出现 MTP durable `postwrite`（prefill）和
+`prewrite`（decode 满块）完成日志；idle 时可见 target FULL/PAD 和
+`DSA MTP idle proposer: ... draft_steps=3 attention=none`。后者的
+`padded_tokens` 可因对端 prefill 很大，但 `dummy_reqs` 不超过本域上限。
+日志按签名去重，不代表每轮都打印；prefix 的非零 L2 restore 和 HBM-only
+回填仍需定向负载覆盖，不能用全 HBM 命中替代。
+
+### 单机 DP2 共享 Mooncake L3（P5）
+
+2026-09-09 启动保护修复和客户端配置整理后的回归再次通过，run ID 为
+`dsa-dp-l3-73180e6e945f4752b2c235ff67d4e833`：7请求各完成32 tokens，三次外部
+读取均先本地miss，再命中325 blocks/41,600 tokens，目标DP的4个TP均完成
+2,243,904,000 bytes读取及325块HBM恢复。两个DP的内容fingerprint一致，八个
+worker和两个scheduler的TCP身份互不重名。冷写的128+128+69块全部有
+`readable=True`与成功completion；同salt并发时本次DP1写入，DP0三批全key命中
+而跳过put。`store completed bytes=0`在这些记录中是去重，不是丢写。
+
+该附件含client摘要和过滤后的server日志，没有token/logprobs或精度断言失败，
+只能收口本轮P5功能回归，不能宣称模型精度通过，也不能据此归因为基线MoE。
+此前双40k并发的数值差异仍是独立待查项，不因本轮功能通过而消失。正常退出、
+压力/淘汰/故障注入及HBM-only回填仍不在本轮证据范围；不要求为这次正常反馈
+原样再跑同一组用例。后续P6-A实现与待验场景见专节，不能用本轮结果替代MTP验收。
+
+2026-09-08 已收到默认单40k、7请求的Graph闭环通过反馈：三次外部命中均有
+所在DP全部4TP的非零L3读取和325块HBM恢复，覆盖两个DP；同key并发请求中
+观察到一域先上传、另一域exists去重。此结果不包括精度、HBM-only回填、
+在途竞争失败重试、压力淘汰或退出生命周期验证，也不代表DP+MTP+L3已开放。
+
+首版为 `no-MTP + TCP + kv_both + Local prefix`，数据流保持
+`L3 -> 每 TP rank 的 L2 -> HBM`。各 DP 的 TP0 分别负责上传，所有 worker
+仍按配置贡献 segment；内容 key 不含 DP/rank，两个域可以读取同一份对象。
+
+共享L3要求在启动Python前，为所有参与进程设置同一个`PYTHONHASHSEED`十进制
+整数（0..4294967295）。`serve_dsa.sh`已有固定值114514，无需新增开关；自建
+启动脚本或离线入口需要显式设置，例如`export PYTHONHASHSEED=114514`。
+模型采样的`--seed`不能替代它：vLLM在该环境变量缺失时使用进程独立的随机
+首块哈希根，即使sha256也会产生不同prefix key。当前框架会拒绝缺失、空值或
+random模式，并比较seed的原字符串（例如1和01不能混用），不擅自改写哈希算法。
+这项限制只用于DSA DP共享L3，不改变纯Local prefix或DP1已有行为。
+
+沿用已验证的 Mooncake Master；若尚未启动，在另一终端运行：
+
+```bash
+bash examples/dsa_demo/L3_cache_sys_api_test/baseline_e2e/start_mooncake_master.sh
+```
+
+先验证框架与 backend UT，本轮无需重编算子或修改 Mooncake 源码：
+
+```bash
+python -m pytest tests/ut/dsa_offload -vv --tb=short
+python -m pytest tests/ut/distributed/ascend_store -vv --tb=short
+```
+
+只回归这两项启动保护时，可先执行不加载模型的UT：
+
+```bash
+python -m pytest tests/ut/dsa_offload/test_dp_context.py \
+  tests/ut/dsa_offload/test_config.py tests/ut/dsa_offload/test_kv_cache.py -q --tb=short
+```
+
+已有P5配置无需改推理参数或重编算子。同步Python代码后，下次有设备时按下方
+原配置重启一次vLLM并运行`online_dp_l3_test.py`，检查跨DP首读和local reset即可；
+Mooncake Master可保留，不必因这次启动保护修复重跑整套精度矩阵。
+
+随后使用更新后的启动脚本重启推理服务：
+
+```bash
+MODEL_PATH=/mnt/share/weights/GLM-5.2-w4a4c8-mxfp4 \
+SERVED_MODEL_NAME=glm-5.2-dsa PORT=8035 \
+RUN_MODE=graph ENABLE_A5_PACKED_C8_DSA=true \
+DATA_PARALLEL_SIZE=2 DATA_PARALLEL_SIZE_LOCAL=2 TENSOR_PARALLEL_SIZE=4 \
+MAX_NUM_SEQS=4 MAX_MODEL_LEN=131072 MAX_NUM_BATCHED_TOKENS=16384 \
+ENABLE_CHUNKED_PREFILL=true GPU_MEMORY_UTILIZATION=0.9 \
+DSA_INDEXER_MLA_BLOCK_RATIO=2 DSA_HOT_CPU_BLOCK_MULTIPLE=1.0 \
+ENABLE_PREFIX_CACHING=true ENABLE_MTP=false \
+ENABLE_L3_WRITE_BEHIND=true ENABLE_L3_PREFIX_LOADBACK=true \
+bash examples/dsa_demo/serve_dsa.sh 2>&1 | tee dsa-dp2-l3-server.log
+```
+
+脚本使用 `mooncake-dsa-tcp.json`，Master 默认 `127.0.0.1:50088`，每 worker
+贡献4 GiB，共32 GiB；此外每 worker 的 local buffer 为1 GiB。L2 预算会从
+各自 DP quota 中扣除本域 L3 segment/local buffer 预留。两个 Scheduler
+与所有 workers 必须使用相同 backend 配置；初始化签名现在也比较这些字段。
+
+默认 TCP segment 身份为 workers `host:45000..45007`、两个 Scheduler
+`host:55000/55001`。这些是 Store 身份，不应与实际 TE RPC 监听端口混淆。
+在同一 Master/host 上并行部署另一服务时，要为它另设
+`MOONCAKE_TCP_SEGMENT_PORT_BASE`，避免两套服务重名。
+
+先用默认单40k，运行7个请求：
+
+```bash
+DSA_DP_API_BASE=http://127.0.0.1:8035/v1 DSA_DP_MAX_TOKENS=32 \
+python examples/dsa_demo/online_dp_l3_test.py 2>&1 | tee dsa-dp2-l3-client.log
+```
+
+流程依次为 DP0 冷写、DP1 首次跨域读取、DP1 本地重放、清两域本地后由
+DP0 读回、两域同 salt 并发请求、再清本地后由 DP1 读回。默认给每批异步
+上传10秒窗口，可用 `DSA_DP_L3_STORE_WAIT_SECONDS` 调整；等待本身不是 IO
+成功证明，热命中断言与服务端日志才是验收依据。不自动重试请求，避免首次
+失败后的本地缓存掩盖 L3 问题。响应逐条保存到 `results/dp_l3/<run-id>.jsonl`。
+
+测试服务需无其他流量，因为 local reset 会影响整个服务。脚本只调用
+`reset_external=false`，保留 L3 对象；P6-B另开放在线全域协调的`reset_external=true`，
+原始Connector/离线单域调用仍于本地修改前拒绝。每次脚本运行
+使用新 salt，会增加新的测试对象，由后端自己淘汰；不是相同 key 被重复扩容。
+
+服务端应能明确看到：
+
+```bash
+grep -E 'DSA prefix tiers|Store-owned TCP|DSA L3 (prefix lookup|load|store)|DSA prefix lookup|DSA prefix restore|DSA runtime idle|ERROR|Traceback' \
+  dsa-dp2-l3-server.log
+```
+
+跨域首次读取与 reset 后读回应为 local L1/L2 miss、L3 hit，命中域的四个
+TP worker 均有非零 `load completed ... destination=l2`，随后非零
+`prefix restore submitted`。这样才能补上 DP 实机 L2->HBM restore 的证据。
+普通 local-replay 仍可 `blocks=0`。同 key 请求的实际 put 是否重叠取决于调度，
+该阶段允许被对侧先完成的上传命中；在途竞争由框架 UT 的受控事件测试补充。
+
+并发 put 的零返回值不再直接等同于 ready：adapter 会再次检查全部组件可读。
+尚未确认时回报 `success=False, retryable=True`，Scheduler 不保留 ready 提示，
+活跃请求可重新扫描，后续同前缀请求也能重试。该状态打印 warning；实际 get
+失败仍按 fail policy 终止，不静默重算。日志里的 put `bytes` 是成功调用提交的
+payload 大小，重复 key 场景不能用它精确计算实际网络流量。
+
+正常停止服务时，应等待各 EngineCore 的模型与 IO 工作排空；新增退出协调
+使用已有 DP Store 公布本地 drain，再用已有 Gloo DP group 做一次退出 barrier，
+本域 drain 后也屏蔽迟到的 START_DP_WAVE，之后才释放任何 embedded segment。
+该协调不进入每轮 forward；强制 kill 或
+超过基线 shutdown timeout 不提供 graceful drain 保证。不要在同一服务里
+单独提前结束某个 DP 实例。
+
+### P5 受控精度对照与容量输出
+
+2026-09-08默认DP0/40k/64tokens的7请求实机反馈已通过：7组比较的全部64个
+输出token以及返回top-k候选集合/概率均一致，最大可见logprob差值为0；
+两次external均确认四TP实际非零L3->L2->HBM。本轮也观察到容量报告按整段
+输出。此结论不覆盖冷算与热复用等价，也不覆盖两个DP同时处理真实请求的精度。
+
+先在P5已有服务上做小范围精度门禁，再叠加P6的DP+MTP+L3，不等所有适配
+完成才比较精度。当前测试是输出一致性与定位入口，不替代模型质量评测。
+
+沿用上一节的 `DP2/TP4/EP8 + Graph + no-MTP + Local prefix + Mooncake TCP kv_both`。
+新客户端可直接连接当前服务，无需为了精度测试重启或重编算子：
+
+```bash
+DSA_DP_API_BASE=http://127.0.0.1:8035/v1 \
+DSA_DP_ACCURACY_RANKS=0 DSA_DP_ACCURACY_LABELS=40k DSA_DP_MAX_TOKENS=64 \
+python examples/dsa_demo/online_dp_l3_accuracy_test.py 2>&1 | tee dsa-dp2-l3-accuracy-client.log
+```
+
+默认7请求全部串行固定路由到DP0，DP1只陪跑；不得混入其他用户流量。
+输入文本不加前缀，同组使用同一salt、固定seed1024、temperature0，生成64tokens，
+ignore_eos=true并请求top5 logprobs。64tokens也会越过这条40k输入的尾块边界。
+要在同服务上验证另一个DP，将 `DSA_DP_ACCURACY_RANKS=1`；`0,1` 表示两个域
+各做一组，共14请求，仍然串行，不是跨域同时请求。
+
+| 阶段 | 请求数 | 用途 |
+|---|---:|---|
+| seed | 1 | 冷算与写缓存，只留档，不作为热路径精度参考 |
+| local-0 / local-1 | 2 | 同一DP本地热复用的自身稳定性 |
+| external-0 / post-local-0 | 2 | 清两域本地后L3读回，再在本域热重放 |
+| external-1 / post-local-1 | 2 | 再次清本地后重复上一对，检查读回自身稳定性 |
+
+每次reset前给write-behind默认10秒窗口（`DSA_DP_L3_STORE_WAIT_SECONDS`）；
+等待不等于IO成功，仍需服务端证据。命中长度不同会标为`incomparable`，
+而不是把不同计算条件下的结果误判为新精度问题。token/logprobs缺失、非有限值
+会标为无效证据或直接失败，不能用空token列表获得假PASS。
+
+同一请求条件下分别比较local-repeat、external-repeat、本地与external、以及
+external后的本地再重放。任一token不同，脚本以非零退出并保存完整比较结果；
+若local-repeat自己就不稳定，不能直接归因于L3。若自身稳定但跨路径不同，
+则保留为待查缓存/计算路径差异，不能直接归因为硬件，也不靠放宽断言收口。
+
+logprobs仅比较共同生成历史及首个分歧位置，不把分叉后不同历史上的概率继续
+相减。`max_shared_topk_logprob_delta`只覆盖共同候选，候选集合变化另列；
+`first_logprob_drift`用1e-6定位首个可见漂移，不是量化模型精度验收阈值。
+`PASSED token replay consistency`只表示这组输出token一致，logprobs漂移仍需查看，
+不宣称KV逐字节一致或全模型精度通过。
+
+完整响应含token/logprobs、request ID、采样配置、prompt摘要、命中及耗时，逐条
+保存到 `results/dp_accuracy/<run-id>.jsonl`；汇总为同名 `.summary.json`。
+可用 `DSA_DP_ACCURACY_RESULT_DIR` 指向其他持久目录。比较在HTTP客户端关闭后
+进行，避免断言触发时留下异步连接清理噪声。重复分析无需再跑推理：
+
+```bash
+python examples/dsa_demo/online_dp_l3_accuracy_test.py \
+  --analyze examples/dsa_demo/results/dp_accuracy/<run-id>.jsonl
+```
+
+服务端仍需按本次run ID对应确认：local阶段是本地命中，external阶段是
+local miss + L3 hit，并有本域4TP非零get和restore。客户端usage本身不能区分
+HBM、L2和L3；本地参考可能直接复用HBM，不应称为纯L2 restore参考。
+优先反馈本次client日志与summary，只有出现差异时再提供相应request的server片段。
+
+#### 双域同时真实请求的精度对照
+
+2026-09-08已验证DP0/DP1分别串行40k，以及同服务的8k/70k并发对照。
+双40k在原生MoE自动选择下仍有已知精度差异，调查已收敛到首decode与对侧
+prefill同轮时的执行路径差别，尚未确认数值根因。历史实验结果不改变当前
+精度断言；以下脚本保留为回归与问题反馈入口，不表示该组合精度已经验收通过。
+详细实验矩阵见下方调查记录链接，不要求每次代码清理都重复整套测试。
+
+受控串行门禁通过后，使用新增的 `--concurrent-pair`，不要把
+`DSA_DP_ACCURACY_RANKS=0,1` 的串行两组当作并发。该参数左侧固定发给DP0，
+右侧固定发给DP1；此模式不使用串行模式的RANKS/LABELS环境变量选择请求。
+同一P5服务可直接继续，无需重启、修改server或重编算子；仍然关闭MTP。
+
+首组为DP0和DP1各一个40k，生成64 tokens：
+
+```bash
+DSA_DP_API_BASE=http://127.0.0.1:8035/v1 DSA_DP_MAX_TOKENS=64 \
+python examples/dsa_demo/online_dp_l3_accuracy_test.py \
+  --concurrent-pair 40k,40k 2>&1 | tee dsa-dp2-concurrent-40k-client.log
+```
+
+一组共7轮、14请求：seed、local-0、local-1、external-0、post-local-0、
+external-1、post-local-1。每轮两个任务先在客户端会合再一起开始RPC，只有
+两个请求都返回后才进入下一轮。两次external之前全服务local-only reset，
+保留L3；等待write-behind窗口仍为10秒。不得混入其他真实流量。
+
+请求保持原prompt、temperature0、seed1024、ignore_eos=true、top5 logprobs。
+每个DP在同一scenario内复用自己的salt；两个DP的salt不同，有意先隔离
+同key并发写竞争，而不是修改生产框架的key schema。同key竞争功能已有P5
+独立测试，跨DP producer内容等价仍属后续单项。
+
+每个DP独立做7组精度比较，不把DP0输出当成DP1的标杆；冷seed不与热输出
+比较。并发组合、路由、prompt摘要、采样条件和cached长度必须一致。
+本地重复自身不稳定、external重复不稳定、跨缓存路径不同分别保留原始证据，
+不因为“并发可能不确定”而自动跳过差异或放宽断言。
+
+JSONL增加execution_mode、scenario、batch_members、batch_signature、batch_id
+以及本次运行内的单调时钟起止时间。离线分析还检查每轮恰有DP0/DP1各一条，
+并输出 `client_overlap_ms`、`start_skew_ms`；缺一个域、没有在途重叠或请求
+失败都会使门禁不通过。一边异常时仍等待另一边完成并保存响应，之后才报错，
+不取消同伴或提前reset掩盖现场。旧串行JSONL继续支持 `--analyze`。
+
+**重叠证据的边界**：client overlap只证明RPC在途窗口重叠，可能含排队/IO；
+不能证明逐个forward的batch/EP token数完全相同。因此报告保留
+`server_batch_alignment_verified=false`，这不是失败，而是明确未自动验证。
+必须结合两个EngineCore同轮阶段的request ID、lookup、load、restore及完成
+日志判断覆盖范围；即便请求集相同，服务端动态调度也可能不同。若token有
+差异，先核对调度和路径，不直接判为L3数据损坏或硬件误差。
+
+第一组通过后，可在同一服务验证长短不均衡：
+
+```bash
+DSA_DP_API_BASE=http://127.0.0.1:8035/v1 DSA_DP_MAX_TOKENS=64 \
+python examples/dsa_demo/online_dp_l3_accuracy_test.py \
+  --concurrent-pair 8k,70k 2>&1 | tee dsa-dp2-concurrent-asymmetric-client.log
+```
+
+也可重复传参，如 `--concurrent-pair 5k,70k --concurrent-pair 8k,40k`。
+两组scenario顺序执行，各自14请求，salt及比较结果互相隔离；仍为每域同时
+一个真实请求，不宣称覆盖每域多请求混合batch。完整响应与summary仍在
+`results/dp_accuracy`，反馈本次client及对应server关键日志即可，不必重跑
+已通过的单域串行测试。本节记录的是无MTP的P5精度调查；P6-A需另按专节验证。
+
+#### 已知精度问题与清理边界
+
+双40k并发在原生MoE自动选择下出现过热路径差异；全eager仍复现，
+历史固定ALLGATHER实验在有效P/D覆盖下通过。尚未在不启用DSA的干净基线
+中复现相同条件，也未获得同输入模块对照，不能写成已确认的纯基线bug。
+
+本次清理撤掉运行时dp_execution trace、强制ALLGATHER和BF16 dispatch消融，
+保留P0–P5实现及上述精度客户端，不放宽断言。普通服务恢复基线自动MoE选择，
+已知差异仍可能出现。当时清理没有开放P6；后续P6-A的代码接入不等于已解决该数值问题。
+
+详细调查记录仅在维护者本地保留，不作为仓库文档或测试依赖。
+
+运行时trace、两个MoE消融、专用启动入口，以及只服务于这些历史日志的解析器
+和专属测试均已退出仓库。不要再使用旧诊断配置。原有`first_sample`配置不属于
+此次删除范围。既有JSONL、summary和原始日志应保留；不必为清理重跑精度矩阵。
+
+当前DP测试入口分工如下，不依赖被删的诊断模块：
+
+| 脚本 | 保留用途 |
+|---|---|
+| `online_dp_foundation_test.py` | P0-P2无prefix/MTP/L3的路由、mixed和idle陪跑冒烟 |
+| `online_dp_prefix_test.py` | P3/P4各域Local prefix、非对称负载及idle重入 |
+| `online_dp_l3_test.py` | P5跨域L3首读、local reset及同key并发写入 |
+| `online_dp_l3_accuracy_test.py` | 串行/并发热路径比较及已有JSONL离线分析；不放宽已知差异的判据 |
+
+上述客户端共用foundation的数据/连接辅助函数及prefix的usage检查，应同步同一
+版本的相关脚本。它们仍需服务和`novel_dataset.py`；缺少部署依赖不表示脚本失效。
+对应`tests/examples/dsa_demo`保留客户端与Mooncake探针的纯脚本自测，不导入它们
+到框架UT，也不复制被测实现。DP配置、预算、dummy、控制面及缓存生命周期UT保留。
+
+#### 容量报告互斥
+
+容量日志也已调整：同机、同用户、共享临时目录的DP EngineCore使用同一把
+`filelock`文件锁，完整HBM/DRAM报告输出后释放，DP1仍独立打印。v0.23的进程
+前缀装饰会把多行日志拆成多次write，这正是此前报告穿插的原因。新锁仅包住
+报告，既不增加DP collective，也不改变容量计算或forward。它不规定DP0必须
+先打印，也不锁住其他模块的日志；自定义异步日志聚合器不在这层保证范围内。
+锁文件无法打开或5秒内未取得时告警并降级输出，避免为日志互斥卡住引擎启动。
+使用的是vLLM已有filelock依赖，不需新装NPU包。该打印改动下次重启生效，
+无需单独占用一次服务拉起来验证。
+
+本轮最小UT：
+
+```bash
+python -m pytest tests/ut/dsa_offload/test_kv_cache.py -vv --tb=short
+python -m pytest tests/examples/dsa_demo -q
+```
+
+### 框架 UT 与示例自测
+
+`tests/ut/dsa_offload` 不再导入 `examples/dsa_demo`。在线客户端的响应断言
+自测和 Mooncake 探针的布局/角色自测已移到 `tests/examples/dsa_demo`，
+它们验证示例脚本本身，按需独立执行，不需要模型服务或真实 L3 后端：
+
+```bash
+python -m pytest tests/examples/dsa_demo -q
+```
+
+框架 UT 与示例自测分开维护，不把示例配置逻辑迁入运行时模块来满足测试依赖。
+
+这组是开发测试工具的自测，不是每轮服务器DSA回归的必跑门禁，也不能用其
+通过数量宣称框架或模型精度通过。修改在线测试脚本/探针时由开发侧运行即可。
+它有意调用仓库中真实examples脚本，而不是在测试里复制被测函数；请求、
+响应和后端等测试替身可在测试内构造，生产框架UT仍不得依赖examples。
+运行需要完整checkout及Python的pytest/openai/httpx，不需要novel_dataset、
+模型权重、NPU或Mooncake native包。不要只复制tests目录后期望它能测不存在的脚本。
+Mooncake探针现在按测试文件推导出的绝对路径加载，不再依赖当前工作目录中的
+`examples`包；从项目外也可以用测试目录的绝对路径执行pytest。
+
+### P6-A：单机 DP2 MTP 共享 L3
+
+2026-09-09代码接入，单40k/128输出tokens/7请求及8k/70k长短并发/8请求的
+A5功能闭环均已收到通过反馈；后者也补齐了两个DP实际Graph replay证据。
+保留P4的固定MTP3、proposer eager、
+target/draft同TP，以及P5的每域TP0异步上传、目标域全部TP同步读回、
+L3->L2->HBM和fail-fast。没有新增全局phase scheduler或每轮DP collective，
+不改LIDU/LIM/KSC算子、真实forward/MoE算法或量化路径。
+
+本次run ID为`dsa-dp-l3-cc1773a4df22418b9dc5d28ac0c98e3c`：两域`mtp=True`且
+fingerprint一致，热命中41472 tokens；三次外部回载均读取324 blocks、972 keys，
+每个目标TP读取2,295,392,256 bytes，随后四TP全部恢复78 target layers和1 MTP层。
+每块7,084,544 bytes包含180,224 bytes MTP，123 descriptors包含3个MTP plane。
+两域四TP均有postwrite/prewrite完成记录；16个已提交store任务全部有成功回报，
+其中11个非零、5个全key命中去重，上传只出现在各域TP0。
+
+local-replay中的`local_blocks=324, hit_blocks=1, effective_blocks=0`符合MTP
+最后一个完整块保留重算的规则，并未再丢掉一个本地块。并发prompt写入观察到
+DP0先完成、DP1去重；这不替代真正重叠在途put冲突和失败重试的实测。
+附件是过滤日志，不含token/logprobs、容量报告和target capture/replay标记，
+不据此宣布数值等价、Graph逐轮覆盖或完整P6完成；该轮未覆盖P6-B。本轮没有发现
+需要修改运行时的新故障。随后长短并发补测的结果见下节；仍不据此宣称完整P6已验收。
+
+本阶段补强了以下组合边界：
+
+- MTP模型路径、revision、配置hash及投机宽度纳入DP启动签名和MTP L3 schema，
+  不含具体DP/rank。无MTP的L3 schema不变；旧MTP namespace内容不再误复用，
+  对象由Mooncake自行淘汰，不需要手工清池或重启Master。
+- proposer dummy的独立ForwardContext继续携带`skip_kv_transfer`，connector
+  对显式dummy误入生命周期直接报错，不允许它放行真实任务。
+- 真实target forward只暂存MTP store计划；本域proposer完成durable copy、
+  runtime校验通过后，仍经既有`wait_for_save()`记录event并放行TP0后台上传。
+- UT覆盖三组件的跨域同key竞争、MTP组件尚不可读的假成功、只补写缺失组件、
+  短读/同TP组失败、不完整bundle miss、两域不同L2长度时的一次Eagle回退。
+  这些是CPU控制面/字节替身测试，不代替真实NPU吞吐、精度或通信验证。
+
+先同步代码并跑UT，本轮没有修改自定义算子，不需要重新编译csrc：
+
+```bash
+python -m pytest tests/ut/dsa_offload -vv --tb=short
+python -m pytest tests/ut/spec_decode/test_llm_base_proposer.py -vv --tb=short
+```
+
+沿用P5的Mooncake Master，正常停止旧vLLM服务后启动；所有命令从项目根目录执行：
+
+```bash
+MODEL_PATH=/mnt/share/weights/GLM-5.2-w4a4c8-mxfp4 \
+bash examples/dsa_demo/serve_dp_mtp_l3.sh 2>&1 | tee dsa-p6a-server.log
+```
+
+该入口只设置阶段默认值并调用`serve_dsa.sh`，不复制vLLM参数拼装：DP2/TP4/EP8、
+八卡可见、target Graph、MTP3 proposer eager、prefix/L3写读开启、direct-HBM关闭。
+maxseq=4、maxlen=131072、chunked prefill=16384、HBM比例2、L2倍数1.0、
+gpu_memory_utilization=0.9，API为8035，模型名glm-5.2-dsa。模型路径可覆盖，
+`RUN_MODE=eager`可切eager对照；TP/DP和阶段开关在此入口固定。
+
+服务就绪且没有其他流量后：
+
+```bash
+DSA_DP_API_BASE=http://127.0.0.1:8035/v1 \
+DSA_DP_L3_LABELS=40k DSA_DP_MAX_TOKENS=128 \
+python examples/dsa_demo/online_dp_l3_test.py --mtp 2>&1 | tee dsa-p6a-client.log
+```
+
+仍是7个请求，固定ignore_eos=True；32/64/128等生成长度由已有环境变量控制，
+`--mtp`不暗改长度。该选项检查完整热前缀一次末块回退：当前40k条目输入41672
+tokens时，应为41472 cached tokens（324块），而非无MTP的41600（325块）。
+通过marker、容量报告和服务端日志确认实际MTP已开启，不只凭客户端cached长度。
+
+```bash
+grep -E 'DSA prefix tiers|DSA MTP (durable|L3|idle)|DSA L3 (prefix|store|load)|DSA prefix restore|ERROR|Traceback' \
+  dsa-p6a-server.log > dsa-p6a-server-key.log
+```
+
+本轮至少检查：两域初始化`mtp=True`且fingerprint相同；各域TP0的store先staged、
+再released after proposer completion；MTP `postwrite`及跨满块`prewrite`均完成。
+外部load应有三component keys（324块对应972 keys），命中域四个TP非零读取后
+恢复target与MTP，`mtp_layers=1`（当前GLM模型）。local重放可零restore。
+同key竞争允许先完成者去重；不可读时必须重试/报错，不能假成功。
+
+先反馈client和server-key即可，不要求同时扩成40k/40k精度矩阵。功能通过后，
+再追加混合长度/不同接受率和同缓存路径数值对照；已有AUTO MoE差异继续单列。
+P6-B的在线管理协议与待验场景见下节；P6-A功能测试仍要求无其他流量。
+正常退出沿用P5 drain保护，强杀不保证数据保留。
+
+#### P6-A 长短不均衡补测（沿用当前服务）
+
+2026-09-09已通过：run ID为`dsa-dp-l3-2fd870ac772441f983420a32570578de`，
+服务重启后参数按原P6-A保持，8请求均完成128 tokens。8k/70k热命中为
+7552/73344 tokens；交换域和local reset后的4个外部请求各有4TP非零读取，
+分别为59块/177 keys/417,988,096 bytes与573块/1719 keys/4,059,443,712 bytes。
+16条TP load完成后均恢复78 target layers+1 MTP layer；本地重放8条restore为0。
+14个store提交均成功完成（11非零、3全key去重），没有本轮可见的漏回报或错误。
+两域四TP都有postwrite/prewrite记录，decode新增满块分别为物理块61和575；
+11:23:05两个DP的TP0均打印`Replaying aclgraph`，两域均有FULL/PAD idle记录。
+
+该结果补齐长短角色交换、实际Graph执行及三组件回载的功能证据，不提供每轮
+执行签名、设备canary或token/logprobs对照。短请求与长请求响应时间接近不能
+作为IO失败的证据：cross-load时8k于11:23:20完成get，而70k于11:23:23完成，
+两域后续staged记录同在11:23:23，与共享EP耦合相容，但未采集性能分解。
+P6-A已验证主路径可阶段性收口，下一步进入P6-B；数值、故障/压力/长稳和
+完整管理生命周期仍独立待验。本次评估只更新文档，不修改运行时代码或要求原样复测。
+
+单40k/128 tokens闭环后，先补一组8k/70k，再进入P6-B。仅更新客户端及其
+prefix/foundation辅助脚本，不修改服务器配置或框架，不需重启服务/Master。
+保持原P6-A的MTP3、Graph和L3配置，无其他流量；本轮不是严格精度测试。
+
+```bash
+DSA_DP_API_BASE=http://127.0.0.1:8035/v1 DSA_DP_MAX_TOKENS=128 \
+python examples/dsa_demo/online_dp_l3_test.py --mtp --concurrent-pair 8k,70k \
+  2>&1 | tee dsa-p6a-pair-client.log
+```
+
+| 阶段 | DP0 | DP1 | 预期来源 |
+|---|---|---|---|
+| pair0-seed | 8k | 70k | 各自新salt冷算并写L3 |
+| pair0-cross-load | 70k | 8k | 交换来源，两个域都必须首次从共享L3取对应前缀 |
+| pair0-local-replay | 70k | 8k | 当前域本地热复用 |
+| pair0-reset-load | 8k | 70k | 清两个域本地后，两个域都从L3取回 |
+
+共8请求，每轮并发发起2请求，等两者都结束后再推进下一阶段。seed后、reset前
+均保留10秒write-behind窗口；一侧失败会等另一侧返回再报错，不重试、不继续reset。
+两份来源的salt各自固定并跨域复用；即使指定40k/40k也不会被两个域都已持有同salt
+的HBM命中掩盖外部读取。`--concurrent-pair`可重复使用，各组顺序执行、salt隔离。
+
+MTP阈值为8192：当前8k条目实际7752 tokens，生成128后仍在dense范围；70k为
+73496 tokens，覆盖长prefill和sparse decode。交换角色覆盖两域的长/短路径。
+热命中应分别为7552/73344 tokens（59/573块），每次外部读取预期177/1719 keys，
+命中域4TP均有对应非零load与`mtp_layers=1`恢复。合计4个外部请求的16条TP完成
+记录；本地重放可restore=0。响应、request ID和实际cache_salt保存在本轮JSONL。
+
+客户端并发RPC不保证server逐forward对齐。结合server日志确认真实load、restore、
+MTP dump以及模式转换，不把client耗时相近当作逐轮同步或数值等价证明。
+`DSA_DP_L3_LABELS=8k,70k`仍是逐标签执行旧7请求流程，不能代替此长短并发场景。
+
+保留现有服务日志，不要清空正在写入的文件。若日志文件为`dp_for_mtp.log`，可在
+运行client前记录`START_LINE=$(wc -l < dp_for_mtp.log)`，client结束后提取增量：
+
+```bash
+tail -n +"$((START_LINE + 1))" dp_for_mtp.log | \
+  grep -E 'DSA MTP (durable|L3|idle)|DSA L3 (prefix|store|load)|DSA prefix restore|DSA runtime idle|Replaying aclgraph|ERROR|Traceback' \
+  > dsa-p6a-pair-server-key.log
+```
+
+已有去重日志可能不重复打印，尤其MTP prewrite/postwrite和首个Graph replay。
+可另附旧日志中的模式/初始化标记，不因本轮未重打印而判断能力失效，也不需要
+为重打这些日志重启服务。反馈client和增量server-key即可。
+
+### P6-B：在线全域缓存管理（正常主路径已验证）
+
+首版代码、CPU控制面验证及A5正常八请求管理流程已完成，后续九请求补测也覆盖了
+预先pause且有请求排队时的reset/resume；具体证据见下文验收记录。故障/长稳与退出仍单列。
+只支持现有单机mp/internal-DP部署，不新增线程/通信组，不改变MoE与缓存数据格式。
+使用已有DP TCPStore的compare_set，在多个API前端之间持有同一管理owner锁。
+
+`POST /reset_prefix_cache?reset_external=false|true`统一执行：
+
+```text
+获取全部署管理锁 -> pause(wait, clear_cache=False)
+ -> 所有域运行请求和connector任务排空
+ -> 全域PREPARE只读检查 -> COMMIT清本地hash/未分配候选
+ -> external=true时使用同一UUID epoch切换L3 namespace
+ -> 确认所有commit结果/fingerprint一致 -> 恢复原先运行的部署 -> 释放锁
+```
+
+基线PAUSED_NEW会保留waiting请求，新请求也可入队，但不admit；已有running请求
+继续执行。DSA waiting-prefill gate现在尊重此状态，避免排队prefill反过来阻塞
+decode排空。EngineCore.has_work包含DSA pending IO，pause Future全部完成后再
+预检各物理池只剩null-block引用，且没有待消费的restore/load计划。queued请求
+本身不删除，恢复后重新查询cache；已经paused的部署reset后仍保持paused。
+
+边界与失败规则：
+
+- HTTP成功表示所有域都确认，而不是仅取第一个结果。并发管理请求在修改前拒绝，
+  不同时启动两轮pause/reset。状态查询也汇总所有域。
+- 暂停开始后的超时、部分失败或不确定结果保持owner锁并标记fail-closed，禁止
+  继续管理/resume；需要正常停止并重启全部DP。已排队请求可能等待到重启；不承诺
+  故障时保住这些请求。新请求在已收到fatal通知的EngineCore中直接返回失败。
+- 管理owner不设自动过期。前端进程失联/网络故障时不由另一个前端自动接手。
+  通知也可能失败，因此不承诺所有进程在故障瞬间同步停下或恢复。
+- HTTP调用方取消等待不会取消已开始的后台管理任务；该任务由原API客户端对象
+  保持引用。API进程整体退出则不保证完成，不允许把HTTP取消视为回滚。
+- pause等待超时复用服务shutdown_timeout（未设置则300秒，至少30秒）；其他
+  utility阶段前端等待上限30秒。超时不等于服务器动作已停止，不可盲目重试。
+- external reset只是本部署逻辑失效，旧Mooncake对象仍占空间直到后端淘汰；
+  不影响其他部署的namespace，也不是物理清池。重启后的namespace持久化不在本版。
+- 手工`/pause`仅允许`mode=wait&clear_cache=false`，`/resume`恢复，`/is_paused`
+  汇总状态。keep/abort、pause自动清缓存、sleep/wake、reset_running_requests=true
+  暂拒绝；不要拿未适配的RLHF/sleep路径绕过管理协议。
+- `reset_mm_cache`和`reset_encoder_cache`继续走原生utility，不参与DSA管理事务。
+  v0.23的API启动会自动调用前者清理dummy多模态缓存，即使当前部署是纯文本模型；
+  不能把它当成L1/L2/L3 prefix reset拦截，否则API服务在就绪前就会退出。
+- DP1原有行为不变；启用DSAL3的offline SPMD单域external reset仍拒绝，不把在线协议误用于它。
+
+`dp_admin.py`是EngineCore参与者，`dp_control.py`是API协调端，注册仍在
+`patch_dsa_data_parallel.py`。正常退出保留P5的全域drain/最后barrier再释放segment。
+管理/paused期间退出不自动resume；未admit请求可能被终止，强杀不保证排空。
+
+#### P6-B验收记录（2026-09-09）
+
+运行`dsa-dp-admin-08506ef24e1c4d88a1bad02c8163b1a3`已通过正常管理主闭环，
+8个40k请求均完成128输出tokens，无client断言或所提供server关键日志中的失败。
+
+- 首次local reset并非空闲演示：07:25:56 DP1报告`running=1 l3_pending=True`；
+  07:26:01最后store完成，07:26:03两域才prepare/commit并resume。
+- 3次reset均有两域prepare/commit/resume及API完成记录。首次local reset保留
+  指纹`8ed58c365f5de72bb466fa9965da41f2`；external reset两域统一切换至
+  `8be1c295fa8ea9ac60ec63bdd5d195d0`；第二次local reset仍保持新指纹。
+  管理请求分别由ApiServer_0/1处理，均成功，但不是并发管理竞争的实机证据。
+- 两个不同salt在external reset后分别于DP0/DP1得到`cached_tokens=0`；
+  新epoch数据随后可双向跨域命中41472 tokens，没有只有一域切换的迹象。
+- `local-reset-load`、`new-epoch-cross-a/b`及`queued-while-paused`共4次回读，
+  各有目标域TP0-3完整get/完成记录：每rank 324块、972 keys、2295392256 bytes，
+  随后`target_layers=78 mtp_layers=1` restore。不是仅依靠HTTP命中数或时延判断IO。
+- 以`(DP rank, job ID)`匹配，23个planned/submitted/completed任务全部闭合；
+  19次非零put并确认`readable=True`，4次`hit all keys`去重对应`bytes=0`成功完成。
+- 手工pause后，client检查`is_paused=True`且排队任务未完成；resume后该请求完成。
+  server中此请求的lookup/get位于resume日志之后。精确排队到达时刻未单独采样。
+
+结论仅覆盖上述正常管理、在途排空及数据恢复。数值精度、故障/超时/HTTP取消、
+并发管理竞争、预先暂停时reset、暂停期间退出和长稳不由此宣称实机通过。
+过滤日志未保留Graph模式信息，不据此新增逐轮Graph覆盖结论。无需原样重复此组。
+
+同步Python代码后需重启一次vLLM（不能只换client），无需重编C++或重启Master。
+继续使用P6-A的DP2/TP4、MTP3、Graph和L3参数：
+
+```bash
+python -m pytest tests/ut/dsa_offload -vv --tb=short
+MODEL_PATH=/mnt/share/weights/GLM-5.2-w4a4c8-mxfp4 \
+bash examples/dsa_demo/serve_dp_mtp_l3.sh 2>&1 | tee dsa-p6b-server.log
+```
+
+以下保留原八请求验证方式：先在`online_dp_cache_admin_test.py`顶部设置
+`PAUSED_RESET=False`、`LEAVE_PAUSED=False`，API_BASE/模型名/API_KEY也在该文件中修改。
+服务就绪后，在无其他业务流量的测试服务上：
+
+```bash
+python examples/dsa_demo/online_dp_cache_admin_test.py 2>&1 | tee dsa-p6b-client.log
+```
+
+共8请求、两个独立salt：分别在DP0/1冷写，local reset后跨域读旧内容；external
+reset后两域分别必须冷算，再清本地并交叉读取新namespace。最后手工pause、
+发送一个排队请求、确认未完成，再resume让它返回。首轮local reset尝试与第二个
+seed请求重叠，0.5秒只用于触发机会，不是排空依据；看pause日志running/l3_pending
+判断是否实际命中在途状态。控制面UT另外用受控Future覆盖pending IO。
+
+```bash
+grep -E 'DSA DP cache admin|DSA L3 namespace reset|DSA L3 (prefix|load|store)|DSA prefix restore|ERROR|Traceback' \
+  dsa-p6b-server.log > dsa-p6b-server-key.log
+```
+
+关注每个operation两域均prepared/committed，external=true的fingerprint一致且
+变化，local-only时不变，resume在全部commit之后；client期望`PASSED requests=8`。
+这是管理/IO功能验证，不宣称数值精度通过。遇到fail-closed停止测试并反馈日志，
+不要继续手动resume。正常完成后可在结束测试时正常停止服务，附退出摘要检查
+各域inflight_jobs=0及worker退出；无需为关服验证另外重拉一轮模型。
+
+### 单机DP收尾回归
+
+限定A5单机DP2/TP4/EP8、GLM-5.2 W4A4C8、Mooncake TCP及固定MTP3/proposer eager，
+P0-P6正常功能主路径已有在线/离线验证。完整精度、故障/长稳及干净退出不据此宣称通过。
+实现与已知限制见总设计16.6节；本节只保留当前可执行的回归入口，不重扫历史调试轮次。
+
+`cc328ec9`收口确认：用户已反馈UT及最新离线三轮正常完成。限定单机DP正常功能
+阶段性闭环，以下命令保留供后续改动回归，不要求为本次文档更新再次运行。
+
+**后续代码改动的回归入口：UT与示例自测。**
+
+在vllm-ascend项目根目录运行：
+
+```bash
+set -o pipefail
+python -m pytest tests/ut/dsa_offload tests/examples/dsa_demo -vv --tb=short 2>&1 | tee dp_closeout_ut.log
+```
+
+需要同步项目代码和`examples/dsa_demo`内相关脚本。框架UT不依赖示例；
+`tests/examples/dsa_demo`测试的是示例本身，故需要对应脚本，二者职责不同。
+本次只清理诊断/示例/文档，没有修改生产框架或算子，不需要编译算子、重启在线服务
+或再次申请八卡跑同一矩阵。反馈最后的pytest汇总；有失败时带完整失败栈。
+
+**离线推理：后续设备空闲时的可选回归，不是本次清理的强制门禁。**
+
+`offline_dp_closeout_test.py`顶部已经预置：
+
+| 设置 | 默认值 |
+|---|---|
+| 模型 | `/mnt/share/weights/GLM-5.2-w4a4c8-mxfp4`，按机器实际路径修改 |
+| 拓扑 | 单机八卡，DP2/TP4/EP8 |
+| 执行 | target Graph，固定MTP3/proposer eager，同步调度 |
+| 缓存 | L1/L2 prefix + Mooncake TCP L3，direct-HBM关闭 |
+| 输入/输出 | 8k/40k，128输出tokens，固定ignore_eos=True |
+| 容量 | 每域max_num_seqs=2，max_model_len=100000，chunk=8192，ratio=2，L2 multiple=1.0 |
+| L3容量 | 每worker贡献4GB，合计32GB |
+
+Master仍需手动启动；在线服务和离线任务不能占用同一组卡或复用冲突的segment端口。
+推理脚本可按习惯放在draft等目录，只需它、可导入的`novel_dataset.py`和顶部指定的
+Mooncake配置文件。它不导入其他推理demo的配置。在实际脚本目录运行：
+
+```bash
+set -o pipefail
+python -u offline_dp_closeout_test.py 2>&1 | tee dp_offline_closeout.log
+```
+
+脚本先检查模型/依赖/Master监听，加载后核对真实DP/TP、MTP、connector与namespace。
+随后两域分别cold、local、清本地后交换域读取，共6请求；冷算cached=0，本地/跨域
+命中8k=7552、40k=41472（当前数据集和MTP3配置）。跨域读取需目标域所有TP非零get，
+随后restore 78 target layers和1 MTP层。完整四长度矩阵可把`PROMPT_LABELS`改回
+`("5k", "8k", "40k", "70k")`，该12请求矩阵已有实机记录，不要求本轮再跑。
+`CHECK_ONLY=True`只做启动前检查并保存参数，不加载模型。
+
+结果逐条写入`results/dp_offline/<run_id>/`，包含配置、实际engine信息、dp0/dp1 JSONL；
+错误在清理前打印并保存`dpN-failure.txt`。结尾`INFERENCE/CACHE PASSED`仅表示
+正常功能断言通过，不代表输出精度或worker干净退出。需要精简服务日志时：
+
+```bash
+grep -E 'dsa-dp-offline|DSA DP L3|DSA L3 (load|store|worker summary|scheduler summary|resource close)|DSA prefix restore|Replaying aclgraph|shutdown|ERROR|Traceback' dp_offline_closeout.log > dp_offline_key.log
+```
+
+正式脚本已移除临时退出探针、诊断RPC、专用pickle设置和`shutdown-debug.zip`生成，
+因此后续不会再打印`shutdown trace armed`；这不是上传遗漏。正常status/reset RPC仍使用
+原生默认序列化。不要为了常规测试手动设置`VLLM_ALLOW_INSECURE_SERIALIZATION=1`。
+
+**在线推理：沿用已有配置与客户端，无需为本次清理重拉服务。**
+
+后续专用八卡空闲时，先核对`serve_dp_mtp_l3.sh`的模型路径及设备，再从项目根目录启动：
+
+```bash
+bash examples/dsa_demo/serve_dp_mtp_l3.sh 2>&1 | tee dp_server.log
+```
+
+另一终端执行（已运行的同配置服务可直接复用）：
+
+```bash
+python examples/dsa_demo/online_dp_cache_admin_test.py 2>&1 | tee dp_admin_client.log
+```
+
+客户端默认`PAUSED_RESET=True`、`LEAVE_PAUSED=False`、128输出tokens，覆盖9请求；
+测试后恢复服务，不自动关闭服务器。不应在有其他业务的服务上执行缓存管理测试。
+
+**已知退出限制，单独记账。**
+
+离线`98e3407215834cb7af79b374a9e39f3f`已经确认所有DSA请求/IO排空、八worker
+L3关闭成功，但随后均停留在TorchNPU post6的`_C._npu_shutdown(success)`，
+超过原生executor的4秒+4秒等待窗口后被SIGKILL。内部具体步骤和归属未完全确定，
+不能标为干净退出通过，也不将它误报成L3读写失败或直接认定与DSA使用方式无关。
+无需为补相同日志再次拉起大模型；已有诊断实现保留在`999c9727`历史中。
+
+### 单机 DP1 在线配置
 
 对 A5/950 W4A4C8，至少修改：
 
@@ -266,7 +1271,7 @@ ENABLE_MTP="true"
 
 启动脚本会同时改用 `sparse_activation_tokens=8192`、resident 档位
 `8192/10240/12288`，并传入
-`{"method":"mtp","num_speculative_tokens":3}`。MTP3 只接受
+`{"method":"mtp","num_speculative_tokens":3,"enforce_eager":true}`。MTP3 只接受
 `temperature=0.0`；target 可复用 uniform FULL graph，GLM proposer 按社区
 基线保持 eager。MTP proposer 使用独立 BF16 full-cache group，不进入 target
 DSA resident 的 token-wise swap；启用 prefix 时，其 verified full blocks 会作为
@@ -707,11 +1712,11 @@ LV-Eval 或 CLongEval 官方排行榜分数。正式精度对比应保持相同�
 - prefill/decode mixed batch（chunked prefill 本身已支持）；
 - async scheduling；
 - HBM Indexer-only/MLA-only 的独立 source mask 与细粒度 IO 去重；完整 HBM
-  pair 与 HBM-only L2 backfill 已完成代码改造、待 A5 上板；
+  pair 与 HBM-only L2 backfill 不在该未支持项中；
 - preemption/resume；
 - 非 MTP speculative method、MTP draft 数不等于 3、非 greedy MTP；
-- 固定 MTP3 多级 prefix 尚待 A5 上板；L3 的 DP>1、layerwise async load 和
-  HBM 直通；
+- L3 的跨机DP、layerwise async load 和 HBM 直通；固定MTP3多级prefix及
+  单机DP2/TP4/EP8共享Mooncake TCP已有上述阶段性验收，不再列为未支持；
 - `DSAL3Connector` 之外的 DSA KV transfer connector，以及非 Mooncake 后端；
 - context parallel 和 pipeline parallel；
 - KV-cache metrics/events；

@@ -31,7 +31,9 @@ def _get_mooncake_client_rank(
 ) -> int:
     try:
         return int(get_global_rank(parallel_config))
-    except Exception:
+    except Exception as exc:
+        if int(getattr(parallel_config, "data_parallel_size", 1)) > 1:
+            raise RuntimeError("Mooncake DP worker identity requires an initialized global worker group") from exc
         for name in ("LOCAL_RANK", "RANK"):
             value = os.getenv(name)
             if value is not None:
@@ -151,8 +153,15 @@ class MooncakeBackend(Backend):
         # TCP follows Mooncake/LMCache's Store-owned engine path. Ascend keeps
         # the existing external GlobalTE path used by the NPU KV pool.
         if self._store_owns_transfer_engine:
-            client_rank = _get_mooncake_client_rank(self.parallel_config)
-            segment_rank = client_rank % TCP_SCHEDULER_SEGMENT_PORT_OFFSET
+            # CPU-only schedulers have no worker process group/device identity.
+            client_rank = (
+                _get_mooncake_client_rank(self.parallel_config)
+                if self._contribute_memory
+                else int(self.parallel_config.data_parallel_rank)
+            )
+            if not 0 <= client_rank < TCP_SCHEDULER_SEGMENT_PORT_OFFSET:
+                raise ValueError(f"Mooncake TCP client rank is outside its endpoint range: {client_rank}")
+            segment_rank = client_rank
             role_offset = 0 if self._contribute_memory else TCP_SCHEDULER_SEGMENT_PORT_OFFSET
             tcp_segment_port = self.config.tcp_segment_port_base + segment_rank + role_offset
             self.local_seg = f"{local_hostname}:{tcp_segment_port}"

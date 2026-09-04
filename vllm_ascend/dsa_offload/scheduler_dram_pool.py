@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DSA scheduler 侧的单机 DRAM 容量合同与 block-id 目录。
 
-EngineCore 在 HBM KV-cache 配置完成各 rank 收敛后，只观测一次单机可用
-内存并生成 ``DSADRAMCapacityPlan``。``DSAKVCacheCoordinator`` 持有唯一
-``DSASchedulerDRAMBlockDirectory``，在已提交 Indexer block table 的覆盖内按
+EngineCore 在 HBM KV-cache 配置确定后，由 ``kv_cache`` 调用本模块计算
+``DSADRAMCapacityPlan``；DP 场景先经 ``dp_context`` 取得共同节点快照与
+等额字节预算，各域再按自己的 L1 比例确定实际 L2 块数。每个 DP 的
+``DSAKVCacheCoordinator`` 独立持有 ``DSASchedulerDRAMBlockDirectory``，
+在已提交 Indexer block table 的覆盖内按
 durable full-block 前缀增量分配 DRAM block id；worker 只消费 assignment，
 不在数据热路径分配。
 
@@ -16,7 +18,10 @@ durable full-block 前缀增量分配 DRAM block id；worker 只消费 assignmen
 首版 prefix cache 直接复用 ``BlockPool`` 的 hash/refcount/LRU：查询阶段只
 返回候选块，HBM admission 成功后才 touch 并绑定到请求；worker 完成整块
 完整 durable bundle dump 后才发布 hash。请求结束只释放引用，payload/hash 保留到
-物理块真正被重新分配。preemption 与 KV connector 仍关闭。
+物理块真正被重新分配。L3 异步 store 的源块覆盖保护由 ``l3.scheduler``
+记录旧 job、再由 worker 执行 reuse fence，不由本目录直接查询后台 IO。
+preemption/resume 仍未开放；DSAL3Connector 的接入不代表任意第三方
+KVConnector 都能直接使用该块目录。
 """
 
 from __future__ import annotations
@@ -48,6 +53,16 @@ class DSADRAMCapacityPlan:
     minimum_usable_blocks: int
     desired_usable_blocks: int
     usable_blocks: int
+    node_scope_id: str = ""
+    snapshot_id: str = ""
+    compatibility_signature: str = ""
+    data_parallel_rank: int = 0
+    data_parallel_size: int = 1
+    node_observed_available_bytes: int = 0
+    per_dp_quota_bytes: int = 0
+    observed_available_bytes_by_dp: tuple[int, ...] = ()
+    l1_indexer_blocks_by_dp: tuple[int, ...] = ()
+    minimum_per_dp_quota_bytes: int = 0
 
     @property
     def arena_capacity(self) -> int:

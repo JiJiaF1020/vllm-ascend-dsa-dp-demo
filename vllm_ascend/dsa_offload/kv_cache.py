@@ -13,13 +13,26 @@ DSA 的 Indexer dense plane 与 MLA resident plane 在这三层都必须显式�
 本模块只负责静态规格、分组、容量和最终 tensor 布局，不处理请求阶段转换，
 也不在对象上动态追加 ``dsa_num_blocks`` 一类旁路字段。每个 plane 的真实
 block 数统一由最终 ``KVCacheTensor.size / spec.page_size_bytes`` 推导。
+
+L1 配置确定后，本模块还会定稿 L2 容量并附入类型化 KV-cache config。
+DP 的共同节点预算通过 ``dp_context`` 协调，具体块容量计算复用
+``scheduler_dram_pool``；各域等额的是字节预算上限，实际块数仍随本域
+L1 容量和配置比例变化。
+
+同机多 DP 的容量报告通过文件锁互斥输出，避免进程日志前缀的分段写入
+交错。锁只覆盖报告，不参与容量计算、DP collective 或请求执行。
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
+import tempfile
 from dataclasses import dataclass, replace
 
 import torch
+from filelock import FileLock, Timeout
 from vllm.config import VllmConfig
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
@@ -34,6 +47,10 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+from vllm_ascend.dsa_offload.dp_context import (
+    coordinate_dsa_node_memory_budget,
+    require_dsa_shared_l3_hash_seed,
+)
 from vllm_ascend.dsa_offload.scheduler_dram_pool import (
     DSADRAMCapacityPlan,
     calculate_dram_capacity_plan,
@@ -43,6 +60,29 @@ from vllm_ascend.dsa_offload.scheduler_dram_pool import (
 # 沿用 v0.19 DSA 原型的物理块数对齐。该对齐只作用于自动计算出来的
 # base block 数；显式 num_gpu_blocks_override 仍由 vLLM 的标准入口接管。
 DSA_KV_BLOCK_COUNT_ALIGNMENT = 128
+DSA_CAPACITY_LOG_LOCK_TIMEOUT_SECONDS = 5
+
+
+def _log_dsa_capacity_report(vllm_config: VllmConfig, message: str, *args: object) -> None:
+    """仅序列化同机容量报告；日志锁不可用时降级输出，不阻止引擎启动。"""
+
+    if int(getattr(vllm_config.parallel_config, "data_parallel_size", 1)) <= 1:
+        logger.info_once(message, *args)
+        return
+    # 不含DP/rank/PID，保证各EngineCore争用同一把锁；不同用户独立。
+    uid = getattr(os, "getuid", lambda: 0)()
+    lock = FileLock(os.path.join(tempfile.gettempdir(), f"vllm-ascend-dsa-capacity-{uid}.lock"), mode=0o600)
+    try:
+        lock.acquire(timeout=DSA_CAPACITY_LOG_LOCK_TIMEOUT_SECONDS)
+    except (OSError, Timeout) as exc:
+        logger.warning("DSA capacity report lock unavailable; output may interleave: %s", exc)
+        logger.info_once(message, *args)
+        return
+    try:
+        # 标准StreamHandler在返回前flush；保留原生格式、进程前缀与info_once语义。
+        logger.info_once(message, *args)
+    finally:
+        lock.release()
 
 
 def _may_override_num_blocks(
@@ -51,6 +91,222 @@ def _may_override_num_blocks(
 ) -> int:
     override = vllm_config.cache_config.num_gpu_blocks_override
     return int(override) if override is not None else num_blocks
+
+
+def dsa_mtp_cache_identity(vllm_config: VllmConfig) -> dict[str, object] | None:
+    """描述产生MTP KV的模型身份，供DP启动校验和共享L3 schema共同使用。"""
+
+    speculative = getattr(vllm_config, "speculative_config", None)
+    if speculative is None:
+        return None
+    draft = speculative.draft_model_config
+    compute_hash = getattr(draft, "compute_hash", None)
+    return {
+        "method": str(speculative.method),
+        "num_speculative_tokens": int(speculative.num_speculative_tokens),
+        "model": str(getattr(draft, "model", "")),
+        "revision": str(getattr(draft, "revision", "") or ""),
+        "config_hash": str(compute_hash()) if callable(compute_hash) else "",
+    }
+
+
+def build_dsa_dp_compatibility_signature(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    dsa_config: object,
+) -> str:
+    """Fingerprint DSA semantics that must agree across DP EngineCores."""
+
+    model_config = vllm_config.model_config
+    hf_config = getattr(model_config, "hf_config", None)
+    compute_hash = getattr(model_config, "compute_hash", None)
+    model_config_hash = (
+        str(compute_hash()) if callable(compute_hash) else ""
+    )
+    parallel_config = vllm_config.parallel_config
+    scheduler_config = vllm_config.scheduler_config
+    cache_config = vllm_config.cache_config
+    compilation_config = vllm_config.compilation_config
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+
+    def group_identity(group: KVCacheGroupSpec) -> dict[str, object]:
+        spec = group.kv_cache_spec
+        sparse_head_dim = getattr(spec, "sparse_head_dim", None)
+        return {
+            "type": f"{type(spec).__module__}.{type(spec).__qualname__}",
+            "dtype": str(getattr(spec, "dtype", "")),
+            "block_size": int(spec.block_size),
+            "page_size_bytes": int(spec.page_size_bytes),
+            "num_kv_heads": int(getattr(spec, "num_kv_heads", 0)),
+            "head_size": int(getattr(spec, "head_size", 0)),
+            "sparse_head_dim": (
+                tuple(int(value) for value in sparse_head_dim)
+                if sparse_head_dim is not None
+                else None
+            ),
+            "cache_sparse_sfa_c8": bool(
+                getattr(spec, "cache_sparse_sfa_c8", False)
+            ),
+            "cache_sparse_li_c8": bool(
+                getattr(spec, "cache_sparse_li_c8", False)
+            ),
+            "layers": tuple(group.layer_names),
+        }
+
+    descriptor = {
+        "version": 1,
+        "model": {
+            "model": str(getattr(model_config, "model", "")),
+            "revision": str(
+                getattr(model_config, "revision", "") or ""
+            ),
+            "architecture": str(
+                getattr(model_config, "architecture", "")
+            ),
+            "architectures": tuple(
+                getattr(hf_config, "architectures", ()) or ()
+            ),
+            "model_type": str(getattr(hf_config, "model_type", "")),
+            "quantization": str(
+                getattr(model_config, "quantization", "") or ""
+            ),
+            "max_model_len": int(
+                getattr(model_config, "max_model_len", 0) or 0
+            ),
+            "enforce_eager": bool(
+                getattr(model_config, "enforce_eager", False)
+            ),
+            "config_hash": model_config_hash,
+        },
+        "parallel": {
+            "tp": int(getattr(parallel_config, "tensor_parallel_size", 1)),
+            "pp": int(getattr(parallel_config, "pipeline_parallel_size", 1)),
+            "pcp": int(
+                getattr(parallel_config, "prefill_context_parallel_size", 1)
+            ),
+            "dcp": int(
+                getattr(parallel_config, "decode_context_parallel_size", 1)
+            ),
+            "dp": int(getattr(parallel_config, "data_parallel_size", 1)),
+            "ep": bool(
+                getattr(parallel_config, "enable_expert_parallel", False)
+            ),
+            "all2all_backend": str(
+                getattr(parallel_config, "all2all_backend", "")
+            ),
+        },
+        "scheduler": {
+            "max_num_seqs": int(
+                getattr(scheduler_config, "max_num_seqs", 0) or 0
+            ),
+            "max_num_batched_tokens": int(
+                getattr(scheduler_config, "max_num_batched_tokens", 0) or 0
+            ),
+            "chunked_prefill": bool(
+                getattr(scheduler_config, "enable_chunked_prefill", False)
+            ),
+            "reserve_full_isl": bool(
+                getattr(scheduler_config, "scheduler_reserve_full_isl", False)
+            ),
+        },
+        "cache": {
+            "block_size": int(getattr(cache_config, "block_size", 0) or 0),
+            "hash_block_size": int(
+                getattr(cache_config, "hash_block_size", 0) or 0
+            ),
+            "prefix": bool(
+                getattr(cache_config, "enable_prefix_caching", False)
+            ),
+        },
+        "dsa": {
+            "indexer_mla_block_ratio": int(
+                getattr(dsa_config, "indexer_mla_block_ratio", 0)
+            ),
+            "sparse_activation_tokens": int(
+                getattr(dsa_config, "sparse_activation_tokens", 0)
+            ),
+            "prompt_budget_thresholds": tuple(
+                getattr(dsa_config, "prompt_budget_thresholds", ())
+            ),
+            "resident_budget_tokens": tuple(
+                getattr(dsa_config, "resident_budget_tokens", ())
+            ),
+            "max_active_reqs": int(
+                getattr(dsa_config, "max_active_reqs", 0)
+            ),
+            "hot_cpu_block_multiple": float(
+                getattr(dsa_config, "hot_cpu_block_multiple", 0.0)
+            ),
+            "row_mode_graph": bool(
+                getattr(dsa_config, "enable_row_mode_decode_graph", False)
+            ),
+            "mtp_tokens": int(
+                getattr(dsa_config, "mtp_num_speculative_tokens", 0)
+            ),
+            "mtp_layers": int(
+                getattr(dsa_config, "mtp_cache_layer_count", 0)
+            ),
+        },
+        "speculative": {
+            "method": str(getattr(speculative_config, "method", "")),
+            "tokens": int(
+                getattr(speculative_config, "num_speculative_tokens", 0)
+                or 0
+            ),
+        },
+        "connector": {
+            "name": str(getattr(kv_transfer_config, "kv_connector", "")),
+            "role": str(getattr(kv_transfer_config, "kv_role", "")),
+        },
+        "compilation": {
+            "mode": str(getattr(compilation_config, "mode", "")),
+            "cudagraph_mode": str(
+                getattr(compilation_config, "cudagraph_mode", "")
+            ),
+            "capture_sizes": tuple(
+                getattr(
+                    compilation_config,
+                    "cudagraph_capture_sizes",
+                    (),
+                )
+                or ()
+            ),
+        },
+        "groups": tuple(group_identity(group) for group in kv_cache_groups),
+    }
+    if speculative_config is not None:
+        descriptor["speculative"]["cache_identity"] = dsa_mtp_cache_identity(vllm_config)
+        descriptor["speculative"]["enforce_eager"] = bool(getattr(speculative_config, "enforce_eager", False))
+        descriptor["speculative"]["draft_tp"] = int(
+            getattr(speculative_config, "draft_tensor_parallel_size", None)
+            or getattr(parallel_config, "tensor_parallel_size", 1)
+        )
+    if (
+        getattr(kv_transfer_config, "kv_connector", None) == "DSAL3Connector"
+        and int(getattr(parallel_config, "data_parallel_size", 1)) > 1
+    ):
+        hash_seed = require_dsa_shared_l3_hash_seed()
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend import (
+            MooncakeStoreConfig,
+        )
+
+        l3_config = MooncakeStoreConfig.load_from_env()
+        descriptor["l3"] = {
+            name: getattr(l3_config, name)
+            for name in (
+                "protocol", "metadata_server", "master_server_address",
+                "global_segment_size", "local_buffer_size", "tcp_segment_port_base",
+            )
+        }
+        descriptor["l3"]["hash_algorithm"] = str(getattr(cache_config, "prefix_caching_hash_algo", ""))
+        descriptor["l3"]["python_hash_seed"] = hash_seed
+    encoded = json.dumps(
+        descriptor,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:32]
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -570,33 +826,81 @@ def finalize_dsa_dram_capacity(
             "DSA TP workers have different HBM Indexer capacities: "
             f"blocks={sorted(indexer_block_counts)}"
         )
+    bundle_bytes = bundle_sizes.pop()
+    indexer_blocks = indexer_block_counts.pop()
 
     from vllm_ascend.ascend_config import get_ascend_config
 
+    ascend_config = get_ascend_config()
+    compatibility_signature = build_dsa_dp_compatibility_signature(
+        vllm_config,
+        dsa_configs[0].kv_cache_groups,
+        ascend_config.dsa_offload_config,
+    )
     observed_available = (
         get_host_available_memory_bytes()
         if host_available_bytes is None
         else int(host_available_bytes)
     )
+    parallel_config = vllm_config.parallel_config
+    memory_budget = coordinate_dsa_node_memory_budget(
+        data_parallel_size=int(
+            getattr(parallel_config, "data_parallel_size", 1)
+        ),
+        data_parallel_rank=int(
+            getattr(parallel_config, "data_parallel_rank", 0)
+        ),
+        observed_available_bytes=observed_available,
+        l1_indexer_blocks=indexer_blocks,
+        complete_bundle_bytes=bundle_bytes,
+        tensor_parallel_size=tp_size,
+        compatibility_signature=compatibility_signature,
+    )
     l3_host_reservation = _dsa_l3_host_reservation_bytes(
         vllm_config,
         tp_size,
     )
-    planning_available = observed_available - l3_host_reservation
+    planning_available = (
+        memory_budget.per_dp_quota_bytes - l3_host_reservation
+    )
     if planning_available <= 0:
         raise RuntimeError(
-            "DSA host DRAM is exhausted by the configured L3 client pools: "
-            f"host_available={observed_available}, "
+            "DSA per-DP host DRAM quota is exhausted by the configured L3 "
+            "client pools: "
+            f"per_dp_quota={memory_budget.per_dp_quota_bytes}, "
             f"l3_reservation={l3_host_reservation}"
         )
     plan = calculate_dram_capacity_plan(
-        indexer_num_blocks=indexer_block_counts.pop(),
+        indexer_num_blocks=indexer_blocks,
         block_multiple=(
-            get_ascend_config().dsa_offload_config.hot_cpu_block_multiple
+            ascend_config.dsa_offload_config.hot_cpu_block_multiple
         ),
-        bytes_per_logical_block=bundle_sizes.pop(),
+        bytes_per_logical_block=bundle_bytes,
         tensor_parallel_size=tp_size,
         host_available_bytes=planning_available,
+    )
+    plan = replace(
+        plan,
+        node_scope_id=memory_budget.node_scope_id,
+        snapshot_id=memory_budget.snapshot_id,
+        compatibility_signature=(
+            memory_budget.compatibility_signature
+        ),
+        data_parallel_rank=memory_budget.data_parallel_rank,
+        data_parallel_size=memory_budget.data_parallel_size,
+        node_observed_available_bytes=(
+            memory_budget.node_available_bytes
+        ),
+        per_dp_quota_bytes=memory_budget.per_dp_quota_bytes,
+        observed_available_bytes_by_dp=(
+            memory_budget.observed_available_bytes_by_dp
+        ),
+        l1_indexer_blocks_by_dp=(
+            memory_budget.l1_indexer_blocks_by_dp
+        ),
+        minimum_per_dp_quota_bytes=(
+            memory_budget.minimum_per_dp_quota_bytes
+        ),
     )
     for config in dsa_configs:
         assert isinstance(config, DSAKVCacheConfig)
@@ -629,12 +933,20 @@ def finalize_dsa_dram_capacity(
         if mtp_bytes_per_block
         else "target Indexer + MLA"
     )
-    logger.info_once(
+    _log_dsa_capacity_report(
+        vllm_config,
         "\n"
         "================ DSA DRAM CAPACITY REPORT ====================\n"
-        "  Host observed available   : %s bytes (%s GiB)\n"
+        "  DP rank / size            : %s / %s\n"
+        "  Node scope / snapshot     : %s / %s\n"
+        "  Compatibility signature   : %s\n"
+        "  Host observations by DP   : %s\n"
+        "  L1 Indexer blocks by DP   : %s\n"
+        "  Node conservative bytes   : %s bytes (%s GiB)\n"
+        "  This-DP byte quota        : %s bytes (%s GiB)\n"
+        "  Minimum common DP quota   : %s bytes (%s GiB)\n"
         "  L3 host reservation       : %s bytes (%s GiB)\n"
-        "  DSA planning bytes        : %s bytes (%s GiB)\n"
+        "  This-DP planning bytes    : %s bytes (%s GiB)\n"
         "  Local TP workers          : %s\n"
         "  Per-rank available bytes  : %s bytes (%s GiB)\n"
         "  Complete block payload    : %s bytes (%s)\n"
@@ -643,12 +955,26 @@ def finalize_dsa_dram_capacity(
         "  Desired usable blocks     : %s\n"
         "  Selected usable blocks    : %s (effective multiple %.3fx)\n"
         "  Per-rank reserved bytes   : %s bytes (%s GiB, includes block 0)\n"
-        "  Total planned host bytes  : %s bytes (%s GiB)\n"
+        "  This-DP reserved bytes    : %s bytes (%s GiB)\n"
         "  Capacity downsized        : %s\n"
         "  Prefix cache              : %s\n"
         "=================================================================",
-        f"{observed_available:,}",
-        format_gib(observed_available),
+        f"{plan.data_parallel_rank:,}",
+        f"{plan.data_parallel_size:,}",
+        plan.node_scope_id,
+        plan.snapshot_id,
+        plan.compatibility_signature,
+        tuple(
+            f"{value:,}"
+            for value in plan.observed_available_bytes_by_dp
+        ),
+        tuple(f"{value:,}" for value in plan.l1_indexer_blocks_by_dp),
+        f"{plan.node_observed_available_bytes:,}",
+        format_gib(plan.node_observed_available_bytes),
+        f"{plan.per_dp_quota_bytes:,}",
+        format_gib(plan.per_dp_quota_bytes),
+        f"{plan.minimum_per_dp_quota_bytes:,}",
+        format_gib(plan.minimum_per_dp_quota_bytes),
         f"{l3_host_reservation:,}",
         format_gib(l3_host_reservation),
         f"{plan.host_available_bytes:,}",
@@ -977,7 +1303,8 @@ def report_dsa_kv_cache_config(
             f"{decode_by_mtp:,} requests at max_model_len={max_model_len:,}"
         )
 
-    logger.info_once(
+    _log_dsa_capacity_report(
+        vllm_config,
         "\n"
         "================ DSA HBM CACHE CAPACITY REPORT ================\n"
         "  Split ratio             : indexer:mla = %d:1; base blocks = %s\n"

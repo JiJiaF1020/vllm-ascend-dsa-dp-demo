@@ -28,7 +28,7 @@ from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import partial
 from multiprocessing import Manager
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeAlias
 
 import numpy as np
 import torch
@@ -458,6 +458,9 @@ class NPUModelRunner(GPUModelRunner):
         )
         self.dsa_worker_dram_store: DSAWorkerDRAMStore | None = None
         self._dsa_decode_forward = False
+        self._logged_dsa_runtime_dummy_signatures: set[
+            tuple[str, int, int]
+        ] = set()
         set_weight_prefetch_method(self.ascend_config.weight_prefetch_config)
 
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
@@ -893,6 +896,32 @@ class NPUModelRunner(GPUModelRunner):
                     resident_pool.restore_after_graph_capture()
             raise
 
+    def _prepare_dsa_runtime_dummy_state(
+        self,
+        *,
+        row_count: int,
+    ) -> None:
+        """Install PAD/no-op device inputs without borrowing request rows."""
+
+        state = self.input_batch.dsa_cache_layout
+        runtime = self.dsa_offload_runtime
+        if state is None or runtime is None:
+            raise RuntimeError(
+                "DSA runtime dummy requires initialized InputBatch and "
+                "runtime owners"
+            )
+
+        state_ready = False
+        try:
+            state.prepare_runtime_dummy(row_count=row_count)
+            state_ready = True
+            runtime.prepare_runtime_dummy(row_count=row_count)
+        except Exception:
+            if state_ready:
+                with suppress(Exception):
+                    state.restore_after_runtime_dummy()
+            raise
+
     def _restore_dsa_graph_dummy_state(self) -> None:
         runtime = self.dsa_offload_runtime
         state = self.input_batch.dsa_cache_layout
@@ -910,18 +939,33 @@ class NPUModelRunner(GPUModelRunner):
             finally:
                 resident_pool.restore_after_graph_capture()
 
+    def _restore_dsa_runtime_dummy_state(self) -> None:
+        runtime = self.dsa_offload_runtime
+        state = self.input_batch.dsa_cache_layout
+        if runtime is None or state is None:
+            raise RuntimeError(
+                "DSA runtime dummy state cannot be restored because an "
+                "owner disappeared"
+            )
+        try:
+            runtime.restore_after_runtime_dummy()
+        finally:
+            state.restore_after_runtime_dummy()
+
     @contextmanager
-    def _dsa_graph_dummy_state_scope(
+    def _dsa_dummy_state_scope(
         self,
-        installed: bool,
+        kind: Literal["capture", "runtime"] | None,
     ):
-        """覆盖 dummy metadata 构造与完整 forward，并在异常时可靠恢复。"""
+        """Cover dummy metadata and forward, then restore its device view."""
 
         try:
             yield
         finally:
-            if installed:
+            if kind == "capture":
                 self._restore_dsa_graph_dummy_state()
+            elif kind == "runtime":
+                self._restore_dsa_runtime_dummy_state()
 
     def _sync_metadata_across_dp(
         self,
@@ -3731,6 +3775,8 @@ class NPUModelRunner(GPUModelRunner):
         else:
             dsa_indexer_block_table = None
             dsa_indexer_slot_mapping = None
+        is_capture_dummy = False
+        is_runtime_dummy = False
         if self.dsa_kv_cache_group_ids is not None:
             dsa_state = self.input_batch.dsa_cache_layout
             dsa_runtime = self.dsa_offload_runtime
@@ -3748,11 +3794,20 @@ class NPUModelRunner(GPUModelRunner):
             resident_capture_rows = (
                 dsa_resident_pool.graph_capture_row_count
             )
+            state_runtime_dummy_rows = dsa_state.runtime_dummy_row_count
+            runtime_dummy_rows = dsa_runtime.runtime_dummy_row_count
             is_capture_dummy = bool(
                 state_capture_rows
                 or runtime_capture_rows
                 or resident_capture_rows
             )
+            is_runtime_dummy = bool(
+                state_runtime_dummy_rows or runtime_dummy_rows
+            )
+            if is_capture_dummy and is_runtime_dummy:
+                raise RuntimeError(
+                    "DSA capture and runtime dummy states overlap"
+                )
             if not (
                 state_capture_rows
                 == runtime_capture_rows
@@ -3768,6 +3823,18 @@ class NPUModelRunner(GPUModelRunner):
                 metadata_ready = (
                     state_capture_rows == num_reqs_padded
                     and dsa_runtime.execution_num_reqs == num_reqs_padded
+                )
+            elif is_runtime_dummy:
+                if state_runtime_dummy_rows != runtime_dummy_rows:
+                    raise RuntimeError(
+                        "DSA runtime-dummy owners disagree on row count: "
+                        f"state={state_runtime_dummy_rows}, "
+                        f"runtime={runtime_dummy_rows}"
+                    )
+                metadata_ready = (
+                    state_runtime_dummy_rows == num_reqs_padded
+                    and dsa_runtime.execution_num_reqs
+                    == num_reqs_padded
                 )
             else:
                 metadata_ready = (
@@ -3786,6 +3853,8 @@ class NPUModelRunner(GPUModelRunner):
                     "runtime_execution_rows="
                     f"{dsa_runtime.execution_num_reqs}, "
                     f"capture_rows={state_capture_rows}, "
+                    "runtime_dummy_rows="
+                    f"{state_runtime_dummy_rows}, "
                     f"num_reqs={num_reqs}, "
                     f"num_reqs_padded={num_reqs_padded}"
                 )
@@ -3815,6 +3884,8 @@ class NPUModelRunner(GPUModelRunner):
             :num_reqs_padded
         ]
         is_prefilling = num_computed_tokens_cpu < num_prompt_tokens_cpu
+        if is_capture_dummy or is_runtime_dummy:
+            is_prefilling.zero_()
         is_prefilling[num_reqs:] = False
         seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs_padded]
         if self.use_async_spec_decode:
@@ -3858,7 +3929,11 @@ class NPUModelRunner(GPUModelRunner):
             dsa_dram_block_table=dsa_dram_block_table,
             dsa_decode_forward=(
                 self.dsa_offload_enabled
-                and (is_capture_dummy or self._dsa_decode_forward)
+                and (
+                    is_capture_dummy
+                    or is_runtime_dummy
+                    or self._dsa_decode_forward
+                )
             ),
             attn_state=self.attn_state,
             decode_token_per_req=self.decode_token_per_req,
@@ -4064,6 +4139,7 @@ class NPUModelRunner(GPUModelRunner):
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
         profile_cpp: bool = False,
+        runtime_idle: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
@@ -4149,7 +4225,7 @@ class NPUModelRunner(GPUModelRunner):
             )
         num_tokens_padded = batch_desc.num_tokens
         num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
-        prepare_dsa_graph_dummy = (
+        prepare_dsa_full_dummy = (
             self._dsa_row_mode_decode_graph_enabled()
             and uniform_decode
             and (
@@ -4157,6 +4233,34 @@ class NPUModelRunner(GPUModelRunner):
                 or cudagraph_runtime_mode == CUDAGraphMode.FULL
             )
         )
+        # Runtime idle is a graph-compatible participant. Its synthetic local
+        # batch must not veto a peer's FULL decode; side effects are disabled
+        # later through PAD rows and device-side no-op copy metadata.
+        if runtime_idle and self.dsa_offload_enabled:
+            dummy_signature = (
+                str(cudagraph_runtime_mode),
+                int(num_tokens_padded),
+                int(num_reqs_padded),
+            )
+            if (
+                dummy_signature
+                not in self._logged_dsa_runtime_dummy_signatures
+            ):
+                logger.info(
+                    "DSA runtime idle dummy: graph_mode=%s "
+                    "padded_tokens=%d padded_reqs=%d io=%s",
+                    cudagraph_runtime_mode,
+                    num_tokens_padded,
+                    num_reqs_padded,
+                    (
+                        "device-pad/noop"
+                        if prepare_dsa_full_dummy
+                        else "no-attention"
+                    ),
+                )
+                self._logged_dsa_runtime_dummy_signatures.add(
+                    dummy_signature
+                )
         if num_tokens_across_dp is not None and num_tokens_padded != num_tokens:
             # pad is needed if the pad of `num_tokens` is triggered inside CudagraphDispatcher
             num_tokens_across_dp[:] = num_tokens_padded
@@ -4168,7 +4272,7 @@ class NPUModelRunner(GPUModelRunner):
         # vllm-ascend does not support ubatch now
         ubatch_slices, ubatch_slices_padded = None, None
         attn_metadata: PerLayerAttnMetadata | None = None
-        dsa_graph_dummy_installed = False
+        dsa_dummy_kind: Literal["capture", "runtime"] | None = None
         # Build attention metadata for dummy_run
         if self._should_build_dummy_attn_metadata(force_attention, is_profile, cudagraph_runtime_mode):
             if create_mixed_batch:
@@ -4195,7 +4299,7 @@ class NPUModelRunner(GPUModelRunner):
                     if is_graph_capturing and using_paged_attention(num_tokens, self.vllm_config)
                     else max_query_len
                 )  # type: ignore[assignment]
-            if prepare_dsa_graph_dummy:
+            if prepare_dsa_full_dummy:
                 seq_lens = max(
                     int(seq_lens),
                     self._dsa_graph_dummy_seq_len(),
@@ -4233,11 +4337,17 @@ class NPUModelRunner(GPUModelRunner):
             if self.use_compress:
                 self.positions.fill_(127)
                 self._dsa_positions_cpu_buf.fill_(127)
-            if prepare_dsa_graph_dummy:
-                self._prepare_dsa_graph_dummy_state(
-                    row_count=num_reqs_padded,
-                )
-                dsa_graph_dummy_installed = True
+            if prepare_dsa_full_dummy:
+                if runtime_idle:
+                    self._prepare_dsa_runtime_dummy_state(
+                        row_count=num_reqs_padded,
+                    )
+                    dsa_dummy_kind = "runtime"
+                else:
+                    self._prepare_dsa_graph_dummy_state(
+                        row_count=num_reqs_padded,
+                    )
+                    dsa_dummy_kind = "capture"
             try:
                 attn_metadata, _ = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
@@ -4254,15 +4364,15 @@ class NPUModelRunner(GPUModelRunner):
                         blk_table = self.input_batch.block_table[kv_cache_gid]
                         blk_table.slot_mapping.gpu.fill_(-1)
             except Exception:
-                if dsa_graph_dummy_installed:
+                if dsa_dummy_kind == "capture":
                     self._restore_dsa_graph_dummy_state()
-                    dsa_graph_dummy_installed = False
+                elif dsa_dummy_kind == "runtime":
+                    self._restore_dsa_runtime_dummy_state()
+                dsa_dummy_kind = None
                 raise
 
         with (
-            self._dsa_graph_dummy_state_scope(
-                dsa_graph_dummy_installed
-            ),
+            self._dsa_dummy_state_scope(dsa_dummy_kind),
             self.maybe_dummy_run_with_lora(
                 self.lora_config,
                 num_scheduled_tokens,
@@ -4346,6 +4456,7 @@ class NPUModelRunner(GPUModelRunner):
                 has_sinks = self._has_sinks,
                 input_ids=input_ids,
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
+                skip_kv_transfer=self.dsa_offload_enabled,
             ):
                 outputs = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
@@ -4357,6 +4468,9 @@ class NPUModelRunner(GPUModelRunner):
             dummy_compute_logits(hidden_states)
 
             if self.drafter and not profile_cpp:
+                dsa_draft_kwargs = {}
+                if runtime_idle and self.dsa_offload_enabled and self.ascend_config.dsa_offload_config.mtp_enabled:
+                    dsa_draft_kwargs["runtime_idle"] = True
                 self.drafter.dummy_run(
                     num_tokens=num_tokens_padded,
                     with_prefill=with_prefill,
@@ -4367,6 +4481,7 @@ class NPUModelRunner(GPUModelRunner):
                     dummy_compute_logits=dummy_drafter_compute_logits,
                     in_graph_capturing=not force_attention,
                     is_profile=is_profile,
+                    **dsa_draft_kwargs,
                 )
             if is_profile and self.dynamic_eplb:
                 self.eplb_updator.adaptor.clear_all_moe_loads()

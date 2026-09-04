@@ -1,6 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DSA L3 scheduler/worker 间的 pickle-safe job 元数据。"""
+"""DSA L3 在 scheduler 与 worker 之间传递的类型化任务和完成结果。
+
+Store/load block 描述请求、逻辑块、物理源或目标块以及 Indexer/MLA/可选
+MTP 的内容 key；job 将多个 block 组成一次操作。Connector metadata 携带
+待加载、待上传及覆盖 L2 前必须完成的旧 job 集合；worker metadata 携带
+上传结果、实际传输字节数和错误，复用基线序列化及聚合接口返回 scheduler。
+``retryable`` 标识并发 put 尚未确认可读等暂态；成功结果不能同时要求重试。
+put 的字节数字表示提交的 payload 量，后端幂等返回时不保证等于物理网络流量。
+
+这些对象只保存可序列化的值，不携带 tensor、原始指针、线程或通信句柄。
+字段校验约束任务形状，不能替代 IO 完成确认。当前上传结果按 TP0-only
+合同聚合，重复 job ID 会报错；job/block ID 不应解释为跨 DP 的全局编号。
+"""
 
 from __future__ import annotations
 
@@ -217,6 +229,7 @@ class DSAL3JobResult:
     success: bool
     transferred_bytes: int = 0
     error: str | None = None
+    retryable: bool = False
 
     def __post_init__(self) -> None:
         if self.job_id < 0:
@@ -225,6 +238,8 @@ class DSAL3JobResult:
             raise ValueError("DSA L3 transferred bytes must be non-negative")
         if self.success and self.error is not None:
             raise ValueError("Successful DSA L3 result cannot contain an error")
+        if self.success and self.retryable:
+            raise ValueError("Successful DSA L3 result cannot request a retry")
 
 
 @dataclass(slots=True)

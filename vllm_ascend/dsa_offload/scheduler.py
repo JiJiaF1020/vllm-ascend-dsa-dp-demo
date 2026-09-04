@@ -4,7 +4,7 @@
 
 本模块不复制 vLLM ``Scheduler.schedule()``。基线调度器仍负责 token
 budget、请求队列、KV block 分配和输出更新；DSA 子类只补充当前首版无法
-由通用调度器表达的三个约束：
+由通用调度器表达的以下约束：
 
 * prefill 与 decode 暂不进入同一个 model forward；
 * prefill 数据面完成后，scheduler 才能释放已卸载的 resident 满块；
@@ -16,6 +16,10 @@ budget、请求队列、KV block 分配和输出更新；DSA 子类只补充当�
 DRAM block directory 都由 ``DSAKVCacheCoordinator`` 持有。每轮输出只用一个薄
 ``DSAOffloadSchedulerOutput`` 投影已提交状态，不向 vLLM ``Request`` 动态
 追加字段，也不复制调度输出的构造逻辑。
+
+DP 下每个 EngineCore 独立持有本调度器，不跨域合并 prefix 长度或 block
+目录。启用 L3 时还需在无真实 token 的情况下推进在途 IO；跨 DP 管理 RPC
+的结果聚合由前端 ``dp_control`` 负责，不放入本模块的调度热路径。
 """
 
 from __future__ import annotations
@@ -134,6 +138,9 @@ class DSAOffloadScheduler(Scheduler):
         暂时装不下该 prompt 时，必须先允许已有 decode 完成并释放空间。
         """
 
+        if self._pause_state != PauseState.UNPAUSED:
+            # PAUSED_NEW不再admit waiting prefill，不能让它阻塞正在排空的decode。
+            return False
         if token_budget <= 0 or len(self.running) >= self.max_num_running_reqs:
             return False
 
@@ -447,12 +454,39 @@ class DSAOffloadScheduler(Scheduler):
             )
         return bool(has_pending())
 
+    def can_reset_dsa_prefix_cache(self) -> bool:
+        """管理面只读预检；新排队请求可保留，但不能有在途IO或仍被引用的块。"""
+
+        if self.running or self.has_requests():
+            return False
+        if self.dsa_l3_enabled and not self.connector.scheduler_handler.can_reset_cache():
+            return False
+        return (
+            self.dsa_coordinator.can_reset_prefix_candidates()
+            and self.kv_cache_manager.block_pool.can_reset_prefix_cache()
+        )
+
+    def commit_dsa_prefix_cache_reset(self) -> bool:
+        """暂停事务内清理本地hash及尚未分配的查询候选，保留排队请求本身。"""
+        if not self.can_reset_dsa_prefix_cache() or not self.reset_prefix_cache(False, False):
+            return False
+        self.dsa_coordinator.clear_prefix_candidates()
+        return True
+
     def reset_prefix_cache(
         self,
         reset_running_requests: bool = False,
         reset_connector: bool = False,
     ) -> bool:
+        if reset_running_requests and self.running:
+            # The base reset pops requests before calling _preempt_request.
+            # DSA cannot resume preempted requests yet; reject before mutation.
+            logger.warning("DSA prefix reset rejected: drain running requests before reset")
+            return False
         if reset_connector and bool(getattr(self, "dsa_l3_enabled", False)):
+            if not getattr(self.connector, "supports_dsa_namespace_reset", True):
+                logger.warning("DSA DP external reset rejected before local cache mutation")
+                return False
             has_pending = getattr(
                 self.connector,
                 "has_pending_transfers",

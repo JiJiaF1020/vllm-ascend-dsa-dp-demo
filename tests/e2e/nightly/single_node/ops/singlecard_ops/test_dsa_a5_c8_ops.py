@@ -1226,6 +1226,48 @@ def test_packed_c8_fused_lidu_graph_replay_changes_pool_state() -> None:
     )
 
 
+def test_packed_c8_fused_lidu_graph_replay_pad_row_is_noop() -> None:
+    inputs = _make_fused_lidu_inputs(
+        candidate_len=6272,
+        final_len=6273,
+        row_mode=2,
+        seed=37,
+    )
+    cache_slots = torch.full(
+        (2, _cache_row_width(8192)),
+        -1,
+        dtype=torch.int32,
+        device="npu",
+    )
+    cache_slots[:, -1].zero_()
+    outputs = _allocate_fused_lidu_outputs()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph, pool=torch.npu.graph_pool_handle()):
+        _launch_fused_lidu(inputs, cache_slots, outputs)
+
+    cache_slots.copy_(
+        torch.arange(
+            cache_slots.numel(),
+            dtype=torch.int32,
+            device="npu",
+        ).reshape_as(cache_slots)
+    )
+    cache_before = cache_slots.clone()
+    inputs["row_modes"].zero_()
+    inputs["req_entries"].fill_(-1)
+    for output in outputs:
+        output.fill_(17)
+
+    graph.replay()
+    torch.npu.synchronize()
+
+    attention, resident_lengths, _, _, counts = outputs
+    assert torch.equal(cache_slots, cache_before)
+    assert resident_lengths.cpu().tolist() == [0]
+    assert counts.cpu().tolist() == [0]
+    assert torch.all(attention == -1)
+
+
 def test_packed_c8_full_shared_next_full_graph_chain() -> None:
     budget = 6144
     candidate_len = budget + _BLOCK_SIZE

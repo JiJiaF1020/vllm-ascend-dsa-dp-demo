@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DSA 数据面到 Ascend 自定义算子的薄适配层。
 
-本模块只固定 LIDU、KSC、SFA-Offload 和满块复制的 tensor ABI。请求阶段、
-resident 行分配、scheduler DRAM block 投影和 attention 时序由上层负责；
-这里不隐式创建输出 tensor，也不执行 D2H 或 list-to-tensor 转换。
+本模块固定 LIDU、MTP LIM、KSC、SFA-Offload 和满块复制的 tensor ABI，
+把上层准备好的输入与 caller-owned 输出传给对应自定义算子。请求阶段、
+resident 行分配、scheduler DRAM block 投影和 attention 时序由上层负责。
+这里不隐式创建输出 tensor，也不通过读取 device tensor 回传 CPU 来推导
+控制元数据；满块复制接口本身仍可承担 HBM 与 swapped DRAM 间的数据搬运。
 """
 
 from __future__ import annotations

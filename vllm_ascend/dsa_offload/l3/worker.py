@@ -1,6 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DSA L3 all-rank load/pool contributor 与 TP-rank0 write-behind worker。"""
+"""DSA 在每个 TP worker 中执行的 L3 加载与异步上传任务。
+
+绑定本 rank 的 DRAM store 和 backend 后，所有 TP rank 按 scheduler 下发的
+计划同步 load 到各自 L2，并在本 TP group 内汇总成功状态，再允许后续
+assignment/restore 和 forward 继续。各 rank 的存储容量贡献由 backend
+配置决定，与是否承担上传任务是两个独立职责。
+
+上传仅由 TP0 的后台执行器处理：记录当前 NPU stream 的完成 event，后台
+任务等待 L1 -> L2 dump 完成后才读取源 arena。主执行线程轮询 Future，
+将 job 结果整理为 worker metadata；需要覆盖仍在使用的 L2 源块时，按
+``jobs_to_flush`` 等待相关旧任务完成，关闭时排空任务并释放 backend。
+
+本模块不分配 scheduler block ID，也不在后台线程中直接更新 scheduler
+目录或 prefix hash。当前同步 load、TP0-only store 的边界不等于已支持
+DP 下的共享 L3 组合，是否开放仍由配置门禁决定。
+"""
 
 from __future__ import annotations
 
@@ -13,7 +28,7 @@ import torch
 import torch.distributed as dist
 from vllm.logger import logger
 
-from vllm_ascend.dsa_offload.l3.backend_adapter import DSAL3BackendAdapter
+from vllm_ascend.dsa_offload.l3.backend_adapter import DSAL3BackendAdapter, DSAL3StoreNotReady
 from vllm_ascend.dsa_offload.l3.metadata import (
     DSAL3ConnectorMetadata,
     DSAL3JobResult,
@@ -139,6 +154,7 @@ class DSAL3StoreWorker:
                 job_id=job.job_id,
                 success=False,
                 error=f"{type(exc).__name__}: {exc}",
+                retryable=isinstance(exc, DSAL3StoreNotReady),
             )
         finally:
             self._return_event(ready_event)
@@ -360,3 +376,4 @@ class DSAL3StoreWorker:
                         wait=True,
                         cancel_futures=False,
                     )
+        logger.info("DSA L3 worker resource shutdown completed: tp_rank=%d", self.tp_rank)

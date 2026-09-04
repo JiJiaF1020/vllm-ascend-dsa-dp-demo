@@ -330,6 +330,7 @@ class DSAOffloadRuntime:
         self._mtp_layer_dump_epochs: dict[int, int] = {}
         self._logged_mtp_dump_timings: set[bool] = set()
         self._graph_capture_row_count = 0
+        self._runtime_dummy_row_count = 0
         self._dram_table_row_count = 0
         self._dram_table_signature: tuple[int, int, int] | None = None
         # shared indexer 新鲜度守卫：每个执行 view 先清空，再记录最近一次
@@ -366,6 +367,8 @@ class DSAOffloadRuntime:
             raise RuntimeError("DSA prefix restore requires a bound DRAM store")
         if not restores:
             return
+        if self._graph_capture_row_count or self._runtime_dummy_row_count:
+            raise RuntimeError("DSA prefix restore cannot execute inside a dummy batch")
         if not self.enable_prefix_caching:
             raise RuntimeError(
                 "DSA received prefix restore jobs while prefix caching is "
@@ -774,6 +777,10 @@ class DSAOffloadRuntime:
     def graph_capture_row_count(self) -> int:
         return self._graph_capture_row_count
 
+    @property
+    def runtime_dummy_row_count(self) -> int:
+        return self._runtime_dummy_row_count
+
     def prepare_execution_view(
         self,
         *,
@@ -787,8 +794,10 @@ class DSAOffloadRuntime:
         的前缀，不创建 graph 专属副本。
         """
 
-        if self._graph_capture_row_count:
-            raise RuntimeError("DSA real execution cannot reuse an active capture dummy")
+        if self._graph_capture_row_count or self._runtime_dummy_row_count:
+            raise RuntimeError(
+                "DSA real execution cannot reuse an active dummy state"
+            )
         active_num_reqs = int(active_num_reqs)
         if active_num_reqs != self.active_num_reqs:
             raise RuntimeError(
@@ -853,8 +862,8 @@ class DSAOffloadRuntime:
         if self.dram_store is None:
             raise RuntimeError("DSA graph capture requires an initialized DRAM store")
         row_count = int(row_count)
-        if self._graph_capture_row_count:
-            raise RuntimeError("DSA runtime graph-capture state was installed twice")
+        if self._graph_capture_row_count or self._runtime_dummy_row_count:
+            raise RuntimeError("DSA runtime dummy state was installed twice")
         if not 0 < row_count <= self.max_num_reqs:
             raise ValueError(
                 "DSA runtime graph-capture row count is outside capacity: "
@@ -905,6 +914,70 @@ class DSAOffloadRuntime:
         self.dump_launch_count = 0
         self.dump_before_cache_write = False
         self._graph_capture_row_count = 0
+        self._dram_table_row_count = 0
+        self._dram_table_signature = None
+
+    def prepare_runtime_dummy(self, *, row_count: int) -> None:
+        """Install fixed-address no-op IO inputs for an idle graph replay."""
+
+        if self.dram_store is None:
+            raise RuntimeError(
+                "DSA runtime dummy requires an initialized DRAM store"
+            )
+        row_count = int(row_count)
+        if self._graph_capture_row_count or self._runtime_dummy_row_count:
+            raise RuntimeError("DSA runtime dummy state was installed twice")
+        if not 0 < row_count <= self.max_num_reqs:
+            raise ValueError(
+                "DSA runtime-dummy row count is outside runtime capacity: "
+                f"rows={row_count}, capacity={self.max_num_reqs}"
+            )
+
+        self._runtime_dummy_row_count = row_count
+        try:
+            self.active_dram_block_table.np[:row_count].fill(
+                DSA_DRAM_NULL_BLOCK_ID
+            )
+            self.active_dram_block_table.gpu[:row_count].zero_()
+            self.dump_src_block_ids.np[:row_count] = 0
+            self.dump_indexer_src_block_ids.np[:row_count] = 0
+            if self.mtp_durable_offload:
+                self.dump_mtp_src_block_ids.np[:row_count] = 0
+            self.dump_dst_block_ids.np[:row_count] = (
+                DSA_DUMP_NOOP_DST_BLOCK_ID
+            )
+            self.dump_src_block_ids.gpu[:row_count].zero_()
+            self.dump_indexer_src_block_ids.gpu[:row_count].zero_()
+            if self.mtp_durable_offload:
+                self.dump_mtp_src_block_ids.gpu[:row_count].zero_()
+            self.dump_dst_block_ids.gpu[:row_count].fill_(
+                DSA_DUMP_NOOP_DST_BLOCK_ID
+            )
+            self.active_num_reqs = row_count
+            self.execution_num_reqs = row_count
+            self.dump_job_count = 0
+            self.dump_launch_count = row_count
+            self.dump_before_cache_write = self.max_decode_query_len > 1
+            self._reset_selection_source()
+        except Exception:
+            self._runtime_dummy_row_count = 0
+            self.active_num_reqs = 0
+            self.execution_num_reqs = 0
+            self.dump_job_count = 0
+            self.dump_launch_count = 0
+            raise
+
+    def restore_after_runtime_dummy(self) -> None:
+        """Release the transient runtime-dummy execution view."""
+
+        if not self._runtime_dummy_row_count:
+            return
+        self.active_num_reqs = 0
+        self.execution_num_reqs = 0
+        self.dump_job_count = 0
+        self.dump_launch_count = 0
+        self.dump_before_cache_write = False
+        self._runtime_dummy_row_count = 0
         self._dram_table_row_count = 0
         self._dram_table_signature = None
 

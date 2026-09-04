@@ -1,9 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""复用 vLLM Connector 生命周期的 DSA L2/L3 双向入口。"""
+"""DSA 多级缓存接入 vLLM 原生 KVConnector 生命周期的入口。
+
+根据 connector 所在角色组合 scheduler handler 或 worker handler：调度侧
+完成外部 prefix 查询、分配后的 load 计划与 store 任务下发；worker 侧在
+既有回调中处理复用 fence、同步加载和异步卸载，并经 worker metadata
+回传完成结果。实际 payload 由 DSA worker DRAM store 持有。
+
+含 MTP 的真实 forward 先暂存 store metadata，等 proposer 完成对应 durable
+dump 后，再由 ``wait_for_save`` 放行上传，避免读取尚未写完整的 MTP plane。
+当前加载一次处理完整任务，``wait_for_layer_load`` 和 ``save_kv_layer``
+不提供 layerwise IO；L2 -> HBM restore 仍由 DSA runtime 执行。
+
+本模块负责生命周期衔接，不建立第二套 Scheduler，也不直接实现存储协议。
+单机DP正常退出在全域排空后，经原生worker RPC提前调用同一个shutdown路径；
+使用原生ensure_kv_transfer_shutdown清除全局引用，后续WorkerProc关闭自然幂等。
+"""
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import torch
@@ -71,16 +87,22 @@ class DSAL3Connector(KVConnectorBase_V1, SupportsHMA):
             )
         self.direct_hbm_load = direct_hbm_load
         self._has_mtp_component = schema.has_mtp
+        self.data_parallel_rank = int(getattr(vllm_config.parallel_config, "data_parallel_rank", 0))
+        self.data_parallel_size = int(getattr(vllm_config.parallel_config, "data_parallel_size", 1))
+        self.supports_dsa_namespace_reset = self.data_parallel_size == 1
         self._defer_store_until_wait = False
         self._deferred_store_metadata: DSAL3ConnectorMetadata | None = None
         self.scheduler_handler: DSAL3StoreScheduler | None = None
         self.worker_handler: DSAL3StoreWorker | None = None
         if role == KVConnectorRole.SCHEDULER:
             logger.info(
-                "DSA prefix tiers: target_hbm=%s local_l2=%s l3=%s",
+                "DSA prefix tiers: target_hbm=%s local_l2=%s l3=%s dp_rank=%d fingerprint=%s mtp=%s",
                 bool(vllm_config.cache_config.enable_prefix_caching),
                 bool(vllm_config.cache_config.enable_prefix_caching),
                 self.enable_load,
+                self.data_parallel_rank,
+                schema.fingerprint,
+                schema.has_mtp,
             )
             lookup_backend = (
                 DSAL3BackendAdapter.create_mooncake(
@@ -118,11 +140,13 @@ class DSAL3Connector(KVConnectorBase_V1, SupportsHMA):
             logger.info(
                 "DSA L3 worker backend active: tp_rank=%d "
                 "contributes_segment=True store_producer=%s "
-                "load_consumer=%s direct_hbm=%s",
+                "load_consumer=%s direct_hbm=%s dp_rank=%d fingerprint=%s",
                 tp_rank,
                 self.enable_store and tp_rank == 0,
                 self.enable_load,
                 self.direct_hbm_load,
+                self.data_parallel_rank,
+                schema.fingerprint,
             )
             self.worker_handler = DSAL3StoreWorker(
                 tp_rank=tp_rank,
@@ -152,6 +176,9 @@ class DSAL3Connector(KVConnectorBase_V1, SupportsHMA):
     def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
         del kwargs
         assert self.worker_handler is not None
+        if getattr(forward_context, "skip_kv_transfer", False):
+            # FULL dummy也有attention metadata，但不能暂存/完成真实MTP上传任务。
+            raise RuntimeError("DSA dummy forward must not enter the L3 connector lifecycle")
         if self._deferred_store_metadata is not None:
             raise RuntimeError(
                 "DSA MTP L3 store metadata survived into the next step; "
@@ -320,7 +347,16 @@ class DSAL3Connector(KVConnectorBase_V1, SupportsHMA):
     def get_finished_count(self) -> int | None:
         return 1
 
+    def reset_cache_for_dp(self, namespace_epoch: str) -> bool:
+        """仅供已暂停且持有管理租约的EngineCore事务提交统一epoch。"""
+        if self.data_parallel_size <= 1 or self.scheduler_handler is None:
+            raise RuntimeError("DSA coordinated namespace reset requires a DP scheduler connector")
+        return self.scheduler_handler.reset_cache(namespace_epoch=namespace_epoch)
+
     def reset_cache(self) -> bool:
+        if not self.supports_dsa_namespace_reset:
+            logger.warning("Uncoordinated DSA DP namespace reset rejected; use the online all-DP reset transaction")
+            return False
         if self.scheduler_handler is None:
             # reset_cache is scheduler-owned; worker payload is overwritten by
             # subsequent assignments and does not own the L3 key namespace.
@@ -339,3 +375,32 @@ class DSAL3Connector(KVConnectorBase_V1, SupportsHMA):
             self.worker_handler.shutdown()
         if self.scheduler_handler is not None:
             self.scheduler_handler.shutdown()
+
+
+def shutdown_dsa_l3_worker(worker: Any) -> bool:
+    """全域排空后的原生collective_rpc回调，只关闭DSA L3，不关闭模型或通信组。"""
+    from vllm.distributed.kv_transfer.kv_transfer_state import (
+        ensure_kv_transfer_shutdown,
+        get_kv_transfer_group,
+        has_kv_transfer_group,
+    )
+
+    config = worker.vllm_config.kv_transfer_config
+    if getattr(config, "kv_connector", None) != "DSAL3Connector":
+        raise RuntimeError("DSA resource shutdown RPC cannot close a different connector")
+    if has_kv_transfer_group():
+        connector = get_kv_transfer_group()
+        if not isinstance(connector, DSAL3Connector) or connector.worker_handler is None:
+            raise RuntimeError("DSA resource shutdown RPC requires its worker connector")
+        if connector._deferred_store_metadata is not None:
+            raise RuntimeError("DSA resource shutdown still has deferred MTP store metadata")
+        # DSA dump与record_event都在当前模型流；不要等待SDK可能常驻的通信流。
+        started = time.monotonic()
+        logger.info("DSA L3 resource close begin: stage=model-stream")
+        torch.npu.current_stream().synchronize()
+        logger.info(
+            "DSA L3 resource close completed: stage=model-stream elapsed_ms=%.3f",
+            (time.monotonic() - started) * 1000,
+        )
+        ensure_kv_transfer_shutdown()
+    return True

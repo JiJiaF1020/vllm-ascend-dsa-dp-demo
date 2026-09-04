@@ -28,6 +28,10 @@ from typing import Any
 # begin-env-vars-definition
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Existing Python environment variable, not a new Ascend tuning switch.
+    # Non-sensitive; default None. DSA DP shared L3 requires the same decimal
+    # seed in [0, 4294967295] in all processes, set before launching Python.
+    "PYTHONHASHSEED": lambda: os.getenv("PYTHONHASHSEED"),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

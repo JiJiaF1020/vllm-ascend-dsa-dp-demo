@@ -27,6 +27,7 @@ from vllm_ascend.dsa_offload.contracts import (
     DSA_SFA_COMPUTE_TOPK,
     DSA_SUPPORTED_INDEX_HEAD_COUNTS,
 )
+from vllm_ascend.dsa_offload.dp_context import require_dsa_shared_l3_hash_seed
 from vllm_ascend.dsa_offload.model_support import (
     DSAOffloadModelCapabilities,
     require_dsa_offload_model_support,
@@ -392,6 +393,38 @@ class DSAOffloadConfig:
         scheduler_config = vllm_config.scheduler_config
         parallel_config = vllm_config.parallel_config
         observability_config = vllm_config.observability_config
+        data_parallel_size = int(
+            getattr(parallel_config, "data_parallel_size", 1)
+        )
+
+        if data_parallel_size > 1:
+            if not bool(
+                getattr(parallel_config, "enable_expert_parallel", False)
+            ):
+                raise ValueError(
+                    "DSA single-node DP initially requires "
+                    "enable_expert_parallel=True"
+                )
+            if str(
+                getattr(parallel_config, "data_parallel_backend", "mp")
+            ) == "ray":
+                raise ValueError(
+                    "DSA single-node DP initially supports the mp backend, "
+                    "not Ray"
+                )
+            if bool(getattr(parallel_config, "enable_elastic_ep", False)):
+                raise ValueError(
+                    "DSA single-node DP does not yet support elastic EP"
+                )
+            if bool(
+                getattr(parallel_config, "data_parallel_external_lb", False)
+            ) or bool(
+                getattr(parallel_config, "data_parallel_hybrid_lb", False)
+            ):
+                raise ValueError(
+                    "DSA single-node DP initially supports online internal "
+                    "load balancing or offline SPMD only"
+                )
 
         max_num_seqs = int(scheduler_config.max_num_seqs or 0)
         if max_num_seqs > self.max_active_reqs:
@@ -489,6 +522,13 @@ class DSAOffloadConfig:
                     f"{DSA_NOMTP_SUPPORTED_RESIDENT_BUDGETS}; unsupported="
                     f"{unsupported_nomtp_budgets}"
                 )
+        if data_parallel_size > 1 and speculative_config is not None:
+            if not bool(getattr(speculative_config, "enforce_eager", False)):
+                raise ValueError("DSA DP MTP requires speculative_config.enforce_eager=True for the proposer")
+            draft_tp = getattr(speculative_config, "draft_tensor_parallel_size", None)
+            target_tp = int(getattr(parallel_config, "tensor_parallel_size", 1))
+            if draft_tp is not None and int(draft_tp) != target_tp:
+                raise ValueError("DSA DP MTP requires the same target and draft tensor_parallel_size")
         kv_transfer_config = vllm_config.kv_transfer_config
         if kv_transfer_config is not None:
             connector_name = str(kv_transfer_config.kv_connector)
@@ -523,16 +563,14 @@ class DSAOffloadConfig:
                 raise ValueError(
                     "DSA L3 first version supports backend='mooncake' only"
                 )
-            if int(getattr(parallel_config, "data_parallel_size", 1)) != 1:
-                raise ValueError(
-                    "DSA L3 first version requires data_parallel_size=1"
-                )
             if int(getattr(vllm_config, "shutdown_timeout", 0)) <= 0:
                 raise ValueError(
                     "DSA L3 asynchronous write-behind requires "
                     "shutdown_timeout>0 so pending stores can drain before "
                     "Mooncake segment teardown"
                 )
+            if data_parallel_size > 1:
+                require_dsa_shared_l3_hash_seed()
         if parallel_config.decode_context_parallel_size != 1 or parallel_config.prefill_context_parallel_size != 1:
             raise ValueError("DSA split Indexer/MLA cache does not yet support decode or prefill context parallelism")
         if parallel_config.pipeline_parallel_size != 1:

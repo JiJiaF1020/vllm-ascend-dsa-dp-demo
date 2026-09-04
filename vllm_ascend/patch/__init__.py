@@ -253,6 +253,38 @@
 #       Remove this patch once upstream vLLM supports hybrid KV cache + CP for
 #       non-CUDA backends, or exposes a platform hook for this behavior.
 #
+# ** 10aa. File: platform/patch_dsa_data_parallel.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.v1.engine.core.DPEngineCoreProc._init_data_parallel`
+#    Why:
+#       DSA L2 planning runs later from the KV-cache utility patch, but the
+#       stateless EngineCore DP process group is owned by DPEngineCoreProc and
+#       has no public lookup hook. Recreating a second group would add another
+#       rendezvous and can break collective ordering.
+#    How:
+#       After the original DP initialization, publish the existing group into
+#       a process-local DSA initialization context. It is used once before any
+#       L2 arena allocation to gather a single-node memory/capacity snapshot;
+#       it is not used in the forward hot path.
+#    Related PR (if no, explain why):
+#       No. This is a DSA sparse-offload initialization contract.
+#    Future Plan:
+#       Replace this patch if upstream exposes an EngineCore initialization
+#       hook or a supported way for backend KV planners to access the DP group.
+#   2. `DPLBAsyncMPClient.call_utility_async` and `DPEngineCoreProc.add_request`
+#    Why/How:
+#       DSA prefix administration needs all-DP acknowledgements and one epoch.
+#       Intercept only DSA-owned management, preserve native MM/encoder startup
+#       resets, and reject new requests after an uncertain management failure.
+#   3. `DPEngineCoreProc._handle_shutdown`
+#    Why/How:
+#       The native worker death-pipe teardown only waits 4s + 4s. After all DSA
+#       DP engines drain, close only their L3 resources via native collective_rpc
+#       while worker RPC queues are alive. Gather all-DP close results using the
+#       existing Store, then use the final CPU barrier and native process teardown.
+#       Abort mode skips early close. Non-DSA/DP1 paths and generic timeouts stay
+#       unchanged; the code depends on pinned v0.23 private lifecycle methods.
+#
 # ** 10ab. File: worker/patch_v2/patch_attn_utils.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.worker.gpu.attn_utils.get_kv_cache_spec`

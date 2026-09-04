@@ -16,6 +16,52 @@
 {doc}`dsa_offload_design` 为总设计。本文只展开 L1/L2/L3 分层缓存、
 Connector 生命周期、异步上传和后续 HBM 热层复用。
 
+**2026-09-09单机DP进展补记**：无MTP的DP2/TP4/EP8共享Mooncake TCP主路径已
+完成P5实机回归。P6-A固定MTP3共享L3已完成代码接入与组合UT，并通过A5单40k、
+128输出tokens、7请求功能闭环：三次外部回载均包含目标域四TP的324块三组件
+load/restore，两域prewrite/postwrite均出现。后续8k/70k交换域及local reset并发
+回载的8请求也已通过，4个外部请求对应16条TP完成记录，两个DP均实际重放Graph。
+P6-A主数据路径可阶段性收口，数值等价、逐轮图覆盖、故障/长稳及生命周期仍待验收；
+P6-B在线internal-DP正常管理主闭环已通过A5八请求验证：在途请求/IO排空后local
+reset、两域统一external epoch、新epoch双向跨域回读和pause期间排队后resume。
+后续九请求补测也通过了已暂停且DP0有1条排队请求时的local/external reset，
+显式resume后新epoch冷算及跨域回读。管理故障注入、暂停期间退出和长稳仍待实机覆盖；失败保留owner、要求重启，
+不提供跨进程故障恢复。具体运行证据见示例README的P6-B验收记录。
+单机offline SPMD也已通过Graph+MTP3的12请求cold/local/cross-L3闭环，
+两域all drained及所有IO结果完成有实机证据；该轮worker随后仍由基线升级SIGKILL，
+不能由脚本PASS外推资源注销/关闭及干净退出。
+2026-09-10针对2bd00308补入退出前资源关闭：所有域drain后，在worker RPC队列仍
+存活时完成当前模型流同步和原生Connector shutdown；全TP及全DP确认后才进入原生
+进程退出。保留原生4秒+4秒终止策略，新增关闭阶段耗时和失败状态。
+后续六请求运行`dsa-dp-offline-9bedef1c841d4119b17e8230d47b7b61`已确认八个
+worker全部成功注销123个region并完成backend关闭，两个Core均收到全TP成功回执；
+随后仍SIGKILL。因此L3资源关闭已验收，剩余问题限于此后的worker退出流程，
+具体阻塞位置及归属未定，不能直接判为Mooncake关闭阻塞或已证明的基线缺陷。
+后续`dsa-dp-offline-98e3407215834cb7af79b374a9e39f3f`八worker的atexit之后
+两次快照均停在TorchNPU post6的`runtime_lifecycle.py:15`，已按相同git版本
+确认是`_C._npu_shutdown(success)`。剩余native资源清理超过原生等待窗口，
+不是L3 IO未排空；内部具体步骤及是否受DSA资源使用触发仍未确定。
+此问题单列已知生命周期限制，不阻塞单机DP正常功能阶段性收口，也不宣称干净退出通过。
+999c9727后的收尾仅清理正式示例的临时退出探针、诊断RPC、zip打包与专用pickle配置，
+保留全域drain、全TP资源关闭回执及原生幂等清理；不改生产模块、算子或eager/Graph元数据。
+常规回归入口见示例README“单机DP收尾回归”，本次只要求UT，不重复申请八卡跑已验矩阵。
+offline单域external reset与direct-HBM仍拒绝。本文下述P0/P1/P2是分层缓存早期阶段编号，
+不与DP方案P0-P6混用；具体启动/测试入口以`examples/dsa_demo/README.md`为准。
+
+P6-A继续由各域TP0上传完整Indexer/MLA/MTP bundle，load成功只在本域TP组
+汇总，不增加EP级IO collective。MTP模型身份加入schema，具体DP/rank不进入
+key；proposer完成copy校验后才放行store，dummy的独立forward context必须
+保留禁IO标记。旧MTP namespace不复用、由后端自然淘汰；无MTP key规则不变。
+partial MTP key不可读、短读、同TP组失败均不得发布成功，load失败仍fail-fast。
+
+P6-B只改低频管理面：PAUSED_NEW期间新请求排队，运行请求和write-behind继续排空；
+DSA waiting-prefill判断不能阻塞此时的decode排空。prepare只读检查全部pool的
+零引用状态与待消费load/restore；commit清本地hash及未分配lookup候选，external
+reset使用统一UUID epoch而不是各域自增计数。所有commit确认后才resume，预先
+paused的服务保持paused。HTTP取消不会自动取消已开始的事务；管理owner无TTL，
+未知失败不能由另一API前端自动接手。该方案不物理删除Mooncake对象，也不保证
+重启后延续该epoch。正常退出沿用全域drain后再释放segment的P5机制。
+
 当前状态：**P0 Store-owned TCP 的单卡、跨 NUMA 与 TP8 120-plane 门禁已通过；
 P1-W rank0 异步 write-behind 已完成 TCP 框架适配、UT，以及 TP8 离线单 40K
 长请求的 eager/graph、5K+8K+40K+70K 混合长度多请求 graph/chunked prefill
@@ -1397,7 +1443,7 @@ executor grace period 后被发送 SIGTERM，但该提示发生在 6 个 store j
 - external L2/HBM 联合 admission；
 - all-rank `L3 -> local L2` Store get；
 - 复用现有 L2->HBM restore 后进入 forward；
-- no-MTP 已上板；固定 MTP3 代码接入、待上板；fail-fast、Mooncake only。
+- no-MTP及固定MTP3正常主路径已上板，含TP8和单机DP2/TP4组合；fail-fast、Mooncake only。
 
 上述代码项已完成。scheduler 使用不贡献 segment 的 Mooncake client 查询本地 L2
 命中后的 Indexer/MLA/可选 MTP key；allocator 在修改任一 pool 前联合检查 split HBM

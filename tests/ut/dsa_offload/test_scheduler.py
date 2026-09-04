@@ -68,6 +68,9 @@ class _AdmissionGate:
 
 def _make_scheduler() -> DSAOffloadScheduler:
     scheduler = object.__new__(DSAOffloadScheduler)
+    # __new__ also bypasses Ascend's BalanceScheduler.__init__ when patched in.
+    scheduler._balance_enabled = False
+    scheduler._disable_preemption = False
     scheduler.policy = SchedulingPolicy.FCFS
     scheduler.waiting = create_request_queue(scheduler.policy)
     scheduler.skipped_waiting = create_request_queue(scheduler.policy)
@@ -86,6 +89,39 @@ def _make_scheduler() -> DSAOffloadScheduler:
     )
     scheduler._pause_state = PauseState.UNPAUSED
     return scheduler
+
+
+def test_reset_running_requests_is_rejected_before_queue_mutation(monkeypatch) -> None:
+    scheduler = _make_scheduler()
+    request = _Request("active", 5000, 2048, 0, 5000)
+    scheduler.running = [request]
+    calls = []
+    monkeypatch.setattr(Scheduler, "reset_prefix_cache", lambda *args, **kwargs: calls.append(args))
+
+    assert scheduler.reset_prefix_cache(reset_running_requests=True) is False
+    assert scheduler.running == [request]
+    assert calls == []
+
+
+def test_dp_l3_external_reset_is_rejected_before_any_local_mutation(monkeypatch) -> None:
+    scheduler = _make_scheduler()
+    scheduler.dsa_l3_enabled = True
+    scheduler.connector = SimpleNamespace(supports_dsa_namespace_reset=False)
+    calls = []
+    monkeypatch.setattr(Scheduler, "reset_prefix_cache", lambda *args, **kwargs: calls.append(args))
+    assert scheduler.reset_prefix_cache(reset_connector=True) is False
+    assert calls == []
+
+
+def test_external_reset_without_connector_keeps_native_success_semantics() -> None:
+    from vllm.v1.core.block_pool import BlockPool
+
+    scheduler = _make_scheduler()
+    scheduler.dsa_l3_enabled = False
+    scheduler.connector = None
+    pool = BlockPool(num_gpu_blocks=4, enable_caching=True, hash_block_size=128)
+    scheduler.kv_cache_manager = SimpleNamespace(reset_prefix_cache=pool.reset_prefix_cache)
+    assert scheduler.reset_prefix_cache(reset_connector=True) is True
 
 
 def test_prefill_detection_uses_uncomputed_prompt_tokens() -> None:
@@ -288,6 +324,31 @@ def test_no_waiting_requests_use_the_upstream_schedule_fast_path(
     monkeypatch.setattr(Scheduler, "schedule", lambda self: marker)
 
     assert scheduler.schedule() is marker
+
+
+def test_pause_wait_keeps_decode_running_despite_waiting_prefill(monkeypatch) -> None:
+    scheduler = _make_scheduler()
+    decode = _Request("decode", 1000, 1000, 1, 1001)
+    waiting = _Request("waiting", 4096, 0, 0, 4096, status=RequestStatus.WAITING)
+    scheduler.running = [decode]
+    scheduler.waiting.add_request(waiting)
+    scheduler.dsa_coordinator = _AdmissionGate(True)
+    scheduler._pause_state = PauseState.PAUSED_NEW
+    scheduler._attach_dsa_cache_layout = lambda output: output
+    seen = []
+    marker = object()
+
+    def schedule(self):
+        seen.extend(self.running)
+        assert self._pause_state == PauseState.PAUSED_NEW
+        return marker
+
+    monkeypatch.setattr(Scheduler, "schedule", schedule)
+    assert scheduler.schedule() is marker
+    assert seen == [decode]
+    assert scheduler.running == [decode]
+    assert scheduler.waiting.peek_request() is waiting
+    assert scheduler.dsa_coordinator.calls == 0
 
 
 def test_inflight_prefill_skips_fast_path_and_withholds_decode(

@@ -102,6 +102,10 @@ class DSABlockPoolView:
         # 加权平均更能反映 DSA 的真实可调度容量。
         return max(pool.get_usage() for pool in self.block_pools)
 
+    def can_reset_prefix_cache(self) -> bool:
+        """复用基线BlockPool的零引用判据，只检查而不清理任何一个pool。"""
+        return all(pool.num_gpu_blocks - pool.get_num_free_blocks() == 1 for pool in self.prefix_cache_pools)
+
     def reset_prefix_cache(self) -> bool:
         # ``all(generator)`` 会在首个 False 处短路，导致后续物理池没有被
         # reset。所有 pool 都必须尝试，避免 HBM MTP 与 DRAM bundle 只
@@ -276,6 +280,7 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
                 "capacity plan"
             )
         self.kv_cache_config = kv_cache_config
+        self.data_parallel_rank = kv_cache_config.dram_capacity.data_parallel_rank
         self.max_model_len = max_model_len
         self.enable_caching = bool(enable_caching)
         self.scheduler_block_size = scheduler_block_size
@@ -606,6 +611,15 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
                 )
             )
         return tuple(hbm_hit_blocks), final_tokens
+
+    def can_reset_prefix_candidates(self) -> bool:
+        """未分配的lookup候选可丢弃，已分配的restore/load计划必须先消费完。"""
+        return not (self._pending_prefix_restores or self._pending_external_prefix_loads)
+
+    def clear_prefix_candidates(self) -> None:
+        if not self.can_reset_prefix_candidates():
+            raise RuntimeError("DSA reset still has allocated prefix restore/load plans")
+        self._pending_prefix_hits.clear()
 
     def get_pending_prefix_hit(
         self,

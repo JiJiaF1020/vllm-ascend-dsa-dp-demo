@@ -1287,6 +1287,65 @@ def test_mtp_full_cache_dumps_confirmed_block_before_proposer_write(
         assert torch.equal(dram[3], source[2])
 
 
+def test_dp_mtp_durable_completion_and_payload_are_local(monkeypatch) -> None:
+    runtimes = []
+    stores = []
+    contexts = []
+    for rank in (0, 1):
+        _, runtime, store = _make_runtime(
+            max_decode_query_len=4, enable_prefix_caching=True, mtp_durable_offload=True,
+        )
+        store.add_mtp_layer(
+            layer_id=0,
+            mtp_full_cache=tuple(torch.full((4, 4, width), rank + 3, dtype=torch.bfloat16) for width in (2, 1, 1)),
+        )
+        runtime._forward_epoch = 7
+        runtime.dump_job_count = 1
+        runtime.dump_before_cache_write = True
+        runtime.dump_mtp_src_block_ids.gpu[0] = 2
+        runtime.dump_dst_block_ids.gpu[0] = 3
+        runtimes.append(runtime)
+        stores.append(store)
+        contexts.append(DSAMTPFullCacheOffloadContext(layer_id=0, runtime=runtime))
+
+    calls = []
+
+    def copy_blocks(*, source_bytes, dram_bytes, src_block_ids, dst_block_ids):
+        calls.append(dram_bytes.data_ptr())
+        dram_bytes[dst_block_ids.long()] = source_bytes[src_block_ids.long()]
+
+    monkeypatch.setattr(runtime_module, "dump_full_cache_plane_bytes", copy_blocks)
+    contexts[0].dump_full_blocks(before_cache_write=True)
+    runtimes[0].validate_mtp_dump_completion()
+    with pytest.raises(RuntimeError, match="missing_layers"):
+        runtimes[1].validate_mtp_dump_completion()
+    assert len(calls) == 3
+    for plane in stores[1].get_mtp_layer_arenas(0).dram_bytes:
+        assert torch.count_nonzero(plane) == 0
+
+    runtimes[1].prepare_runtime_dummy(row_count=1)
+    contexts[1].dump_full_blocks(before_cache_write=True)
+    contexts[1].dump_full_blocks(before_cache_write=False)
+    assert len(calls) == 3
+    assert runtimes[1]._forward_epoch == 7
+    assert runtimes[1]._mtp_layer_dump_epochs == {}
+    runtimes[1].restore_after_runtime_dummy()
+
+    # The next real plan repopulates the transient IO view on the same owner.
+    runtimes[1].dump_job_count = 1
+    runtimes[1].dump_before_cache_write = True
+    runtimes[1].dump_mtp_src_block_ids.gpu[0] = 2
+    runtimes[1].dump_dst_block_ids.gpu[0] = 3
+    contexts[1].dump_full_blocks(before_cache_write=True)
+    runtimes[1].validate_mtp_dump_completion()
+    assert len(calls) == 6
+    for rank, store in enumerate(stores):
+        arenas = store.get_mtp_layer_arenas(0)
+        for source, dram in zip(arenas.source_bytes, arenas.dram_bytes, strict=True):
+            assert torch.equal(dram[3], source[2])
+        assert runtimes[rank]._mtp_layer_dump_epochs[0] == 7
+
+
 def test_mtp_full_cache_ignores_target_graph_noop_padding(monkeypatch) -> None:
     _, runtime, store = _make_runtime(
         max_decode_query_len=4,
@@ -1630,3 +1689,93 @@ def test_graph_capture_runtime_can_be_reused_for_multiple_sizes() -> None:
         assert runtime.execution_num_reqs == 0
         assert runtime.dump_job_count == 0
         assert runtime.dump_launch_count == 0
+
+
+def test_runtime_dummy_uses_only_null_and_noop_io_rows() -> None:
+    _, runtime, _ = _make_runtime(max_num_reqs=4)
+    epoch_before = runtime._forward_epoch
+
+    runtime.prepare_runtime_dummy(row_count=4)
+
+    assert runtime.graph_capture_row_count == 0
+    assert runtime.runtime_dummy_row_count == 4
+    assert runtime.active_num_reqs == 4
+    assert runtime.execution_num_reqs == 4
+    assert runtime.dump_job_count == 0
+    assert runtime.dump_launch_count == 4
+    assert runtime.active_dram_block_table.gpu[:4].eq(0).all()
+    assert runtime.dump_src_block_ids.gpu[:4].eq(0).all()
+    assert runtime.dump_indexer_src_block_ids.gpu[:4].eq(0).all()
+    assert runtime.dump_dst_block_ids.gpu[:4].eq(-1).all()
+    assert runtime._forward_epoch == epoch_before
+
+    runtime.restore_after_runtime_dummy()
+
+    assert runtime.runtime_dummy_row_count == 0
+    assert runtime.active_num_reqs == 0
+    assert runtime.execution_num_reqs == 0
+    assert runtime.dump_job_count == 0
+    assert runtime.dump_launch_count == 0
+
+
+def test_prefix_state_survives_peer_idle_dummy_before_hbm_backfill(monkeypatch) -> None:
+    resident_pool, runtime, store = _make_runtime(enable_prefix_caching=True)
+    state = DSAInputBatchCacheLayout(
+        max_num_reqs=1, device=torch.device("cpu"), pin_memory=False,
+        resident_token_pool=resident_pool,
+    )
+    input_batch = SimpleNamespace(
+        num_reqs=1, req_ids=["req-0"], req_id_to_index={"req-0": 0},
+        num_computed_tokens_cpu=np.array([256], dtype=np.int32),
+        block_table=[_ResidentBlockTable(), _ResidentBlockTable()],
+    )
+    state.refresh(
+        input_batch=input_batch,
+        projection=DSARequestCacheLayoutProjection(
+            request_ids=("req-0",), stages=(int(DSARequestCacheStage.PREFILL),),
+            target_resident_budget_tokens=(256,), sparse_budget_tokens=(0,),
+            resident_valid_tokens=(-1,), resident_block_table_replacements=(),
+        ),
+    )
+    pool_index = resident_pool.get_index("req-0")
+    store.apply_assignment(pool_index=pool_index, logical_block_start=0, physical_block_ids=(1, 2))
+    # L1 covers two blocks; L2 only has its first block ready.
+    restore = DSADRAMBlockRestore(
+        request_id="req-0", source_dram_block_ids=(), destination_indexer_block_ids=(),
+        destination_resident_block_ids=(), logical_block_start=1, ready_block_count=1,
+    )
+    copy_calls = []
+    monkeypatch.setattr(runtime, "_execute_prefix_restore_jobs", lambda count: copy_calls.append(count))
+    runtime.prepare_prefix_restore_jobs(restores=(restore,), state=state)
+    assert copy_calls == []
+    table_before = store.logical_block_table.copy()
+    columns_before = state.columns.cpu.clone()
+    pointers_before = (state.columns.gpu.data_ptr(), runtime.active_dram_block_table.gpu.data_ptr())
+    epoch_before = runtime._forward_epoch
+
+    state.prepare_runtime_dummy(row_count=1)
+    runtime.prepare_runtime_dummy(row_count=1)
+    with pytest.raises(RuntimeError, match="inside a dummy"):
+        runtime.prepare_prefix_restore_jobs(restores=(restore,), state=state)
+    assert store.durable_full_block_counts[pool_index] == 1
+    assert runtime._forward_epoch == epoch_before
+    np.testing.assert_array_equal(store.logical_block_table, table_before)
+    assert resident_pool.get_index("req-0") == pool_index
+    runtime.restore_after_runtime_dummy()
+    state.restore_after_runtime_dummy()
+    assert torch.equal(state.columns.cpu, columns_before)
+    assert torch.equal(state.columns.gpu, columns_before)
+    assert pointers_before == (state.columns.gpu.data_ptr(), runtime.active_dram_block_table.gpu.data_ptr())
+
+    runtime.prepare_forward(
+        input_batch=input_batch, state=state,
+        num_scheduled_tokens=np.array([1], dtype=np.int32),
+        req_indices=torch.zeros(1, dtype=torch.int64), positions=torch.tensor([256]),
+        num_reqs=1, num_tokens=1, resident_group_id=0, indexer_group_id=1, decode_forward=False,
+    )
+    assert runtime.dump_job_count == 1
+    assert runtime.dump_dst_block_ids.np[0] == 2
+    assert runtime.dump_src_block_ids.np[0] == 11
+    assert store.durable_full_block_counts[pool_index] == 2
+    assert runtime._forward_epoch == epoch_before + 1
+    assert copy_calls == []
