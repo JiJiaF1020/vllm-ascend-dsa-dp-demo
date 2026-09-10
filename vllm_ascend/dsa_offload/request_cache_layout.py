@@ -77,6 +77,7 @@ class DSARequestCachePlan:
     indexer_tokens_need_slot: int
     sparse_budget_tokens: int
     resident_valid_tokens: int
+    # 表示当前部分块；MTP待dump满块由manager结合已完成的DRAM水位补充保留。
     preserve_resident_tail_block: bool
     resident_tail_block_count: int = 1
 

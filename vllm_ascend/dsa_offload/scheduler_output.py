@@ -14,7 +14,7 @@ vLLM v0.23 的 ``SchedulerOutput`` 对 cached request 只传新增 block IDs，
 * 只有 ENTER 行携带 resident block IDs 全量快照。
 * DRAM 目录只传本轮新增的连续 assignment 后缀，不重传完整逻辑表。
 * prefix-hit 行额外携带一次性的 Indexer/MLA/可选 MTP restore 列；每行 ready 水位
-  只供 scheduler 在 worker 成功返回后发布 DRAM hash。
+  在 worker 成功返回后提交，供hash发布和MTP ENTER源块保活使用。
 
 多进程执行器使用 pickle 传递 scheduler output，因此该类型化子类会随普通
 ``SchedulerOutput`` 一起跨进程恢复。worker 最终仍按自己的 ``InputBatch``

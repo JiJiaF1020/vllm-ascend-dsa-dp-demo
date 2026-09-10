@@ -1201,7 +1201,7 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
         self,
         request_id: str,
         *,
-        preserve_tail_block: bool,
+        num_computed_tokens: int,
     ) -> bool:
         """释放已 dump 的 dense-prefill MLA 满块，只保留不满尾块。
 
@@ -1215,8 +1215,13 @@ class DSAKVCacheCoordinator(KVCacheCoordinator):
         if not req_blocks:
             return False
 
-        preserved_tail = req_blocks[-1] if preserve_tail_block else None
-        releasable = req_blocks[:-1] if preserved_tail is not None else req_blocks
+        block_size = self.resident_manager.block_size
+        tail_index = int(num_computed_tokens) // block_size if num_computed_tokens % block_size else None
+        if num_computed_tokens < 0 or (tail_index is not None and tail_index >= len(req_blocks)):
+            raise RuntimeError("DSA prefill tail is outside the computed resident block table")
+        # Lookahead may allocate later blocks that contain no computed KV yet.
+        preserved_tail = req_blocks[tail_index] if tail_index is not None else None
+        releasable = [block for index, block in enumerate(req_blocks) if index != tail_index]
         self.resident_manager.req_to_blocks[request_id] = [preserved_tail] if preserved_tail is not None else []
         if releasable:
             self.resident_manager.block_pool.free_blocks(reversed(releasable))

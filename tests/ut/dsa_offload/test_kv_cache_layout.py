@@ -19,6 +19,9 @@ from vllm_ascend.dsa_offload.request_cache_layout import (
 @dataclass(frozen=True)
 class _Block:
     block_id: int
+    ref_cnt: int = 1
+    is_null: bool = False
+    block_hash: object | None = None
 
 
 class _Pool:
@@ -129,6 +132,7 @@ class _DRAMDirectory:
         self.freed_request_ids: list[str] = []
         self.attached: dict[str, tuple[_Block, ...]] = {}
         self.request_blocks: dict[str, list[_Block]] = {}
+        self.ready_counts: dict[str, int] = {}
         self._next_id = 9100
 
     def can_attach_cached_prefix(
@@ -167,6 +171,9 @@ class _DRAMDirectory:
         return tuple(
             block.block_id for block in self.request_blocks[request_id]
         )
+
+    def get_ready_block_count(self, request_id: str) -> int:
+        return self.ready_counts.get(request_id, 0)
 
     def free_request(self, request_id: str) -> tuple[int, ...]:
         self.freed_request_ids.append(request_id)
@@ -246,7 +253,7 @@ def test_dense_enter_sparse_keeps_indexer_full_and_resident_fixed() -> None:
     request.num_computed_tokens = 3000
     coordinator.release_prefill_resident_blocks(
         "req",
-        preserve_tail_block=True,
+        num_computed_tokens=request.num_computed_tokens,
     )
     preserved_tail = coordinator.resident_manager.req_to_blocks["req"][0]
 
@@ -281,7 +288,7 @@ def test_enter_canonicalizes_descending_sparse_budget_blocks(
     request.num_computed_tokens = 3000
     coordinator.release_prefill_resident_blocks(
         request.request_id,
-        preserve_tail_block=True,
+        num_computed_tokens=request.num_computed_tokens,
     )
     preserved_tail = coordinator.resident_manager.req_to_blocks[
         request.request_id
@@ -713,7 +720,7 @@ def test_block_aligned_prefill_enter_allocates_a_new_tail_block() -> None:
     request.num_computed_tokens = 2048
     assert coordinator.release_prefill_resident_blocks(
         "req",
-        preserve_tail_block=False,
+        num_computed_tokens=request.num_computed_tokens,
     )
     assert not coordinator.resident_manager.req_to_blocks["req"]
 
@@ -746,7 +753,7 @@ def test_mtp_enter_installs_two_fixed_parity_tail_blocks(
     request.num_computed_tokens = 3000
     coordinator.release_prefill_resident_blocks(
         "req",
-        preserve_tail_block=True,
+        num_computed_tokens=request.num_computed_tokens,
     )
     preserved_tail = coordinator.resident_manager.req_to_blocks["req"][0]
     pool = coordinator.resident_manager.block_pool
@@ -812,7 +819,7 @@ def test_mtp_full_plane_stays_dense_after_target_enters_sparse() -> None:
     request.num_computed_tokens = 3000
     coordinator.release_prefill_resident_blocks(
         "req",
-        preserve_tail_block=True,
+        num_computed_tokens=request.num_computed_tokens,
     )
 
     request.num_output_tokens = 1

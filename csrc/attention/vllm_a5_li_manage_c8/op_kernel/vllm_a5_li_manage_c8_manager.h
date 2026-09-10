@@ -18,7 +18,7 @@ using namespace AscendC;
 
 constexpr uint32_t BLOCK_SIZE = 128;
 constexpr uint32_t TOPK = 2048;
-constexpr uint32_t TAIL_CAPACITY = BLOCK_SIZE;
+constexpr uint32_t TAIL_CAPACITY = 2 * BLOCK_SIZE;
 constexpr uint32_t TAIL_BLOCK_COUNT = 2;
 constexpr uint32_t TAIL_STORAGE_CAPACITY =
     TAIL_BLOCK_COUNT * BLOCK_SIZE;
@@ -63,6 +63,7 @@ public:
         GM_ADDR candidateLens, GM_ADDR finalSeqLengthsKv,
         GM_ADDR rowModes, GM_ADDR reqPoolEntries,
         GM_ADDR cacheSlotsPool, GM_ADDR sparseAndTailSlots,
+        GM_ADDR sparseAndTailSrcIds, GM_ADDR perQueryMissCounts,
         GM_ADDR residentSeqLengths, GM_ADDR copySrcIds,
         GM_ADDR copyDstSlots, GM_ADDR copyCounts,
         uint32_t coreIdx, uint32_t topkRowStride)
@@ -80,6 +81,10 @@ public:
         cacheSlotsPoolGm_.SetGlobalBuffer((__gm__ int32_t *)cacheSlotsPool);
         sparseAndTailSlotsGm_.SetGlobalBuffer(
             (__gm__ int32_t *)sparseAndTailSlots);
+        sparseAndTailSrcIdsGm_.SetGlobalBuffer(
+            (__gm__ int32_t *)sparseAndTailSrcIds);
+        perQueryMissCountsGm_.SetGlobalBuffer(
+            (__gm__ int32_t *)perQueryMissCounts);
         residentSeqLengthsGm_.SetGlobalBuffer(
             (__gm__ int32_t *)residentSeqLengths);
         copySrcIdsGm_.SetGlobalBuffer((__gm__ int32_t *)copySrcIds);
@@ -88,6 +93,7 @@ public:
 
         pipe_->InitBuffer(topkBuf_, TOPK * sizeof(int32_t));
         pipe_->InitBuffer(slotBuf_, ATTENTION_CAPACITY * sizeof(int32_t));
+        pipe_->InitBuffer(sourceBuf_, ATTENTION_CAPACITY * sizeof(int32_t));
         pipe_->InitBuffer(cacheChunkBuf_, CACHE_CHUNK * sizeof(int32_t));
         pipe_->InitBuffer(protectedSlotBuf_, MAX_CACHE_TOKENS * sizeof(uint8_t));
         pipe_->InitBuffer(hashBuf_, HASH_CAPACITY * sizeof(uint32_t));
@@ -228,44 +234,52 @@ private:
         WaitFlag<HardEvent::MTE3_S>(EVENT_ID3);
     }
 
-    __aicore__ inline void InitAttentionSlots(
-        LocalTensor<int32_t> slots)
+    __aicore__ inline void InitAttentionRows(
+        LocalTensor<int32_t> slots, LocalTensor<int32_t> sources)
     {
         Duplicate(slots, INVALID, ATTENTION_CAPACITY);
+        Duplicate(sources, INVALID, ATTENTION_CAPACITY);
         // The following scalar SetValue calls selectively overwrite this
         // vector fill. Explicit V->S ordering prevents the fill from racing
         // with those writes and leaving a partially initialized output row.
         SyncPipes<HardEvent::V_S>();
     }
 
-    __aicore__ inline void StoreAttentionSlots(
-        uint32_t queryRow, LocalTensor<int32_t> slots)
+    __aicore__ inline void StoreAttentionRows(
+        uint32_t queryRow, LocalTensor<int32_t> slots,
+        LocalTensor<int32_t> sources)
     {
+        const uint64_t offset =
+            static_cast<uint64_t>(queryRow) * ATTENTION_CAPACITY;
+        StoreRange(sparseAndTailSlotsGm_[offset], slots, ATTENTION_CAPACITY);
         StoreRange(
-            sparseAndTailSlotsGm_[
-                static_cast<uint64_t>(queryRow) * ATTENTION_CAPACITY],
-            slots, ATTENTION_CAPACITY);
+            sparseAndTailSrcIdsGm_[offset], sources, ATTENTION_CAPACITY);
     }
 
-    __aicore__ inline void ClearAttentionSlots(uint32_t queryRow)
+    __aicore__ inline void ClearAttentionRows(
+        uint32_t queryRow, int32_t missCount)
     {
         LocalTensor<int32_t> slots = slotBuf_.Get<int32_t>();
-        InitAttentionSlots(slots);
-        StoreAttentionSlots(queryRow, slots);
+        LocalTensor<int32_t> sources = sourceBuf_.Get<int32_t>();
+        InitAttentionRows(slots, sources);
+        StoreAttentionRows(queryRow, slots, sources);
+        WriteOutputScalar(perQueryMissCountsGm_[queryRow], missCount);
     }
 
     __aicore__ inline bool AppendCausalTail(
         uint32_t queryRow, uint32_t queryEnd,
-        uint32_t finalLen, uint32_t budget,
-        LocalTensor<int32_t> slots)
+        uint32_t sourceLen, uint32_t finalLen, uint32_t budget,
+        LocalTensor<int32_t> slots, LocalTensor<int32_t> sources)
     {
         const uint32_t laterQueries = queryEnd - 1U - queryRow;
         if (finalLen <= laterQueries) {
             return false;
         }
         const uint32_t visibleLen = finalLen - laterQueries;
-        const uint32_t tailTokenStart =
-            ((visibleLen - 1U) / BLOCK_SIZE) * BLOCK_SIZE;
+        const uint32_t tailTokenStart = sourceLen;
+        if (visibleLen < tailTokenStart) {
+            return false;
+        }
         const uint32_t tailCount = visibleLen - tailTokenStart;
         if (tailCount > TAIL_CAPACITY) {
             return false;
@@ -276,44 +290,60 @@ private:
                 TOPK + index,
                 static_cast<int32_t>(
                     budget + token % TAIL_STORAGE_CAPACITY));
+            sources.SetValue(TOPK + index, static_cast<int32_t>(token));
         }
         PipeBarrier<PIPE_V>();
-        StoreAttentionSlots(queryRow, slots);
+        StoreAttentionRows(queryRow, slots, sources);
         return true;
     }
 
-    __aicore__ inline uint32_t QueryCandidateLen(
-        uint32_t queryRow, uint32_t queryEnd,
-        uint32_t finalLen) const
+    __aicore__ inline bool PublishSparseSelection(
+        uint32_t queryRow, uint32_t queryEnd, uint32_t sourceLen,
+        uint32_t finalLen, uint32_t budget, bool firstFill,
+        LocalTensor<int32_t> topk, LocalTensor<int32_t> slots,
+        LocalTensor<int32_t> sources, LocalTensor<uint8_t> protectedSlots,
+        LocalTensor<uint32_t> hash)
     {
-        const uint32_t laterQueries = queryEnd - 1U - queryRow;
-        if (finalLen <= laterQueries) {
-            return 0;
+        LoadTopk(queryRow, topk);
+        uint32_t missCount = 0U;
+        for (uint32_t index = 0U; index < TOPK; ++index) {
+            const int32_t token = topk.GetValue(index);
+            uint32_t hashPosition = 0U;
+            bool found = false;
+            if (!FindHashPosition(hash, token, hashPosition, found) || !found) {
+                return false;
+            }
+            const uint32_t slot = hash.GetValue(hashPosition) >> SLOT_SHIFT;
+            if (token < 0 || static_cast<uint32_t>(token) >= sourceLen ||
+                slot >= budget) {
+                return false;
+            }
+            const bool isMiss = firstFill || protectedSlots.GetValue(slot) == 2U;
+            missCount += isMiss ? 1U : 0U;
         }
-        const uint32_t visibleLen = finalLen - laterQueries;
-        return ((visibleLen - 1U) / BLOCK_SIZE) * BLOCK_SIZE;
-    }
 
-    __aicore__ inline bool ResolveTailSlot(
-        int32_t token, uint32_t sourceLen, uint32_t finalLen,
-        uint32_t budget, uint32_t &slot) const
-    {
-        if (token < static_cast<int32_t>(sourceLen)) {
-            return false;
+        InitAttentionRows(slots, sources);
+        uint32_t missCursor = 0U;
+        uint32_t hitCursor = missCount;
+        for (uint32_t index = 0U; index < TOPK; ++index) {
+            const int32_t token = topk.GetValue(index);
+            uint32_t hashPosition = 0U;
+            bool found = false;
+            if (!FindHashPosition(hash, token, hashPosition, found) || !found) {
+                return false;
+            }
+            const uint32_t slot = hash.GetValue(hashPosition) >> SLOT_SHIFT;
+            const bool isMiss = firstFill || protectedSlots.GetValue(slot) == 2U;
+            const uint32_t output = isMiss ? missCursor++ : hitCursor++;
+            sources.SetValue(output, token);
+            slots.SetValue(output, static_cast<int32_t>(slot));
         }
-        if (token < 0 || token >= static_cast<int32_t>(finalLen)) {
-            slot = MISS_SLOT;
-            return true;
-        }
-        const uint32_t tokenU32 = static_cast<uint32_t>(token);
-        const uint32_t finalBlock = (finalLen - 1U) / BLOCK_SIZE;
-        const uint32_t tokenBlock = tokenU32 / BLOCK_SIZE;
-        if (tokenBlock + 1U < finalBlock) {
-            slot = MISS_SLOT;
-            return true;
-        }
-        slot = budget + tokenU32 % TAIL_STORAGE_CAPACITY;
-        return true;
+        PipeBarrier<PIPE_V>();
+        WriteOutputScalar(
+            perQueryMissCountsGm_[queryRow],
+            static_cast<int32_t>(missCount));
+        return AppendCausalTail(
+            queryRow, queryEnd, sourceLen, finalLen, budget, slots, sources);
     }
 
     __aicore__ inline void ClearCopyRow(uint32_t batch)
@@ -372,7 +402,7 @@ private:
         uint32_t batch, uint32_t queryStart, uint32_t queryEnd)
     {
         for (uint32_t queryRow = queryStart; queryRow < queryEnd; ++queryRow) {
-            ClearAttentionSlots(queryRow);
+            ClearAttentionRows(queryRow, -1);
         }
         WriteOutputScalar(residentSeqLengthsGm_[batch], 0);
         WriteOutputScalar(copyCountsGm_[batch], -1);
@@ -382,7 +412,7 @@ private:
         uint32_t batch, uint32_t queryStart, uint32_t queryEnd)
     {
         for (uint32_t queryRow = queryStart; queryRow < queryEnd; ++queryRow) {
-            ClearAttentionSlots(queryRow);
+            ClearAttentionRows(queryRow, 0);
         }
         WriteOutputScalar(residentSeqLengthsGm_[batch], 0);
         WriteOutputScalar(copyCountsGm_[batch], 0);
@@ -391,7 +421,8 @@ private:
     __aicore__ inline bool ProcessDense(
         uint32_t batch, uint32_t queryStart, uint32_t queryEnd,
         int32_t finalLen,
-        LocalTensor<int32_t> topk, LocalTensor<int32_t> slots)
+        LocalTensor<int32_t> topk, LocalTensor<int32_t> slots,
+        LocalTensor<int32_t> sources)
     {
         const uint32_t queryCount = queryEnd - queryStart;
         if (finalLen < static_cast<int32_t>(queryCount) ||
@@ -408,13 +439,14 @@ private:
             if (visibleLen > tiling_->maxCandidateLen) {
                 return false;
             }
-            InitAttentionSlots(slots);
+            InitAttentionRows(slots, sources);
             if (visibleLen <= TOPK) {
                 if (visibleLen > ATTENTION_CAPACITY) {
                     return false;
                 }
                 for (uint32_t index = 0; index < visibleLen; ++index) {
                     slots.SetValue(index, static_cast<int32_t>(index));
+                    sources.SetValue(index, static_cast<int32_t>(index));
                 }
             } else {
                 LoadTopk(queryRow, topk);
@@ -429,10 +461,12 @@ private:
                     // DENSE 行的完整 KV 已在 HBM；逻辑 token 位置就是
                     // QSFA 消费的 resident slot，不产生 DRAM->HBM IO。
                     slots.SetValue(index, token);
+                    sources.SetValue(index, token);
                 }
             }
             PipeBarrier<PIPE_V>();
-            StoreAttentionSlots(queryRow, slots);
+            StoreAttentionRows(queryRow, slots, sources);
+            WriteOutputScalar(perQueryMissCountsGm_[queryRow], 0);
         }
         WriteOutputScalar(residentSeqLengthsGm_[batch], finalLen);
         WriteOutputScalar(copyCountsGm_[batch], 0);
@@ -467,15 +501,10 @@ private:
             budget > sourceLen) {
             return false;
         }
-        const uint32_t earliestCandidate = QueryCandidateLen(
-            0, queryCount, static_cast<uint32_t>(finalLen));
-        const uint32_t latestCandidate = QueryCandidateLen(
-            queryCount - 1U,
-            queryCount,
-            static_cast<uint32_t>(finalLen));
-        return earliestCandidate >= TOPK &&
-            sourceLen <= earliestCandidate &&
-            latestCandidate <= tiling_->maxCandidateLen &&
+        const uint32_t earliestVisible =
+            static_cast<uint32_t>(finalLen) - (queryCount - 1U);
+        return sourceLen <= earliestVisible &&
+            sourceLen <= tiling_->maxCandidateLen &&
             finalLen <= static_cast<int32_t>(tiling_->tokenCapacity);
     }
 
@@ -483,8 +512,9 @@ private:
         uint32_t batch, uint32_t queryStart, uint32_t queryEnd,
         uint64_t poolBase, uint32_t sourceLen, uint32_t finalLen,
         uint32_t budget, LocalTensor<int32_t> topk,
-        LocalTensor<int32_t> slots, LocalTensor<int32_t> cacheChunk,
-        LocalTensor<uint32_t> hash)
+        LocalTensor<int32_t> slots, LocalTensor<int32_t> sources,
+        LocalTensor<int32_t> cacheChunk,
+        LocalTensor<uint8_t> protectedSlots, LocalTensor<uint32_t> hash)
     {
         // First validate and deduplicate the complete MTP union in UB.  Do
         // not clear the caller-owned pool until success is guaranteed: an
@@ -494,12 +524,10 @@ private:
         uint32_t unionCount = 0;
         for (uint32_t queryRow = queryStart; queryRow < queryEnd; ++queryRow) {
             LoadTopk(queryRow, topk);
-            const uint32_t queryCandidate = QueryCandidateLen(
-                queryRow, queryEnd, finalLen);
             for (uint32_t index = 0; index < TOPK; ++index) {
                 const int32_t token = topk.GetValue(index);
                 if (token < 0 ||
-                    token >= static_cast<int32_t>(queryCandidate)) {
+                    token >= static_cast<int32_t>(sourceLen)) {
                     return false;
                 }
                 uint32_t hashPosition = 0;
@@ -509,20 +537,6 @@ private:
                     return false;
                 }
                 if (!found) {
-                    uint32_t tailSlot = 0;
-                    if (ResolveTailSlot(
-                            token, sourceLen, finalLen,
-                            budget, tailSlot)) {
-                        if (tailSlot == MISS_SLOT) {
-                            return false;
-                        }
-                        hash.SetValue(
-                            hashPosition,
-                            PackHashEntry(
-                                static_cast<uint32_t>(token),
-                                tailSlot));
-                        continue;
-                    }
                     if (unionCount >= budget ||
                         unionCount >= tiling_->outputCapacity) {
                         return false;
@@ -544,7 +558,6 @@ private:
         uint32_t residentCount = 0;
         for (uint32_t queryRow = queryStart; queryRow < queryEnd; ++queryRow) {
             LoadTopk(queryRow, topk);
-            InitAttentionSlots(slots);
             for (uint32_t index = 0; index < TOPK; ++index) {
                 const int32_t token = topk.GetValue(index);
                 uint32_t hashPosition = 0;
@@ -567,12 +580,6 @@ private:
                     WriteCopyPair(batch, residentCount, token, slot);
                     ++residentCount;
                 }
-                slots.SetValue(index, slot);
-            }
-            PipeBarrier<PIPE_V>();
-            if (!AppendCausalTail(
-                    queryRow, queryEnd, finalLen, budget, slots)) {
-                return false;
             }
         }
 
@@ -600,6 +607,13 @@ private:
         if (residentCount != budget) {
             return false;
         }
+        for (uint32_t queryRow = queryStart; queryRow < queryEnd; ++queryRow) {
+            if (!PublishSparseSelection(
+                    queryRow, queryEnd, sourceLen, finalLen, budget, true,
+                    topk, slots, sources, protectedSlots, hash)) {
+                return false;
+            }
+        }
         WritePoolScalar(
             poolBase + tiling_->tokenCapacity,
             static_cast<int32_t>(budget));
@@ -614,7 +628,8 @@ private:
         uint32_t batch, uint32_t queryStart, uint32_t queryEnd,
         uint64_t poolBase, uint32_t sourceLen, uint32_t finalLen,
         uint32_t budget, LocalTensor<int32_t> topk,
-        LocalTensor<int32_t> slots, LocalTensor<int32_t> cacheChunk,
+        LocalTensor<int32_t> slots, LocalTensor<int32_t> sources,
+        LocalTensor<int32_t> cacheChunk,
         LocalTensor<uint8_t> protectedSlots,
         LocalTensor<uint32_t> hash)
     {
@@ -628,12 +643,10 @@ private:
         // those writes are not guaranteed to invalidate the scalar DCache.
         for (uint32_t queryRow = queryStart; queryRow < queryEnd; ++queryRow) {
             LoadTopk(queryRow, topk);
-            const uint32_t queryCandidate = QueryCandidateLen(
-                queryRow, queryEnd, finalLen);
             for (uint32_t index = 0; index < TOPK; ++index) {
                 const int32_t token = topk.GetValue(index);
                 if (token < 0 ||
-                    token >= static_cast<int32_t>(queryCandidate)) {
+                    token >= static_cast<int32_t>(sourceLen)) {
                     return false;
                 }
                 uint32_t hashPosition = 0;
@@ -646,18 +659,6 @@ private:
                     continue;
                 }
                 const uint32_t tokenU32 = static_cast<uint32_t>(token);
-                uint32_t tailSlot = 0;
-                if (ResolveTailSlot(
-                        token, sourceLen, finalLen,
-                        budget, tailSlot)) {
-                    if (tailSlot == MISS_SLOT) {
-                        return false;
-                    }
-                    hash.SetValue(
-                        hashPosition,
-                        PackHashEntry(tokenU32, tailSlot));
-                    continue;
-                }
                 const int32_t slot = cacheSlotsPoolGm_.GetValue(
                     poolBase + tokenU32);
                 if (slot >= 0 && slot < static_cast<int32_t>(budget)) {
@@ -736,32 +737,12 @@ private:
             return false;
         }
 
-        // Resolve each query row from the UB union map.  This naturally maps
-        // duplicated tokens in different MTP rows to one slot without a
-        // same-kernel GM write-after-read dependency.
+        // Resolve each query row from the UB union map and publish a paired
+        // miss-prefix/hit-suffix source+slot row for fused copy+SFA.
         for (uint32_t queryRow = queryStart; queryRow < queryEnd; ++queryRow) {
-            LoadTopk(queryRow, topk);
-            InitAttentionSlots(slots);
-            for (uint32_t index = 0; index < TOPK; ++index) {
-                const int32_t token = topk.GetValue(index);
-                uint32_t hashPosition = 0;
-                bool found = false;
-                if (!FindHashPosition(
-                        hash, token, hashPosition, found) || !found) {
-                    return false;
-                }
-                const int32_t slot = static_cast<int32_t>(
-                    hash.GetValue(hashPosition) >> SLOT_SHIFT);
-                if (slot < 0 ||
-                    slot >= static_cast<int32_t>(
-                        budget + TAIL_STORAGE_CAPACITY)) {
-                    return false;
-                }
-                slots.SetValue(index, slot);
-            }
-            PipeBarrier<PIPE_V>();
-            if (!AppendCausalTail(
-                    queryRow, queryEnd, finalLen, budget, slots)) {
+            if (!PublishSparseSelection(
+                    queryRow, queryEnd, sourceLen, finalLen, budget, false,
+                    topk, slots, sources, protectedSlots, hash)) {
                 return false;
             }
         }
@@ -787,6 +768,7 @@ private:
         const int32_t mode = rowModesGm_.GetValue(batch);
         LocalTensor<int32_t> topk = topkBuf_.Get<int32_t>();
         LocalTensor<int32_t> slots = slotBuf_.Get<int32_t>();
+        LocalTensor<int32_t> sources = sourceBuf_.Get<int32_t>();
         if (mode == ROW_MODE_PAD) {
             ProcessPad(batch, queryStart, queryEnd);
             return;
@@ -795,7 +777,7 @@ private:
             const int32_t finalLen = finalSeqLengthsKvGm_.GetValue(batch);
             if (!ProcessDense(
                     batch, queryStart, queryEnd, finalLen,
-                    topk, slots)) {
+                    topk, slots, sources)) {
                 MarkRequestError(batch, queryStart, queryEnd);
             }
             return;
@@ -833,11 +815,14 @@ private:
             ? ProcessFirstFill(
                 batch, queryStart, queryEnd, poolBase, sourceLen,
                 static_cast<uint32_t>(finalLen), budget, topk, slots,
+                sources,
                 cacheChunkBuf_.Get<int32_t>(),
+                protectedSlotBuf_.Get<uint8_t>(),
                 hashBuf_.Get<uint32_t>())
             : ProcessSteady(
                 batch, queryStart, queryEnd, poolBase, sourceLen,
                 static_cast<uint32_t>(finalLen), budget, topk, slots,
+                sources,
                 cacheChunkBuf_.Get<int32_t>(),
                 protectedSlotBuf_.Get<uint8_t>(),
                 hashBuf_.Get<uint32_t>());
@@ -859,12 +844,15 @@ private:
     GlobalTensor<int32_t> cacheSlotsPoolGm_;
     GlobalTensor<int32_t> rowModesGm_;
     GlobalTensor<int32_t> sparseAndTailSlotsGm_;
+    GlobalTensor<int32_t> sparseAndTailSrcIdsGm_;
+    GlobalTensor<int32_t> perQueryMissCountsGm_;
     GlobalTensor<int32_t> residentSeqLengthsGm_;
     GlobalTensor<int32_t> copySrcIdsGm_;
     GlobalTensor<int32_t> copyDstSlotsGm_;
     GlobalTensor<int32_t> copyCountsGm_;
     TBuf<TPosition::VECCALC> topkBuf_;
     TBuf<TPosition::VECCALC> slotBuf_;
+    TBuf<TPosition::VECCALC> sourceBuf_;
     TBuf<TPosition::VECCALC> cacheChunkBuf_;
     TBuf<TPosition::VECCALC> protectedSlotBuf_;
     TBuf<TPosition::VECCALC> hashBuf_;

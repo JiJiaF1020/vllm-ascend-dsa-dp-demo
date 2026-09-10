@@ -23,6 +23,7 @@ from vllm_ascend.dsa_offload.kv_cache import (
 )
 from vllm_ascend.dsa_offload.l3 import backend_adapter as l3_backend_adapter_module
 from vllm_ascend.dsa_offload.l3 import connector as l3_connector_module
+from vllm_ascend.dsa_offload.l3 import schema as l3_schema_module
 from vllm_ascend.dsa_offload.l3.backend_adapter import (
     DSAL3BackendAdapter,
     configure_dsa_mooncake_global_ub,
@@ -266,21 +267,24 @@ def test_l3_schema_fingerprint_and_component_keys_are_stable() -> None:
     assert changed_tp.fingerprint != left.fingerprint
 
 
-def test_l3_schema_adds_native_mtp_component() -> None:
+@pytest.mark.parametrize("packed_c8", [False, True])
+def test_l3_schema_adds_native_mtp_component(monkeypatch, packed_c8) -> None:
     specs = {
         "model.layers.0.self_attn.indexer.k_cache": DSAIndexerKVSpec(
             block_size=128,
             num_kv_heads=1,
             head_size=128,
             dtype=torch.bfloat16,
+            cache_sparse_li_c8=packed_c8,
         ),
         "model.layers.0.self_attn.attn": DSAResidentMLAAttentionSpec(
             block_size=128,
             num_kv_heads=1,
-            head_size=576,
-            sparse_head_dim=(512, 64, 0),
+            head_size=656 if packed_c8 else 576,
+            sparse_head_dim=(656, 0, 0) if packed_c8 else (512, 64, 0),
             dtype=torch.bfloat16,
             cache_dtype_str="auto",
+            cache_sparse_sfa_c8=packed_c8,
         ),
         "model.layers.1.self_attn.attn": AscendMLAAttentionSpec(
             block_size=128,
@@ -307,7 +311,8 @@ def test_l3_schema_adds_native_mtp_component() -> None:
         ),
         parallel_config=SimpleNamespace(tensor_parallel_size=8),
         speculative_config=SimpleNamespace(
-            method="mtp", num_speculative_tokens=3,
+            method="mtp",
+            num_speculative_tokens=3,
             draft_model_config=SimpleNamespace(model="/models/glm-mtp", compute_hash=lambda: "draft-v1"),
         ),
     )
@@ -325,6 +330,10 @@ def test_l3_schema_adds_native_mtp_component() -> None:
     assert f":{schema.fingerprint}:mtp:" in keys[2]
     vllm_config.parallel_config.data_parallel_rank = 1
     assert DSAL3KeySchema.from_config(vllm_config, SimpleNamespace(kv_cache_groups=groups)) == schema
+    with monkeypatch.context() as scoped:
+        scoped.setattr(l3_schema_module, "DSA_A5_MTP_ATTENTION_SEMANTICS", "old-per-query-tail")
+        old_policy = DSAL3KeySchema.from_config(vllm_config, SimpleNamespace(kv_cache_groups=groups))
+    assert (old_policy.fingerprint != schema.fingerprint) == packed_c8
     vllm_config.speculative_config.draft_model_config.compute_hash = lambda: "draft-v2"
     changed = DSAL3KeySchema.from_config(vllm_config, SimpleNamespace(kv_cache_groups=groups))
     assert changed.fingerprint != schema.fingerprint

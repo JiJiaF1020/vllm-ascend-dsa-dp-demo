@@ -5,11 +5,14 @@
 保留simple_prompt_test.py的配置/输出风格，但启动采用v0.23官方offline SPMD：
 每个DP一个LLM客户端，在导入vLLM前设置该客户端的VLLM_DP_*，不重复创建DP部署。
 不依赖其他demo的配置函数，不自动启动Mooncake，不安装退出探针。
+完成后自动精简JSONL并输出跨轮精度证据，也可只整理已有结果而不启动推理。
+默认三轮：首次生成、本地prefix复用、清本地并交换DP后从L3回载。
 这是功能探索样例，不自动判定精度、缓存IO字节一致性或worker优雅退出。
 """
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import math
@@ -23,12 +26,21 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 # =============================================================================
+# 0. 已有结果摘要：正常推理保持空字符串；每次推理结束会自动生成摘要
+# =============================================================================
+SUMMARY_ONLY_DIR = ""  # 填已有simple-dp-xxx目录后，只生成摘要，不加载数据/模型或连接Mooncake
+# 只需python运行本脚本，无额外命令行参数；处理完旧结果后改回""才能重新推理。
+
+# =============================================================================
 # 1. 输入与采样：PROMPTS是整份输入，不是每个DP必须复制的一份
 # =============================================================================
 # 数据导入与PROMPTS由使用者直接维护；可替换为自己的数据或字符串列表。
-from novel_dataset import chinese_5k, chinese_8k, chinese_40k, chinese_70k
+if not SUMMARY_ONLY_DIR:
+    from novel_dataset import chinese_5k, chinese_8k, chinese_40k, chinese_70k
 
-PROMPTS = chinese_8k + chinese_5k + chinese_70k + chinese_40k
+    PROMPTS = chinese_8k + chinese_5k + chinese_70k + chinese_40k
+else:
+    PROMPTS = []  # 只分析已有JSONL时无需novel_dataset。
 MAX_TOKENS = 128  # 默认观察MTP decode跨满块；只看短输出时可自行调小
 TEMPERATURE = 0.0  # 0为greedy；本样例开启MTP时只允许0
 IGNORE_EOS = True  # 忽略EOS，避免跨满块测试因提前停止而没有覆盖到目标路径
@@ -61,7 +73,7 @@ GRAPH_CAPTURE_ROW_SIZES = [1, 2, 4, 8]  # 请求行数，自动过滤大于MAX_N
 DATA_PARALLEL_SIZE = 2  # 可设1作无L3的单域对照；同时调整TP或可见卡数。DP1+L3沿用simple_prompt_test.py
 TENSOR_PARALLEL_SIZE = 4
 VISIBLE_DEVICES = "0,1,2,3,4,5,6,7"  # 卡数必须等于DP*TP，脚本统一设置两种可见卡变量
-PROMPT_DISTRIBUTION = "round_robin"  # round_robin：第i个输入交给DP(i%DPsize)
+PROMPT_DISTRIBUTION = "round_robin"  # 第i个输入交给DP(i%DPsize)
 # replicate：每个DP都跑整份PROMPTS，可用于单个长prompt在不同域的对照。
 # round_robin要求输入条数>=DPsize，不偷偷添加placeholder请求。
 DP_MASTER_PORT = 0  # 0自动选择空闲端口；需要指定时填写未占用端口，IP固定本机127.0.0.1
@@ -82,7 +94,7 @@ DSA_MAX_ACTIVE_REQS = 256  # resident元数据行容量，必须>=MAX_NUM_SEQS
 # 5. Prefix cache与重复推理：是否复用、复用几轮、是否清本地缓存
 # =============================================================================
 ENABLE_PREFIX_CACHING = True  # 关DSA时控制原生HBM prefix；开DSA时控制L1/L2 prefix
-REPLAY_ROUNDS = 3  # 默认：冷算 -> 本地prefix复用 -> 清本地并交换DP后从L3回载
+REPLAY_ROUNDS = 3  # 默认：首次生成 -> 本地prefix复用 -> 清本地并交换DP后从L3回载
 RESET_LOCAL_CACHE_BEFORE_LAST_REPLAY = True  # 最后一轮前两域都只清本地HBM/L2，保留L3
 SWAP_DP_ON_LAST_REPLAY = True  # 最后一轮循环交换各域输入，观察跨域复用；只适用于round_robin
 # 本地prefix观察：ENABLE_PREFIX_CACHING=True、REPLAY_ROUNDS=2，reset/swap保持False。
@@ -384,6 +396,14 @@ def _indices(c, count, rank, round_index):
     return list(range(source, count, c["DATA_PARALLEL_SIZE"]))
 
 
+def _round_phase(c, round_index):
+    if round_index == 0:
+        return "seed"
+    if c["RESET_LOCAL_CACHE_BEFORE_LAST_REPLAY"] and round_index == c["REPLAY_ROUNDS"] - 1:
+        return "after-local-reset"
+    return f"local-replay-{round_index}" if c["ENABLE_PREFIX_CACHING"] else f"recompute-{round_index}"
+
+
 def _worker(rank, c, prompts, port, barrier, run_dir):
     os.environ.update({str(key): str(value) for key, value in c["NATIVE_RUNTIME_ENV"].items()})
     os.environ.update(
@@ -462,15 +482,17 @@ def _worker(rank, c, prompts, port, barrier, run_dir):
             ignore_eos=c["IGNORE_EOS"],
             logprobs=c["LOGPROBS"] or None,
         )
+        # 全域同一run salt且每轮不变：隔离旧实验缓存，保留本次跨DP内容共享。
+        cache_salt = run_dir.name
         for round_index in range(c["REPLAY_ROUNDS"]):
+            phase = _round_phase(c, round_index)
             barrier.wait(timeout=c["PROCESS_TIMEOUT_SECONDS"])
             if c["RESET_LOCAL_CACHE_BEFORE_LAST_REPLAY"] and round_index == c["REPLAY_ROUNDS"] - 1:
                 if not llm.reset_prefix_cache(reset_connector=False):
                     raise RuntimeError("local-only prefix reset refused after both domains drained")
             barrier.wait(timeout=c["PROCESS_TIMEOUT_SECONDS"])
             selected = _indices(c, len(prompts), rank, round_index)
-            # 全域同一run salt且每轮不变：隔离旧实验缓存，但不破坏本次跨DP共享。
-            inputs = [{"prompt": prompts[index], "cache_salt": run_dir.name} for index in selected]
+            inputs = [{"prompt": prompts[index], "cache_salt": cache_salt} for index in selected]
             outputs = llm.generate(inputs, params, use_tqdm=False)
             if len(outputs) != len(selected):
                 raise RuntimeError("request/output count mismatch")
@@ -480,6 +502,8 @@ def _worker(rank, c, prompts, port, barrier, run_dir):
                     record = {
                         "dp_rank": rank,
                         "round": round_index + 1,
+                        "phase": phase,
+                        "cache_salt": cache_salt,
                         "prompt_index": index,
                         "request_id": output.request_id,
                         "prompt": prompts[index],
@@ -496,7 +520,7 @@ def _worker(rank, c, prompts, port, barrier, run_dir):
                         ]
                     handle.write(json.dumps(record, ensure_ascii=False) + "\n")
                     print(
-                        f"[simple-dp] dp={rank} round={round_index + 1} prompt={index} "
+                        f"[simple-dp] dp={rank} round={round_index + 1} phase={phase} prompt={index} "
                         f"prompt_tokens={record['prompt_tokens']} cached={record['cached_tokens']} "
                         f"output_tokens={len(completion.token_ids)}",
                         flush=True,
@@ -520,7 +544,422 @@ def _worker(rank, c, prompts, port, barrier, run_dir):
                 traceback.print_exc()
 
 
+# =============================================================================
+# 结果摘要：纯标准库后处理，不改变推理、采样或缓存逻辑，不自动判定精度PASS/FAIL。
+# =============================================================================
+_SUMMARY_LOGPROB_CONTEXT = 1
+_SUMMARY_SETTINGS = (
+    "MODEL_PATH",
+    "RUN_MODE",
+    "DATA_PARALLEL_SIZE",
+    "TENSOR_PARALLEL_SIZE",
+    "MAX_NUM_SEQS",
+    "MAX_MODEL_LEN",
+    "MAX_NUM_BATCHED_TOKENS",
+    "ENABLE_CHUNKED_PREFILL",
+    "ENABLE_DSA_OFFLOAD",
+    "ENABLE_A5_PACKED_C8_DSA",
+    "ENABLE_MTP",
+    "MTP_NUM_SPECULATIVE_TOKENS",
+    "ENABLE_PREFIX_CACHING",
+    "ENABLE_L3_WRITE_BEHIND",
+    "ENABLE_L3_PREFIX_LOADBACK",
+    "MAX_TOKENS",
+    "IGNORE_EOS",
+    "TEMPERATURE",
+    "SEED",
+    "LOGPROBS",
+    "REPLAY_ROUNDS",
+    "PROMPT_DISTRIBUTION",
+    "RESET_LOCAL_CACHE_BEFORE_LAST_REPLAY",
+    "SWAP_DP_ON_LAST_REPLAY",
+    # 只保留旧结果的诊断条件说明，不再提供这些拉起开关。
+    "ISOLATE_DP_CACHE_SALT",
+    "TRACE_POOL_LIFECYCLE",
+)
+_SUMMARY_ENGINE_FIELDS = (
+    "dp_rank",
+    "dp_size",
+    "tp_size",
+    "dsa",
+    "prefix",
+    "mtp",
+    "connector",
+    "kv_role",
+    "fingerprint",
+)
+
+
+def _summary_read_object(path):
+    try:
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Cannot read JSON: {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"Expected a JSON object: {path}")
+    return value
+
+
+def _summary_probabilities(rows, location):
+    if rows is None:
+        return None, 0
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise ValueError(f"{location}: logprobs must be a list of token-to-logprob objects")
+    cleaned, nonfinite = [], 0
+    for row in rows:
+        values = {}
+        for token, value in row.items():
+            if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))):
+                raise ValueError(f"{location}: invalid logprob value for token {token}")
+            if value is not None and not math.isfinite(value):
+                value = None
+                nonfinite += 1
+            values[str(token)] = value
+        cleaned.append(values)
+    return cleaned, nonfinite
+
+
+def _summary_read_records(root, ranks):
+    records, identities = [], set()
+    for rank in ranks:
+        path = root / f"dp{rank}.jsonl"
+        with path.open(encoding="utf-8-sig") as handle:
+            for line_no, line in enumerate(handle, 1):
+                if not line.strip():
+                    continue
+                location = f"{path.name}:{line_no}"
+                try:
+                    row = json.loads(line)
+                except ValueError as exc:
+                    raise ValueError(f"{location}: invalid JSON: {exc}") from exc
+                if not isinstance(row, dict):
+                    raise ValueError(f"{location}: expected a record object")
+                for key, minimum in (("dp_rank", 0), ("round", 1), ("prompt_index", 0), ("prompt_tokens", 0)):
+                    if type(row.get(key)) is not int or row[key] < minimum:
+                        raise ValueError(f"{location}: invalid {key}")
+                if row["dp_rank"] != rank:
+                    raise ValueError(f"{location}: dp_rank does not match filename")
+                if not isinstance(row.get("prompt"), str) or not isinstance(row.get("text"), str):
+                    raise ValueError(f"{location}: original prompt and output text are required")
+                tokens = row.get("token_ids")
+                if not isinstance(tokens, list) or any(type(token) is not int or token < 0 for token in tokens):
+                    raise ValueError(f"{location}: invalid token_ids")
+                identity = (rank, row["round"], row["prompt_index"])
+                if identity in identities:
+                    raise ValueError(f"{location}: duplicate dp/round/prompt record {identity}")
+                identities.add(identity)
+                probabilities, nonfinite = _summary_probabilities(row.get("logprobs"), location)
+                record = {
+                    key: row.get(key)
+                    for key in (
+                        "dp_rank",
+                        "round",
+                        "phase",
+                        "cache_salt",
+                        "prompt_index",
+                        "request_id",
+                        "prompt_tokens",
+                        "cached_tokens",
+                        "finish_reason",
+                        "token_ids",
+                        "text",
+                    )
+                }
+                record.update(
+                    source=location,
+                    prompt_sha256=hashlib.sha256(row["prompt"].encode("utf-8")).hexdigest(),
+                    output_tokens=len(tokens),
+                    logprob_rows=None if probabilities is None else len(probabilities),
+                    nonfinite_logprobs=nonfinite,
+                    _logprobs=probabilities,
+                )
+                records.append(record)
+    if not records:
+        raise ValueError("The input JSONL files contain no result records")
+    return sorted(records, key=lambda record: (record["round"], record["prompt_index"], record["dp_rank"]))
+
+
+def _summary_at(values, position):
+    return values[position] if values is not None and 0 <= position < len(values) else None
+
+
+def _summary_reference(record):
+    return {
+        key: record[key]
+        for key in ("source", "dp_rank", "round", "phase", "cache_salt", "request_id", "cached_tokens", "finish_reason")
+    }
+
+
+def _summary_compare(left, right):
+    result = {
+        "prompt_index": left["prompt_index"],
+        "left": _summary_reference(left),
+        "right": _summary_reference(right),
+    }
+    if left["prompt_sha256"] != right["prompt_sha256"] or left["prompt_tokens"] != right["prompt_tokens"]:
+        return {**result, "status": "not_comparable", "reason": "prompt content or token count changed"}
+    lt, rt = left["token_ids"], right["token_ids"]
+    common = 0
+    while common < min(len(lt), len(rt)) and lt[common] == rt[common]:
+        common += 1
+    matched = common == len(lt) == len(rt)
+    lp, rp = left["_logprobs"], right["_logprobs"]
+    largest_delta, delta_position, delta_token = None, None, None
+    first_probability_change, first_candidate_set_change = None, None
+    probability_changes = []
+    compared_rows, all_values_finite = 0, True
+    # After the first different token, generated histories diverge. Those
+    # later distributions must not be counted as same-input numerical drift.
+    for position in range(min(common + 1, len(lt), len(rt))):
+        lrow, rrow = _summary_at(lp, position), _summary_at(rp, position)
+        if lrow is None or rrow is None:
+            continue
+        compared_rows += 1
+        keys_match = lrow.keys() == rrow.keys()
+        if not keys_match and first_candidate_set_change is None:
+            first_candidate_set_change = position
+        all_values_finite &= (
+            bool(lrow) and bool(rrow) and all(value is not None for value in (*lrow.values(), *rrow.values()))
+        )
+        row_delta = None
+        for token in sorted(lrow.keys() & rrow.keys()):
+            if lrow[token] is None or rrow[token] is None:
+                continue
+            delta = abs(lrow[token] - rrow[token])
+            row_delta = delta if row_delta is None else max(row_delta, delta)
+            if largest_delta is None or delta > largest_delta:
+                largest_delta, delta_position, delta_token = delta, position, token
+        if row_delta is not None and row_delta > 0 and first_probability_change is None:
+            first_probability_change = position
+        if not keys_match or (row_delta is not None and row_delta > 0):
+            probability_changes.append(
+                {
+                    "position_0based": position,
+                    "candidate_keys_match": keys_match,
+                    "max_shared_logprob_delta": row_delta,
+                }
+            )
+    centers = {0, delta_position, first_probability_change, first_candidate_set_change}
+    if not matched:
+        centers.add(common)
+    positions = {
+        position
+        for center in centers
+        if center is not None
+        for position in range(max(0, center - _SUMMARY_LOGPROB_CONTEXT), center + _SUMMARY_LOGPROB_CONTEXT + 1)
+    }
+    window = [
+        {
+            "position_0based": position,
+            "same_generated_history": position <= common,
+            "left_token": _summary_at(lt, position),
+            "right_token": _summary_at(rt, position),
+            "left_logprobs": _summary_at(lp, position),
+            "right_logprobs": _summary_at(rp, position),
+        }
+        for position in sorted(positions)
+        if position < max(len(lt), len(rt))
+    ]
+    result.update(
+        status="tokens_match" if matched else "tokens_differ",
+        common_prefix_tokens=common,
+        first_difference_0based=None if matched else common,
+        left_output_tokens=len(lt),
+        right_output_tokens=len(rt),
+        left_token=None if matched else _summary_at(lt, common),
+        right_token=None if matched else _summary_at(rt, common),
+        text_match=left["text"] == right["text"],
+        finish_reason_match=left["finish_reason"] == right["finish_reason"],
+        cached_tokens_match=left["cached_tokens"] == right["cached_tokens"],
+        max_shared_logprob_delta_before_feedback=largest_delta,
+        max_delta_position_0based=delta_position,
+        max_delta_token=delta_token,
+        first_shared_logprob_change_0based=first_probability_change,
+        first_candidate_set_change_0based=first_candidate_set_change,
+        compared_logprob_rows=compared_rows,
+        returned_topk_equal_before_feedback=(
+            not probability_changes
+            if compared_rows == min(common + 1, len(lt), len(rt)) and compared_rows > 0 and all_values_finite
+            else None
+        ),
+        same_history_probability_changes=probability_changes,
+        logprob_window=window,
+    )
+    return result
+
+
+def _summarize_results(root):
+    root = Path(root).expanduser().resolve()
+    settings_path = root / "settings.json"
+    settings = _summary_read_object(settings_path) if settings_path.is_file() else {}
+    warnings = []
+    if not settings:
+        warnings.append("settings.json missing; execution settings are not verified")
+    dp_size = settings.get("DATA_PARALLEL_SIZE")
+    if dp_size is None:
+        ranks = sorted(int(path.stem[2:]) for path in root.glob("dp*.jsonl") if path.stem[2:].isdigit())
+        warnings.append("DATA_PARALLEL_SIZE missing; DP files inferred, completeness is not verified")
+    elif type(dp_size) is int and dp_size > 0:
+        ranks = list(range(dp_size))
+    else:
+        raise ValueError("settings.json: DATA_PARALLEL_SIZE must be a positive integer")
+    records = _summary_read_records(root, ranks)
+    prompts = settings.get("PROMPTS")
+    expected_count = len(prompts) if isinstance(prompts, list) else None
+    rounds = settings.get("REPLAY_ROUNDS")
+    if expected_count is not None and type(rounds) is int and rounds > 0:
+        copies = len(ranks) if settings.get("PROMPT_DISTRIBUTION") == "replicate" else 1
+        for round_index in range(1, rounds + 1):
+            for prompt_index in range(expected_count):
+                count = sum(row["round"] == round_index and row["prompt_index"] == prompt_index for row in records)
+                if count != copies:
+                    warnings.append(
+                        f"prompt={prompt_index} round={round_index}: expected {copies} record(s), got {count}"
+                    )
+    engines = []
+    for rank in ranks:
+        path = root / f"dp{rank}-engine.json"
+        if path.is_file():
+            engine = _summary_read_object(path)
+            engines.append({key: engine[key] for key in _SUMMARY_ENGINE_FIELDS if key in engine})
+    fingerprints = {engine.get("fingerprint") for engine in engines if engine.get("fingerprint")}
+    if len(fingerprints) > 1:
+        warnings.append("DP engine fingerprints differ; do not assume cache compatibility")
+    for row in records:
+        if row["logprob_rows"] != row["output_tokens"]:
+            warnings.append(f"{row['source']}: logprobs missing or row count differs from output tokens")
+        if row["nonfinite_logprobs"]:
+            warnings.append(f"{row['source']}: {row['nonfinite_logprobs']} non-finite logprobs were replaced by null")
+        if not row["token_ids"]:
+            warnings.append(f"{row['source']}: empty output")
+    if rounds is None:
+        rounds = max(row["round"] for row in records)
+    if type(rounds) is not int or rounds < 1:
+        raise ValueError("settings.json: REPLAY_ROUNDS must be a positive integer")
+    # 优先显示最近两轮，再依次回看；单轮只输出记录，不虚构精度对照。
+    compare_rounds = [(index, index + 1) for index in range(rounds - 1, 0, -1)]
+    comparisons = []
+    for index in sorted({row["prompt_index"] for row in records}):
+        group = [row for row in records if row["prompt_index"] == index]
+        for left_round, right_round in compare_rounds:
+            left = {row["dp_rank"]: row for row in group if row["round"] == left_round}
+            right = {row["dp_rank"]: row for row in group if row["round"] == right_round}
+            if len(left) == len(right) == 1:
+                pairs = [(next(iter(left.values())), next(iter(right.values())))]
+            elif left and left.keys() == right.keys():
+                pairs = [(left[rank], right[rank]) for rank in sorted(left)]
+            else:
+                warnings.append(f"prompt={index} rounds={left_round}/{right_round}: missing or ambiguous records")
+                continue
+            comparisons.extend(_summary_compare(a, b) for a, b in pairs)
+    public_records = [{key: value for key, value in row.items() if not key.startswith("_")} for row in records]
+    return {
+        "schema": "simple-dp-precision-summary-v1",
+        "run_dir": str(root),
+        "note": "Evidence only, not an accuracy PASS/FAIL. Cold/prefix, DP placement and execution paths can differ. "
+        "Result JSONL alone does not prove which cache transport executed. "
+        "Post-divergence logprobs are context only.",
+        "settings": {key: settings[key] for key in _SUMMARY_SETTINGS if key in settings},
+        "engines": engines,
+        "warnings": warnings,
+        "records": public_records,
+        "comparisons": comparisons,
+    }
+
+
+def _render_precision_summary(report):
+    lines = [
+        "[simple-dp-precision] 离线证据摘要（不是精度PASS/FAIL）",
+        f"run_dir={report['run_dir']}",
+        "settings=" + json.dumps(report["settings"], ensure_ascii=False),
+        "engines=" + json.dumps(report["engines"], ensure_ascii=False),
+        "",
+        "记录：",
+    ]
+    for row in report["records"]:
+        lines.append(
+            f"dp={row['dp_rank']} round={row['round']} prompt={row['prompt_index']} "
+            f"phase={row['phase']} "
+            f"prompt_tokens={row['prompt_tokens']} cached={row['cached_tokens']} "
+            f"output={row['output_tokens']} finish={row['finish_reason']}"
+        )
+    lines.extend(
+        [
+            "",
+            "跨轮比较（position从0计数）：",
+            "按最近相邻轮次优先对照；冷算/复用及实际L3路径请结合配置和服务端日志判断。",
+        ]
+    )
+    for result in report["comparisons"]:
+        a, b = result["left"], result["right"]
+        lines.append(
+            f"prompt={result['prompt_index']} r{a['round']}/dp{a['dp_rank']} -> "
+            f"r{b['round']}/dp{b['dp_rank']}: {result['status']}"
+        )
+        lines.append(
+            f"  phases={a['phase']}/{b['phase']} cached_tokens={a['cached_tokens']}/{b['cached_tokens']} "
+            f"cache_salt={a['cache_salt']}/{b['cache_salt']}"
+        )
+        if result["status"] == "not_comparable":
+            lines.append("  " + result["reason"])
+            continue
+        lines.append(
+            f"  common_prefix={result['common_prefix_tokens']} first_diff={result['first_difference_0based']} "
+            f"left_token={result['left_token']} right_token={result['right_token']} "
+            f"lengths={result['left_output_tokens']}/{result['right_output_tokens']} "
+            f"max_shared_logprob_delta={result['max_shared_logprob_delta_before_feedback']} "
+            f"delta_position={result['max_delta_position_0based']}"
+        )
+        first = result["first_difference_0based"]
+        centers = {
+            first,
+            result["max_delta_position_0based"],
+            result["first_shared_logprob_change_0based"],
+            result["first_candidate_set_change_0based"],
+        }
+        lines.append(
+            f"  first_shared_logprob_change={result['first_shared_logprob_change_0based']} "
+            f"first_candidate_set_change={result['first_candidate_set_change_0based']} "
+            f"returned_topk_equal={result['returned_topk_equal_before_feedback']} "
+            f"compared_logprob_rows={result['compared_logprob_rows']}"
+        )
+        if result["same_history_probability_changes"]:
+            lines.append("  same_history_changes=" + json.dumps(result["same_history_probability_changes"]))
+        for sample in result["logprob_window"]:
+            if sample["position_0based"] in centers:
+                lines.append(f"  probability_position={sample['position_0based']}")
+                lines.append("  left_logprobs=" + json.dumps(sample["left_logprobs"], ensure_ascii=False))
+                lines.append("  right_logprobs=" + json.dumps(sample["right_logprobs"], ensure_ascii=False))
+    lines.extend(
+        [
+            "",
+            *["WARNING: " + warning for warning in report["warnings"]],
+            "",
+            "完整输出文本/token IDs及首差异上下文在 precision_details.json；未保留完整prompt或全量logprobs。",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _write_precision_summary(root):
+    """只写精简报告，不覆盖原始prompt、输出和全量logprobs。"""
+    report = _summarize_results(root)
+    output = Path(report["run_dir"]) / "precision_compact"
+    output.mkdir(parents=True, exist_ok=True)
+    details_path = output / "precision_details.json"
+    text_path = output / "precision_summary.txt"
+    details_path.write_text(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    summary = _render_precision_summary(report)
+    text_path.write_text(summary, encoding="utf-8")
+    print(summary, flush=True)
+    print(f"[simple-dp-precision] REPORT_READY summary={text_path}", flush=True)
+    print(f"[simple-dp-precision] details={details_path}; originals unchanged", flush=True)
+
+
 def main():
+    if SUMMARY_ONLY_DIR:
+        _write_precision_summary(SUMMARY_ONLY_DIR)
+        return
     c = _settings()
     _validate(c)
     prompts = list(c["PROMPTS"])
@@ -590,6 +1029,7 @@ def main():
         8192 if c["ENABLE_MTP"] else c["DSA_SPARSE_ACTIVATION_TOKENS"]
     ):
         print("[simple-dp] all prompts are below the sparse activation threshold; use longer inputs to test sparse IO")
+    _write_precision_summary(run_dir)
     print(f"\n[simple-dp] COMPLETED results={run_dir}; accuracy and graceful worker exit are not asserted")
 
 

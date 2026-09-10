@@ -16,7 +16,8 @@ from typing import NamedTuple
 import torch
 
 from vllm_ascend.dsa_offload.contracts import (
-    DSA_A5_ATTENTION_CAPACITY,
+    DSA_A5_MTP_ATTENTION_CAPACITY,
+    DSA_A5_NOMTP_ATTENTION_CAPACITY,
     DSA_A5_PACKED_KV_ROW_BYTES,
     DSA_SFA_COMPUTE_TOPK,
 )
@@ -95,6 +96,22 @@ def require_dsa_offload_ops(
     missing = [op_name for op_name in required_ops if not hasattr(torch.ops._C_ascend, op_name)]
     if missing:
         raise RuntimeError(f"DSA sparse offload custom operators are not installed: {tuple(missing)}")
+    if packed_c8 and mtp:
+        schema = torch.ops._C_ascend.npu_dsa_a5_li_manage_c8_out.default._schema
+        expected_outputs = (
+            "sparse_and_tail_slots",
+            "sparse_and_tail_src_ids",
+            "per_query_miss_counts",
+            "resident_seq_lengths",
+            "copy_src_ids",
+            "copy_dst_slots",
+            "copy_counts",
+        )
+        if len(schema.arguments) != 19 or tuple(arg.name for arg in schema.arguments[12:]) != expected_outputs:
+            raise RuntimeError(
+                "DSA A5 MTP requires the seven-output LIM ABI with 2304-column attention rows; "
+                "rebuild and reinstall both the CANN custom operators and vllm_ascend_C, then restart the worker"
+            )
 
 
 def _packed_byte_view(cache: torch.Tensor, *, name: str) -> torch.Tensor:
@@ -238,20 +255,20 @@ def a5_lightning_indexer_decode_update_mtp_c8(
     req_pool_entries: torch.Tensor,
     cache_slots: torch.Tensor,
     attention_slots: torch.Tensor,
+    attention_src_ids: torch.Tensor,
+    per_query_miss_counts: torch.Tensor,
     resident_seq_lengths: torch.Tensor,
     outputs: DSALightningIndexerOutputs,
 ) -> None:
     """调用 A5 多 query LIM；copy plan 保持请求轴，attention 保持 TND 轴。
 
-    ``candidate_lens`` 对 SPARSE 行表示 durable DRAM prefix。算子根据
-    ``actual_seq_lengths_query``/``final_seq_lengths_kv`` 为每条 query
-    独立推导 LI candidate，并把两块 parity tail 内的命中直接映射为
-    resident slot。
+    SPARSE 的每条 query 独立在共享 durable prefix 上选 topK，再追加
+    因果可见的双尾；配对 attention 输出为 [T,1,2304]，resident span=C+256。
+    tail 不参与 LI 或 union copy。七输出依次为 slots、src_ids、query miss、
+    resident span、copy src/dst/count，均保持 caller-owned；旧五输出需升级。
     """
 
-    index_key_dequant_scale = _normalize_a5_indexer_key_scale(
-        index_key_dequant_scale
-    )
+    index_key_dequant_scale = _normalize_a5_indexer_key_scale(index_key_dequant_scale)
     torch.ops._C_ascend.npu_dsa_a5_li_manage_c8_out(
         index_weights,
         query,
@@ -266,6 +283,8 @@ def a5_lightning_indexer_decode_update_mtp_c8(
         req_pool_entries,
         cache_slots,
         attention_slots,
+        attention_src_ids,
+        per_query_miss_counts,
         resident_seq_lengths,
         outputs.topk_index,
         outputs.topk_slots,
@@ -283,6 +302,14 @@ def a5_kvcache_scatter_copy_c8(
     destination_slots: torch.Tensor,
     copy_counts: torch.Tensor,
 ) -> None:
+    """物化请求级连续 copy-prefix，不接收 query 级 attention/miss 列表。
+
+    source 是完整序列 token ID，经本请求 DRAM 表定位；destination 是
+    resident slot，经本请求 HBM 表定位。只允许 count=0 正常空转，
+    count<0 或有效前缀内部的非法 pair 必须失败。前缀外 scratch 不读取；
+    已有缓冲之间的别名和源数据 ready 由 scheduler/runtime 生命周期保证。
+    """
+
     torch.ops._C_ascend.npu_dsa_a5_kvcache_scatter_copy_c8_out(
         _packed_byte_view(resident_packed_cache, name="resident_packed_cache"),
         _packed_byte_view(dram_packed_arena, name="dram_packed_arena"),
@@ -304,11 +331,16 @@ def sparse_flash_attention_for_offload_c8(
     actual_seq_lengths_query: torch.Tensor,
     resident_seq_lengths: torch.Tensor,
 ) -> torch.Tensor:
-    """以 KSC 生成的 resident slot plan 调用 A5 原生 QSFA。"""
+    """直接消费 LIM 输出：非 MTP 2176 列、MTP 2304 列，不裁剪或重排。"""
 
-    if sparse_indices.shape[-1] != DSA_A5_ATTENTION_CAPACITY:
+    if sparse_indices.shape[-1] not in (
+        DSA_A5_NOMTP_ATTENTION_CAPACITY,
+        DSA_A5_MTP_ATTENTION_CAPACITY,
+    ):
         raise ValueError(
-            f"A5 DSA attention slots must have width {DSA_A5_ATTENTION_CAPACITY}, got {tuple(sparse_indices.shape)}"
+            "A5 DSA attention slots must have width "
+            f"{DSA_A5_NOMTP_ATTENTION_CAPACITY} (non-MTP) or "
+            f"{DSA_A5_MTP_ATTENTION_CAPACITY} (MTP), got {tuple(sparse_indices.shape)}"
         )
     query = query.contiguous()
     kwargs = dict(

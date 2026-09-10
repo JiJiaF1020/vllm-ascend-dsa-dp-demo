@@ -384,7 +384,7 @@ def test_final_prefill_chunk_releases_resident_blocks_after_output(
     request = _Request("prefill", 1000, 512, 0, 1000)
     scheduler.requests = {request.request_id: request}
     scheduler.block_size = 128
-    release_calls: list[tuple[str, bool]] = []
+    release_calls: list[tuple[str, int]] = []
     scheduler.dsa_coordinator = SimpleNamespace(
         enable_caching=False,
         request_cache_layout=SimpleNamespace(
@@ -392,8 +392,8 @@ def test_final_prefill_chunk_releases_resident_blocks_after_output(
                 req.num_computed_tokens >= req.num_prompt_tokens
             )
         ),
-        release_prefill_resident_blocks=lambda request_id, preserve_tail_block: (
-            release_calls.append((request_id, preserve_tail_block))
+        release_prefill_resident_blocks=lambda request_id, num_computed_tokens: (
+            release_calls.append((request_id, num_computed_tokens))
         ),
     )
     output = SchedulerOutput.make_empty()
@@ -410,18 +410,20 @@ def test_final_prefill_chunk_releases_resident_blocks_after_output(
 
     request.num_computed_tokens = request.num_prompt_tokens
     assert scheduler.update_from_output(output, object()) is parent_result
-    assert release_calls == [(request.request_id, True)]
+    assert release_calls == [(request.request_id, request.num_prompt_tokens)]
 
 
+@pytest.mark.parametrize("enable_caching,num_spec_tokens", [(True, 0), (False, 3)])
 def test_dram_hash_is_published_before_parent_can_free_request(
-    monkeypatch,
+    monkeypatch, enable_caching, num_spec_tokens,
 ) -> None:
     scheduler = _make_scheduler()
+    scheduler.num_spec_tokens = num_spec_tokens
     request = _Request("req", 256, 256, 0, 256)
     scheduler.requests = {request.request_id: request}
     calls: list[tuple[str, int]] = []
     scheduler.dsa_coordinator = SimpleNamespace(
-        enable_caching=True,
+        enable_caching=enable_caching,
         mark_request_dram_ready=lambda req, count: calls.append(
             (req.request_id, count)
         ),
@@ -573,11 +575,12 @@ def test_mtp_decode_dram_assignment_excludes_provisional_tokens() -> None:
         resident_manager=SimpleNamespace(req_to_blocks={}),
     )
 
-    scheduler._build_dsa_cache_layout_projection(output)
+    projection = scheduler._build_dsa_cache_layout_projection(output)
 
     # floor(255 / 128) == 1。若错误地把本轮 4 个 target query 算进去，
     # 会提前得到 floor(259 / 128) == 2 并为未验证尾块分配 DRAM id。
     assert observed == [1]
+    assert projection.dram_ready_block_counts == (1,)
 
 
 def test_l3_projection_carries_ready_watermark_without_local_prefix_cache() -> None:

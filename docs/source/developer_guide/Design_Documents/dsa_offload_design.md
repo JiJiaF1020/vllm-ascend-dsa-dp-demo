@@ -666,19 +666,15 @@ proposer 的 `kv_cache_gid`、block table、每 draft step slot mapping、seq le
 增长，只在请求结束时释放；target 从 DENSE 进入 SPARSE 时只收缩 target
 resident group。
 
-LIM 的请求级 `candidate_len` 在 SPARSE 行表示本轮开始时已经 durable 的 DRAM
-完整块前缀。SPARSE 每个 query 真正参与 LI 排名的历史边界由设备侧根据
-`final_seq_len` 和 `actual_seq_lengths_query` 独立计算：
+LIM 的请求级 `candidate_len` 在 SPARSE 行表示共享的 durable DRAM 完整块前缀 D。各 query 分别在同一候选域选 topK，只有 tail 的因果可见长度不同：
 
 ```text
 visible_len(q)   = final_len - later_queries(q)
-query_candidate = floor((visible_len(q) - 1) / 128) * 128
+LI candidates    = [0, D)
+causal tail(q)   = [D, visible_len(q))  # 最多 256 个 token
 ```
 
-位于 `query_candidate` 但尚未进入 durable DRAM 的 token 只能来自当前两块
-tail，LIM 直接把它映射为 parity slot，不为 KSC 生成 IO。四个 query 的 DRAM
-miss 先做请求内稳定去重，再一次性更新 `cache_slots` 和 copy plan；不允许四行
-依次驱逐同一请求的 resident 集合。
+尚未进入 durable DRAM 的 token 全量走 causal tail，不再参与 LI 或 miss 判断。LIM 将这些 token 映射为 parity slots，追加在 top2048 之后，不为 KSC 生成 IO。各 query 的 DRAM miss 先做请求内去重，再一次性更新 `cache_slots` 和 copy plan；必须保护全部 query 的 topK 并集，不能逐行互相驱逐。
 
 DENSE 不使用上述“完整块 + tail”拆分：其 KV 全在 HBM，每个 query 直接对完整
 `visible_len` 排 top-2048；`visible_len<=2048` 时输出完整 causal prefix，超过
@@ -784,7 +780,7 @@ SFA-Offload 读取每行前 2048 个 `topk_slots`，SPARSE 行再根据
 是它尚未成为可卸载的完整 block。DENSE 行的 `tail_info=[-1, 0]`，其
 top2048 slot 直接等于完整序列 position。
 
-A5 C8 的物理 ABI 有一处受控差异：融合 LIDU 直接生成社区 QSFA 消费的固定
+A5 C8 非 MTP 的物理 ABI 有一处受控差异：融合 LIDU 直接生成社区 QSFA 消费的固定
 `int32[B,1,2176]` slot 行与 `resident_seq_lengths[B]`，同时生成 KSC 的
 `copy_src_ids/copy_dst_slots/copy_counts`。packed KSC 只搬运有效 copy-prefix，
 不再承担 attention metadata 构造。该差异没有引入新的 request 真源，也不改变
@@ -793,12 +789,57 @@ resident length 保持完整 `actual_len`，因此 dense 序列长度不受 2176
 A5 路径不消费 A3 的 `tail_info` scratch；融合算子已把有效尾部 slot 直接追加到
 2176 列 QSFA 索引行中。
 
-MTP3 时请求轴与 query 轴分离：copy plan/`cache_slots` 仍为 `B` 行，QSFA
-attention slots 为 `T=sum(Q_b)` 行。SPARSE 的 `candidate_lens[B]` 是 durable
-DRAM prefix，不是四个 query 共用的排名长度；LIM 在设备侧计算每 query
-candidate，并对跨界后新完成、仍位于双尾中的 selected token 直接给出 parity
-slot。此时 `resident_seq_lengths[B]` 为 `budget+256` 的物理可寻址 span，
-而每条 attention row 仍只追加自身当前逻辑块内最多 128 个 causal tail slot。
+MTP 的 copy plan/`cache_slots` 仍为 `B` 行，`sparse_and_tail_slots` 与 `sparse_and_tail_src_ids` 均为 `int32[T,1,2304]`，`T=sum(Q_b)`，算子支持每请求 1～4 条 query 混合。SPARSE 的 `candidate_lens[B]` 是共享 durable DRAM prefix D：各 query 独立在 `[0,D)` 选 top2048，再追加自身因果可见的 `[D,V_q)`（最多 256 个 token），tail slot 为 `budget+token%256`。tail 不参与 LI、miss 判断或 union copy；两份输出逐元素配对，topK 区域保持 miss 在前、hit 在后，尾部空位为 -1，`per_query_miss_counts[T]` 只统计 durable-prefix miss。`resident_seq_lengths[B]` 为 `budget+256` 的物理可寻址 span，DENSE 为最终原始 KV 长度，PAD 为 0。
+
+新版 MTP 不再把双尾区中新完成但尚未持久化的块加入 LI 候选域，而是将其因果可见部分全量纳入 Attention。这是明确的 Attention 语义升级；已有 durable-prefix 元数据和双 parity block 分配不变。非 MTP 仍使用 2176，不能全局替换成 2304。升级时必须同步 MTP 预分配 buffer、C++ shape 检查和 QSFA 输入检查，重新编译并重新捕获图；不支持复用旧 2176 graph。
+
+2026-09-10迁移保持同事的七输出顺序；新增 query source/miss 输出供后续融合
+使用，当前 KSC 仍只消费请求级去重 copy plan。KSC 保留错误 count/pair/table
+的设备断言，错误 `-1` 不可当作正常零IO。packed-MTP L3指纹增加
+`durable-prefix-topk-causal-dual-tail-v1`，隔离旧策略对象但不加入具体TP/DP rank。
+2304版本的验收以独立的单卡及整网回归证据为准，已验证范围见下文；不将先前
+2176版本的验收结果自动算作2304版本数值/性能验证通过。
+
+MTP victim扫描策略不得依赖请求的物理metadata pool行号。2026-09-10单卡行置换
+实验证实：相同逻辑初态和输入下，该依赖会改变resident slot布局，并在相同逻辑
+选择集合和顺序时引出QSFA数值差异。快速victim扫描和精确补扫统一使用只依赖
+candidate长度的seed，保留旧pool 0扫描规则；真实pool行号仍用于状态寻址，
+不固定或合并请求行，不修改双尾、七输出ABI或KSC。2026-09-11单卡严格回归通过：
+first-fill和两个steady步骤的映射、slots、copy counts及QSFA均一致。
+同日整网Eager回归`simple-dp-cc0755dfaeb04b8daf4c67d31be33ddb`中，两域70k仍经历
+R2/R3/R4的pool行1/0/1切换，但8k和70k各自的热路径128个输出token及返回top-5概率
+全部一致，原A/B/A分叉消失；R4每个TP实际完成59块及520块L3读取，70k为53本地+520外部。
+同日Graph回归`simple-dp-3ca6ff2eef804f59b86ea7ea8f2f05c0`也通过同一复现场景：
+两域都有实际replay记录、70k行号仍为1/0/1、八组热比较128 tokens及返回top-5一致，
+16条输出token/text与Eager对应记录相同，L3读取及排空计数一致。
+这关闭了该行号依赖复现场景，不等于全量logits、冷算/复用、性能或其他模型认证；
+修复后的全量算子门禁仍待反馈。R1/R2差异单独保留，不归因于硬件或豁免。
+验证后移除临时行号trace及runner接线，simple-DP恢复三轮共享salt和末轮交换DP，
+保留自动摘要与严格单卡行置换回归；不修改实际pool分配、native算子或Eager/Graph元数据。
+
+2026-09-10跨特性复核增加以下生命周期约束：
+
+- prefill结束时以已计算长度定位真实部分块，不能保留`req_blocks[-1]`，因为
+  MTP lookahead可能已经分配了更靠后的空块。
+- 首次ENTER前，按scheduler确认的DRAM ready水位到已计算长度保留尚未dump的
+  已验证满块和部分块，装到其固定logical parity列；runtime仍在每层写新KV前
+  执行原有dump。所保留的满块去除dense prefix hash，避免以后被当作只读前缀命中。
+- 若待dump满块已被另一请求引用，不能直接变可写tail，也不能只清hash：本请求
+  保持一轮DENSE完成dump，再尝试ENTER。该保守过渡可能改变一轮attention执行
+  路径，但不引入第二套eager/graph元数据或跨层COW复制协议。
+- ENTER容量预检只计释放后refcount真正归零的非null块，所有预检完成前不修改
+  任何物理池或请求阶段。共享L2前缀可以同源读取，可写HBM resident必须独立。
+- MTP即使关闭prefix，也会在成功forward返回后记录DRAM ready；关闭prefix只
+  关闭hash校验/发布，不关闭源块保活所需水位。不会把已分配块数当成已完成dump。
+- DSA dummy向更大native descriptor补齐时，query counts与seq_len覆盖相同的
+  最终行数；capture行满足SPARSE first-fill合同，runtime idle行仍为PAD/零IO。
+
+KSC的错误断言只保证错误传播，不会验证“物理块中是否确实是该请求的数据”。
+真实请求的null-DRAM拒绝、上述源块保活和共享引用隔离仍由框架负责；七输出中
+`per_query_miss_counts`也不能代替请求级`copy_counts`。KSC有效copy前缀内部
+不允许空洞，只有前缀外scratch与正常0-count行可跳过。
+
+LIM 为单次自定义 kernel 调用，所有 state/output 均 caller-owned；合法且不含 SPARSE first-fill 的 batch 统一走快路径，支持 PAD、短/长 DENSE 与 SPARSE-steady 混合。存在 first-fill 时沿用通用填充路径。DENSE 仍在完整因果可见 KV 上选 topK，可见长度不超过 2048 时直接发布连续索引；PAD 不访问缓存池。框架仍只配置固定 MTP3，非 uniform query 的 eager/graph 路由规则不因算子升级而改变。
 
 GLM-5.2 的 full 层仍生成同一份输出。紧随其后的 shared 层不执行 LI/LIDU，
 而是用该输出的 `copy_src_ids/copy_dst_slots/copy_counts` 对自己的 packed

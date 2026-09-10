@@ -107,6 +107,110 @@ def _prime(coordinator, *, hbm=4, l2=4):
     coordinator.free(req.request_id)
 
 
+def _finish_step(req, computed, *, mtp=True):
+    req.num_computed_tokens = computed
+    req.num_output_tokens = computed - req.num_prompt_tokens + 1
+    req.num_tokens = computed + 1
+    req.num_tokens_with_spec = computed + (4 if mtp else 1)
+
+
+def _mtp_enter_boundary(computed):
+    manager, coordinator = _make_dp(0, mtp=True)
+    req = _request("boundary")
+    req.num_prompt_tokens = req.num_tokens = req.num_tokens_with_spec = 255
+    assert allocate_dsa_slots(manager, req, 255, num_lookahead_tokens=3) is not None
+    coordinator.ensure_request_dram_blocks(req.request_id, 1)
+    coordinator.mark_request_dram_ready(req, 1)
+    _finish_step(req, 255)
+    assert allocate_dsa_slots(manager, req, 4, num_lookahead_tokens=3) is not None
+    assert coordinator.get_request_cache_state(req.request_id).stage == DSARequestCacheStage.DENSE_DECODE
+    _finish_step(req, computed)
+    return manager, coordinator, req
+
+
+def test_mtp_prefill_release_preserves_computed_tail_not_lookahead():
+    manager, coordinator = _make_dp(0, mtp=True)
+    req = _request("lookahead")
+    req.num_prompt_tokens = req.num_tokens = req.num_tokens_with_spec = 383
+    assert allocate_dsa_slots(manager, req, 383, num_lookahead_tokens=3) is not None
+    before = list(coordinator.resident_manager.req_to_blocks[req.request_id])
+    assert len(before) == 4
+    coordinator.ensure_request_dram_blocks(req.request_id, 2)
+    coordinator.mark_request_dram_ready(req, 2)
+    _finish_step(req, 383)
+    coordinator.release_prefill_resident_blocks(req.request_id, num_computed_tokens=383)
+    assert coordinator.resident_manager.req_to_blocks[req.request_id] == [before[2]]
+    assert before[2].ref_cnt == 1
+    assert before[3].ref_cnt == 0
+    assert allocate_dsa_slots(manager, req, 4, num_lookahead_tokens=3) is not None
+    assert coordinator.resident_manager.req_to_blocks[req.request_id][2] is before[2]
+
+
+@pytest.mark.parametrize("computed", [256, 258])
+def test_mtp_enter_keeps_pending_full_block_until_prewrite_dump(computed):
+    manager, coordinator, req = _mtp_enter_boundary(computed)
+    before = list(coordinator.resident_manager.req_to_blocks[req.request_id])
+    pending = before[1]
+    assert pending.block_hash is not None
+    assert coordinator.dram_directory.get_ready_block_count(req.request_id) == 1
+    assert allocate_dsa_slots(manager, req, 4, num_lookahead_tokens=3) is not None
+    after = coordinator.resident_manager.req_to_blocks[req.request_id]
+    assert len(after) == 4
+    # Runtime prewrite uses budget_blocks + logical_block % 2 for its source.
+    assert after[2 + 1 % 2] is pending
+    assert pending.ref_cnt == 1
+    assert pending.block_hash is None
+    if computed % 128:
+        assert after[2] is before[2]
+    assert all(block.block_hash is None for block in after)
+
+
+def test_shared_pending_mtp_block_stays_dense_then_enters_without_alias():
+    manager, coordinator, req = _mtp_enter_boundary(256)
+    before = list(coordinator.resident_manager.req_to_blocks[req.request_id])
+    pending = before[1]
+    pool = coordinator.resident_manager.block_pool
+    pool.touch([pending])  # Another prefix user already holds the completed block.
+    assert allocate_dsa_slots(manager, req, 4, num_lookahead_tokens=3) is not None
+    assert coordinator.get_request_cache_state(req.request_id).stage == DSARequestCacheStage.DENSE_DECODE
+    assert coordinator.resident_manager.req_to_blocks[req.request_id] == before
+    assert pending.ref_cnt == 2
+    assert pending.block_hash is not None
+
+    # The extra dense forward's prewrite dump makes the source durable.
+    coordinator.ensure_request_dram_blocks(req.request_id, 2)
+    coordinator.mark_request_dram_ready(req, 2)
+    _finish_step(req, 260)
+    assert allocate_dsa_slots(manager, req, 4, num_lookahead_tokens=3) is not None
+    assert coordinator.get_request_cache_state(req.request_id).stage == DSARequestCacheStage.ENTER_SPARSE_DECODE
+    assert pending.ref_cnt == 1
+    assert pending not in coordinator.resident_manager.req_to_blocks[req.request_id]
+
+
+def test_enter_counts_only_references_that_will_really_become_free():
+    manager, coordinator = _make_dp(0)
+    req = _request("shared-capacity")
+    req.num_prompt_tokens = req.num_tokens = req.num_tokens_with_spec = 255
+    assert allocate_dsa_slots(manager, req, 255) is not None
+    _finish_step(req, 255, mtp=False)
+    assert allocate_dsa_slots(manager, req, 1) is not None
+    _finish_step(req, 256, mtp=False)
+    resident = coordinator.resident_manager
+    before = list(resident.req_to_blocks[req.request_id])
+    resident.block_pool.touch(before)
+    resident.block_pool.get_new_blocks(resident.block_pool.get_num_free_blocks() - 1)
+    indexer_before = list(coordinator.indexer_manager.req_to_blocks[req.request_id])
+    indexer_free = coordinator.indexer_manager.block_pool.get_num_free_blocks()
+    stage_before = coordinator.get_request_cache_state(req.request_id).stage
+    assert allocate_dsa_slots(manager, req, 1) is None
+    assert resident.req_to_blocks[req.request_id] == before
+    assert [block.ref_cnt for block in before] == [2, 2]
+    assert resident.block_pool.get_num_free_blocks() == 1
+    assert coordinator.indexer_manager.req_to_blocks[req.request_id] == indexer_before
+    assert coordinator.indexer_manager.block_pool.get_num_free_blocks() == indexer_free
+    assert coordinator.get_request_cache_state(req.request_id).stage == stage_before
+
+
 def test_same_request_id_hash_and_physical_ids_stay_dp_local():
     manager0, dp0 = _make_dp(0)
     manager1, dp1 = _make_dp(1)
@@ -160,7 +264,7 @@ def test_dp_local_prefix_commit_keeps_peer_cold_and_preserves_backfill_gap(hbm, 
     req.num_computed_tokens = 513
     req.num_output_tokens = 1
     req.num_tokens = req.num_tokens_with_spec = 514
-    dp0.release_prefill_resident_blocks(req.request_id, preserve_tail_block=True)
+    dp0.release_prefill_resident_blocks(req.request_id, num_computed_tokens=req.num_computed_tokens)
     assert allocate_dsa_slots(manager0, req, 1) is not None
     assert dp0.get_request_cache_state(req.request_id).stage == DSARequestCacheStage.ENTER_SPARSE_DECODE
     assert len(dp0.resident_manager.req_to_blocks[req.request_id]) == 3
@@ -189,7 +293,7 @@ def test_mtp_dp_local_triple_replay_and_dual_tail_remain_isolated(hbm, l2):
     req.num_computed_tokens = 513
     req.num_output_tokens = 1
     req.num_tokens = req.num_tokens_with_spec = 514
-    dp0.release_prefill_resident_blocks(req.request_id, preserve_tail_block=True)
+    dp0.release_prefill_resident_blocks(req.request_id, num_computed_tokens=req.num_computed_tokens)
     assert allocate_dsa_slots(manager0, req, 1, num_lookahead_tokens=3) is not None
     assert len(dp0.resident_manager.req_to_blocks[req.request_id]) == 4
     assert len(dp0.mtp_full_manager.req_to_blocks[req.request_id]) == 5

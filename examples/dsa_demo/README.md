@@ -6,7 +6,8 @@
 | 文件 | 用途 |
 |---|---|
 | `simple_prompt_test.py` | 基线隔离、cache-init、eager 和 graph 冒烟 |
-| `simple_dp_prompt_test.py` | 同事入门用的单机DP离线脚本，顶部按特性分组配置，输出完整文本/token IDs |
+| `simple_dp_prompt_test.py` | 同事入门用的单机DP离线脚本，顶部按特性分组配置，输出完整文本/token IDs及自动精度证据摘要 |
+| `run_a5_mtp_operator_tests.py` | MTP七输出/2304升级门禁，默认框架UT＋单卡算子，不加载模型或启动Mooncake |
 | `qa_dataset_test.py` | LongBench 风格数据集精度回归，可切 disabled/eager/graph |
 | `eval_dataset_acc_score.py` | 对 QA 脚本生成的 JSONL 计算 LongBench 指标 |
 | `serve_dsa.sh` | 以 OpenAI 兼容在线服务拉起 DSA eager/graph |
@@ -30,6 +31,144 @@ L3 接入、异步 write-behind 和 HBM 热层后续方案见
 [DSA L1/L2/L3 分层缓存详细设计](../../docs/source/developer_guide/Design_Documents/dsa_l2_l3_cache_design.md)。
 阶段优先级与退出门禁见
 [DSA 稀疏卸载后续开发 RoadMap](../../docs/source/developer_guide/Design_Documents/dsa_offload_roadmap.md)。
+
+## A5 MTP 算子升级验证
+
+### 当前精度回归：pool行置换修复
+
+`5454d950`的行日志显示两个DP的70k均为R2 pool=1/A、R3 pool=0/B、R4 pool=1/A。
+随后单卡受控实验确认：相同逻辑初态和输入，换pool行号会改变steady阶段的resident映射，
+并引出QSFA差异。step1的集合及顺序仍相同，原始QSFA max_abs=3.0517578125e-05；
+按逻辑token排序仍有1.52587890625e-04差异，不能只归结为列表排序。step2进一步出现
+miss数6494之后的6435/6434分叉，原始QSFA max_abs=7.62939453125e-04。
+
+修复只将`HashVictimScanSeed`改成candidate-only，保留旧pool0扫描；快速/精确补扫共用它。
+真实poolRow仍用于状态地址，不改变allocator、七输出、双尾、KSC或正式attention列表排列。
+没有增加搬运/排序/同步，但victim选择改变后的命中率和性能仍需实测。
+修复后的单卡、整网Eager及Graph受控复现场景已通过；详见本节验证记录。
+
+**首次部署LIM修复时需重新编译安装，不能只同步Python。**已经通过修复后测试的环境
+不必因本次诊断清理再次编译。沿用已有SOC/CANN配置，不要求清空build/output，例如：
+
+```bash
+COMPILE_CUSTOM_KERNELS=1 python -m pip install -e . --no-build-isolation --no-deps
+```
+
+可单独执行不加载模型的严格行置换回归：
+
+```bash
+ASCEND_VISIBLE_DEVICES=0 ASCEND_RT_VISIBLE_DEVICES=0 \
+python -m pytest tests/e2e/nightly/single_node/ops/singlecard_ops/test_dsa_a5_c8_ops.py \
+  -k pool_row_relocation_diagnostic -vv -s --tb=short 2>&1 | tee mtp_pool_row_fixed.log
+```
+
+0改为分配到的空闲A5卡号；该测试不需要模型权重、Mooncake或DP集群。
+反馈完整`mtp_pool_row_fixed.log`即可。名称保留diagnostic以兼容旧命令，但现已加入严格断言。
+
+用例保留DENSE+SPARSE、candidate=73472、budget=12288、pool width=100096、8条query，
+以相同输入序列运行row0-a、row1、row0-b，分别观察first-fill和两个steady更新。
+QSFA用合法的合成packed-C8数据，CPU按实际resident映射物化相同逻辑KV，**刻意绕过KSC**；
+这是排除复制错误后检查LIM/QSFA元数据效应，不是完整框架复现。
+
+打印三行`[mtp-pool-row]` JSON，字段含义：
+- `same_row_repeat`：同一行从相同初态重跑是否一致，作为实验自身的控制。
+- `same_logical_state_before`与`same_resident_map_after`：当前步骤前/后，把选中的pool行
+  归一化后是否相同；修复后不应因换行号而分叉。
+- `same_selected_sets/order`、`same_slots`：逻辑选择集合、排列及resident位置是否变化。
+- `qsfa_*`：原始slot列表下稀疏请求的QSFA差异；`ordered_qsfa_*`只在测试内把TopK按逻辑
+  token排序作控制，保留因果tail和无效后缀，不排序物理block ID，不修改正式推理。
+
+修复回归要求所有一致性字段为true，copy_counts两侧相同；否则打印全部指标后失败，
+不放宽浮点容差。成功末尾打印`POOL_ROW_INVARIANCE_PASSED`。仍打印`EVIDENCE_ONLY`
+说明测试文件未更新；旧内核配新测试应在steady阶段失败。
+2026-09-11服务器已通过此单卡严格回归（1 passed，62 deselected）：三步一致性字段
+全部为true，原始/逻辑排序QSFA的max_abs均为0，copy counts依次为12288、6494、6435，
+两侧相同。此结果闭环该合成行置换用例，不等于GLM整网精度问题全部解决；正式推理
+未引入测试内的排序控制。
+
+修复后的全量框架/单卡门禁尚未收到结果；若已跑过通过，只反馈summary，不必重复。
+未跑过则用既有入口，已经编译成功的环境不需再编译：
+
+```bash
+ASCEND_VISIBLE_DEVICES=0 ASCEND_RT_VISIBLE_DEVICES=0 \
+python examples/dsa_demo/run_a5_mtp_operator_tests.py
+```
+
+2026-09-11整网Eager运行`simple-dp-cc0755dfaeb04b8daf4c67d31be33ddb`已完成16请求。
+两域70k在R2/R3/R4仍使用pool行1/0/1，但热路径不再出现A/B/A：8k与70k共8组
+相邻热轮比较均为128 tokens/text相同、返回top-5相同、共同候选logprob差值0。
+R4每个TP均实际完成8k的59块及70k的520块L3读取；后者从logical_start=53加载，
+与本地公共前缀拼成573块。两域各13个store计划全部完成，failed/pending/inflight均为0。
+这不是固定pool行或跳过L3得到的通过。R1/R2差异仍在，且70k R1已命中6784 tokens，
+不是纯冷算；冷算/复用等价性、全量logits和性能不在本次结论内。
+
+同日Graph运行`simple-dp-3ca6ff2eef804f59b86ea7ea8f2f05c0`也完成16请求，两个DP均有
+`Replaying aclgraph`记录；这证明实际执行过Graph，不声称日志逐步覆盖所有forward。
+70k热轮仍为pool1/0/1，8组热比较均128 tokens/text和返回top-5一致、差值0。
+与上述Eager对照，16条完整输出token/text也逐条相同；原始逐token的跨模式全量logprobs
+未随精简工件提供，不据此声称完整logits相同。R4读取及13个store完成计数与Eager一致。
+当前可关闭这次LIM物理行号依赖的复现场景，不扩大为冷算/复用、所有并发形状或性能认证。
+
+验证后已删除专用行日志、trace配置/runner接线和独立DP salt开关；恢复下方基础三轮
+Graph样例，保留自动摘要及严格单卡回归。不改allocator、算子、图元数据或L3协议。
+旧四轮脚本不要配清理后的框架使用；同步新的simple-DP脚本即可使用三轮入口。
+
+`simple_dp_prompt_test.py`正常完成推理后会自动生成精度证据摘要，不需要独立过滤脚本。
+同一次运行目录下的`precision_compact/precision_summary.txt`用于先反馈，
+`precision_details.json`保留完整生成token/text及首差异附近概率，
+不含完整prompt或全量logprobs；原始`dp*.jsonl`保留不变。
+摘要按实际DP数和相邻轮次配对，支持末轮交换DP与replicate；单轮只整理输出。
+已有结果也可直接处理：把本脚本顶部`SUMMARY_ONLY_DIR`改为对应的`simple-dp-xxx`
+目录，再执行`python simple_dp_prompt_test.py`。此模式不导入`novel_dataset`、
+不加载模型或连接Mooncake；重新推理前将`SUMMARY_ONLY_DIR`改回空字符串。
+摘要同时记录首次共同候选概率变化、候选集合变化和最大变化位置；候选交集
+差值为0不等于完整top-k集合相同，也不等于全量logits一致。
+仅整理已有结果不需要NPU、vLLM或重启服务；差异仅作为诊断证据，不自动判精度通过/失败。
+
+2026-09-10迁移同事 `d44387d3a9 / 3f644e34ec / 3b5d0ecdc0` 的有用增量，
+不复制测试机数据和旧框架。MTP采用共同durable前缀TopK＋因果可见双尾，
+保留同事七输出接口；非MTP仍2176。KSC保留原有错误断言，不静默吞掉坏plan。
+迁移及随后LIM修复已有上述限定场景的A5验证，不等于全量数值或性能认证。
+
+这是CANN算子、生成ACLNN API、Torch binding、Python owner的联合升级，
+**只同步Python、复用旧so或只编译kernel都不够**。沿用现有成功的A5/CANN环境，
+在项目根目录重编译安装，例如：
+
+```bash
+COMPILE_CUSTOM_KERNELS=1 python -m pip install -e . --no-build-isolation --no-deps
+python examples/dsa_demo/run_a5_mtp_operator_tests.py
+```
+
+`SOC_VERSION`沿用测试机真实A5型号；自动识别失败再填写以`ascend950`开头的值。
+不要求先全量删除build/output，但必须确认本轮host/kernel/扩展均实际更新。
+本次LIM符号名不变，启动检查会拒绝旧五输出schema；七输出旧2176版本不能只靠
+Torch schema识别，仍需配套重建，native shape测试会检查2304。
+
+脚本开关直接在顶部修改。默认顺序：
+
+1. `tests/ut/dsa_offload`：owner、请求/query分轴、L3语义指纹及既有prefix/DP回归。
+2. `test_dsa_a5_c8_ops.py`全量：非MTP回归、七输出形状校验、跨128边界与两种parity、
+   first-fill/steady、ragged/PAD/DENSE、真实swapped DRAM逐字节复制、eager/graph及
+   full/shared/下一full缓冲复用。这里的MTP是target C8算子，不是proposer BF16算子。
+
+任一阶段失败即停止。日志和`summary.json`在脚本旁的`results/a5_mtp_ops/<时间-pid>/`，
+反馈失败阶段日志或全量结果目录即可。复制到draft也可自动定位已安装的源码仓库；
+有多份安装时直接填写`PROJECT_ROOT`。脚本不改NPU可见设备设置，请沿用原单卡UT环境。
+
+同日跨特性复核还补充了真实BlockPool的ENTER回归：lookahead后的真实尾块、
+待dump满块、共享pending块延后一轮DENSE以及低余量失败不改表。算子用例增加
+head32/T=70的四-query tile（含真正执行LI的R=2行）、共享只读L2源的独立HBM写回。
+这些会随上述入口自动执行，不需再加开关。`simple_dp_prompt_test.py`仍保留
+MTP+prefix+L3组合；当前已恢复四长度三轮Graph入门测试，说明见下方单机DP入门入口。
+
+`RUN_INVALID_PLAN_PROBES=False`默认关闭故意触发设备断言的负例。只有允许设备异常的
+独占环境才打开；它单独启动两个进程检查-1 count和坏pair，禁用core文件、设置超时，
+且必须看到对应错误信息，不能将任意进程异常当成PASS。正常门禁不包含这些破坏性测试。
+
+算子门禁通过后，用`simple_dp_prompt_test.py`的Graph＋MTP＋prefix＋L3配置
+复测，再按需回归在线。需要重启服务/重新capture graph。packed-MTP的L3指纹已隔离
+旧attention策略，不需清空公共Mooncake；旧对象不会被本版复用。新旧策略的生成token
+不要求逐个相同，精度对照应比较同一新策略下local replay与external loadback。
 
 ## 1. 前置条件
 
@@ -260,13 +399,38 @@ python simple_dp_prompt_test.py
 ```
 
 配置按长条注释分成输入/采样、基线通用、DP/TP、DSA、prefix/replay、MTP、L3、
-运行环境/结果八组。不导入其他demo的配置，不要求命令行环境变量。
-默认叠加A5八卡DP2/TP4、Graph、chunked prefill、DSA、prefix、MTP3、L3读写，
+运行环境/结果八组，另有顶部的已有结果摘要入口。不导入其他demo的配置，不要求命令行环境变量。
+当前叠加A5八卡DP2/TP4、Graph、chunked prefill、DSA、prefix、MTP3、L3读写，
 每域max_num_seqs=4，生成128 tokens并ignore_eos=True，保存top-5 logprobs。
-三轮依次为冷算、本地prefix复用、清本地后交换DP并从L3回载。
-数据导入和`PROMPTS`完全由使用者维护，不自动选择、加载或替换数据集。当前示例
-保留`chinese_8k + chinese_5k + chinese_70k + chinese_40k`的组合，需提供相应数据模块，
-也可直接替换成自己的字符串列表。运行前仍需核对模型/设备/Mooncake配置并手动启动Master。
+默认`PROMPTS=chinese_8k + chinese_5k + chinese_70k + chinese_40k`，
+`PROMPT_DISTRIBUTION="round_robin"`、`REPLAY_ROUNDS=3`。
+数据导入和`PROMPTS`由使用者直接维护，不自动补请求或增加序号前缀。
+四份数据各一条时，前两轮DP0跑8k/70k，DP1跑5k/40k；最后一轮交换输入归属。
+运行前核对模型/设备/Mooncake配置并手动启动Master。已部署修复后算子的环境无需重编译。
+
+默认三轮共12个请求，不把不同DP输出当作数学标杆，也不自动放宽精度判据：
+
+| 轮次 | 日志phase | 作用 |
+|---|---|---|
+| R1 | `seed` | 首次生成并写L3；70k可能复用同域8k刚生成的公共前缀，不能一律当成全量重算 |
+| R2 | `local-replay-1` | 保留本地缓存的首次复用 |
+| R3 | `after-local-reset` | 两域排空并只清本地、保留L3，再交换各域输入；与该prompt的R2比较 |
+
+运行级salt在所有DP和各轮保持相同，隔离旧实验缓存但不破坏本次跨域内容共享。
+原四轮独立salt/行号日志专用于LIM定位，修复已通过单卡及整网Eager/Graph后删除。
+
+同步最新脚本到实际运行目录后执行：
+
+```bash
+python -u simple_dp_prompt_test.py 2>&1 | tee simple_dp.log
+grep -E '\[simple-dp|Replaying aclgraph|DSA L3|DSA MTP durable|DSA prefix|ERROR|Traceback' simple_dp.log > simple_dp_key.log
+```
+
+反馈`simple_dp_key.log`及本次`results/simple_dp/<run_id>/precision_compact/`
+下的`precision_summary.txt`、`precision_details.json`即可，不用传原始大JSONL。
+R3应有非零L3 load/restore完成，具体块数取决于本次prompt共享前缀和调度顺序，
+不能只靠`cached_tokens`或phase名称证明实际发生IO。精度差异需结合执行条件分析，
+当前样例不声明首次生成/前缀复用、不同DP或不同模式之间数学等价。
 
 常见用法，均直接在脚本内修改：
 
@@ -274,10 +438,10 @@ python simple_dp_prompt_test.py
 |---|---|
 | 基线DP对照 | 关闭`ENABLE_DSA_OFFLOAD`和两个L3开关；MTP按对照需要选择，RUN_MODE可独立选eager/graph |
 | 调整输入 | 直接修改脚本顶部的数据导入及`PROMPTS` |
-| 每个DP跑相同输入 | `PROMPT_DISTRIBUTION="replicate"`，同时关闭`SWAP_DP_ON_LAST_REPLAY` |
+| 每个DP跑相同输入 | `PROMPT_DISTRIBUTION="replicate"`、`SWAP_DP_ON_LAST_REPLAY=False`；仍共享本次run salt |
 | 仅Local prefix重放 | 关闭两个L3开关及reset/swap，保留prefix，`REPLAY_ROUNDS=2` |
 | 非MTP对照 | `ENABLE_MTP=False`；MTP3默认已开启，proposer固定eager |
-| L3与跨域读取 | 默认即已配置；前两轮保留本地缓存，第三轮清本地并交换域 |
+| 混合三轮跨域读取 | 当前默认；配好`PROMPTS`，保留round_robin、三轮、L3及reset/swap开关 |
 | 不加载模型的配置检查 | `CHECK_ONLY=True`，先检查配置、路径、依赖以及启用时的Master监听 |
 
 L3当前固定Mooncake TCP，Master需自己启动；MTP proposer固定eager。
@@ -296,7 +460,8 @@ round_robin要求每域至少一条输入，不伪造placeholder。DP=1可作为
 每次运行结果存于`results/simple_dp/<run_id>/`：配置、LLM参数、实际engine信息及
 逐域JSONL（含原prompt、输出文本、token IDs和可选logprobs）。每轮只打印简要进度，
 主进程最后按DP/轮次统一打印完整输出，避免文本穿插。脚本用全域共享、轮间不变的
-run salt隔离旧实验缓存，不修改prompt文本，也不把DP ID加入内容key。
+run salt隔离旧实验缓存，不修改prompt文本。每条记录保存phase和实际salt，摘要保留命中长度，
+便于识别请求或对照条件是否发生变化。摘要比较的是相邻轮次，不自动给出精度PASS。
 
 本脚本供配置探索和学习，不自动放宽/判定数值精度，不把cache hit或COMPLETED
 当成IO字节正确性和worker优雅退出的证明。需要严格功能验收仍使用

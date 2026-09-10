@@ -4236,6 +4236,14 @@ class NPUModelRunner(GPUModelRunner):
         # Runtime idle is a graph-compatible participant. Its synthetic local
         # batch must not veto a peer's FULL decode; side effects are disabled
         # later through PAD rows and device-side no-op copy metadata.
+        if prepare_dsa_full_dummy:
+            num_scheduled_tokens = self.dsa_offload_runtime.dummy_query_lengths(
+                row_count=batch_desc.num_reqs,
+                num_tokens=num_tokens_padded,
+                query_len=max_query_len,
+            )
+            num_reqs_padded = len(num_scheduled_tokens)
+            self.query_lens = torch.from_numpy(num_scheduled_tokens)
         if runtime_idle and self.dsa_offload_enabled:
             dummy_signature = (
                 str(cudagraph_runtime_mode),
@@ -4264,7 +4272,8 @@ class NPUModelRunner(GPUModelRunner):
         if num_tokens_across_dp is not None and num_tokens_padded != num_tokens:
             # pad is needed if the pad of `num_tokens` is triggered inside CudagraphDispatcher
             num_tokens_across_dp[:] = num_tokens_padded
-            num_scheduled_tokens = num_scheduled_tokens.repeat(num_reqs_padded)
+            if not prepare_dsa_full_dummy:
+                num_scheduled_tokens = num_scheduled_tokens.repeat(num_reqs_padded)
         
         if self.dynamic_eplb:
             self.update_eplb_heat_collection_status(num_tokens_padded)
@@ -4305,8 +4314,9 @@ class NPUModelRunner(GPUModelRunner):
                     self._dsa_graph_dummy_seq_len(),
                 )
 
-            self.optimistic_seq_lens_cpu[:num_reqs] = seq_lens
-            self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
+            seq_len_rows = num_reqs_padded if prepare_dsa_full_dummy else num_reqs
+            self.optimistic_seq_lens_cpu[:seq_len_rows] = seq_lens
+            self.optimistic_seq_lens_cpu[seq_len_rows:].fill_(0)
             self.seq_lens.copy_(self.optimistic_seq_lens_cpu, non_blocking=True)
 
             cum_num_tokens = self._get_cumsum_and_arange(
@@ -4317,7 +4327,9 @@ class NPUModelRunner(GPUModelRunner):
                 self.gdn_query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
                 copy_snapshot_to_gpu(self.gdn_query_start_loc)
 
-            if not profile_cpp:
+            # DSA already wrote all uniform padded ends from the native
+            # descriptor. FIA's generic padding would reinterpret the raw B.
+            if not profile_cpp and not prepare_dsa_full_dummy:
                 num_reqs_padded = self._pad_query_start_loc_for_fia(
                     self.query_start_loc,
                     num_tokens_padded,

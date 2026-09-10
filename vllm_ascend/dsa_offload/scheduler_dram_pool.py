@@ -397,7 +397,7 @@ class DSASchedulerDRAMBlockDirectory:
             )
         if ready_block_count == previous:
             return
-        if ready_block_count > len(request.block_hashes):
+        if self.enable_caching and ready_block_count > len(request.block_hashes):
             raise RuntimeError(
                 "DSA DRAM ready prefix exceeds available request hashes: "
                 f"request_id={request_id!r}, ready={ready_block_count}, "
@@ -413,6 +413,11 @@ class DSASchedulerDRAMBlockDirectory:
                 kv_cache_group_id=_DSA_DRAM_CACHE_GROUP_ID,
             )
         self._ready_block_counts[request_id] = ready_block_count
+
+    def get_ready_block_count(self, request_id: str) -> int:
+        """返回已由成功 forward 确认的完整 bundle 水位，不等于已分配块数。"""
+
+        return self._ready_block_counts.get(request_id, 0)
 
     def take_unpublished_assignment(
         self,
@@ -446,6 +451,10 @@ class DSASchedulerDRAMBlockDirectory:
             return ()
         released_ids = tuple(block.block_id for block in released)
         ready_count = self._ready_block_counts.pop(request_id, 0)
+        if not self.enable_caching:
+            # Durability is needed for MTP source retention, not cache reuse.
+            # Keep the existing no-prefix free-queue policy unchanged.
+            ready_count = 0
         self._worker_published_block_counts.pop(request_id, None)
         ready_blocks = released[:ready_count]
         unready_blocks = released[ready_count:]

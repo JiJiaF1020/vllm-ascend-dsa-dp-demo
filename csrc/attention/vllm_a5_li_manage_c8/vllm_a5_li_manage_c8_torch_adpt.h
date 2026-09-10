@@ -22,6 +22,8 @@ inline void npu_dsa_a5_li_manage_c8_out(
     const at::Tensor& req_pool_entries,
     at::Tensor cache_slots_pool,
     at::Tensor sparse_and_tail_slots,
+    at::Tensor sparse_and_tail_src_ids,
+    at::Tensor per_query_miss_counts,
     at::Tensor resident_seq_lengths,
     at::Tensor copy_src_ids,
     at::Tensor copy_dst_slots,
@@ -29,7 +31,7 @@ inline void npu_dsa_a5_li_manage_c8_out(
 {
     constexpr int64_t block_size = 128;
     constexpr int64_t head_dim = 128;
-    constexpr int64_t attention_capacity = 2176;
+    constexpr int64_t attention_capacity = 2304;
     constexpr int64_t copy_capacity = 16384;
     constexpr int64_t max_source_capacity = 1 << 18;
     constexpr int64_t max_queries_per_request = 4;
@@ -83,6 +85,7 @@ inline void npu_dsa_a5_li_manage_c8_out(
         &actual_seq_lengths_query, &index_block_table, &candidate_lens,
         &final_seq_lengths_kv, &row_modes, &req_pool_entries,
         &cache_slots_pool, &sparse_and_tail_slots, &resident_seq_lengths,
+        &sparse_and_tail_src_ids, &per_query_miss_counts,
         &copy_src_ids, &copy_dst_slots, &copy_counts};
     for (const at::Tensor* tensor : int_tensors) {
         TORCH_CHECK(tensor->scalar_type() == at::kInt,
@@ -116,6 +119,10 @@ inline void npu_dsa_a5_li_manage_c8_out(
                     sparse_and_tail_slots.size(0) == total_query_rows &&
                     sparse_and_tail_slots.size(1) == 1 &&
                     sparse_and_tail_slots.size(2) == attention_capacity &&
+                    sparse_and_tail_src_ids.sizes() ==
+                        sparse_and_tail_slots.sizes() &&
+                    per_query_miss_counts.dim() == 1 &&
+                    per_query_miss_counts.size(0) == total_query_rows &&
                     resident_seq_lengths.dim() == 1 &&
                     resident_seq_lengths.size(0) == batch &&
                     copy_src_ids.dim() == 3 &&
@@ -124,7 +131,8 @@ inline void npu_dsa_a5_li_manage_c8_out(
                     copy_src_ids.size(2) == copy_capacity &&
                     copy_dst_slots.sizes() == copy_src_ids.sizes() &&
                     copy_counts.dim() == 1 && copy_counts.size(0) == batch,
-                "DSA A5 MTP LIM caller-owned output shapes are invalid.");
+                "DSA A5 MTP LIM caller-owned output shapes are invalid; "
+                "paired attention outputs must be [T,1,2304].");
 
     const auto device = query.device();
     const at::Tensor* tensors[] = {
@@ -133,6 +141,7 @@ inline void npu_dsa_a5_li_manage_c8_out(
         &index_key_dequant_scale, &index_block_table, &candidate_lens,
         &final_seq_lengths_kv, &row_modes, &req_pool_entries,
         &cache_slots_pool, &sparse_and_tail_slots, &resident_seq_lengths,
+        &sparse_and_tail_src_ids, &per_query_miss_counts,
         &copy_src_ids, &copy_dst_slots, &copy_counts};
     for (const at::Tensor* tensor : tensors) {
         TORCH_CHECK(tensor->device() == device,
@@ -142,8 +151,9 @@ inline void npu_dsa_a5_li_manage_c8_out(
         &query, &query_dequant_scale, &actual_seq_lengths_query,
         &index_block_table, &candidate_lens, &final_seq_lengths_kv,
         &row_modes, &req_pool_entries, &cache_slots_pool,
-        &sparse_and_tail_slots, &resident_seq_lengths, &copy_src_ids,
-        &copy_dst_slots, &copy_counts};
+        &sparse_and_tail_slots, &sparse_and_tail_src_ids,
+        &per_query_miss_counts, &resident_seq_lengths,
+        &copy_src_ids, &copy_dst_slots, &copy_counts};
     for (const at::Tensor* tensor : contiguous_tensors) {
         TORCH_CHECK(tensor->is_contiguous(),
                     "DSA A5 MTP LIM metadata and outputs must be contiguous.");
@@ -169,6 +179,8 @@ inline void npu_dsa_a5_li_manage_c8_out(
                  scale_stride,
                  weight_stride,
                  sparse_and_tail_slots,
+                 sparse_and_tail_src_ids,
+                 per_query_miss_counts,
                  resident_seq_lengths,
                  copy_src_ids,
                  copy_dst_slots,

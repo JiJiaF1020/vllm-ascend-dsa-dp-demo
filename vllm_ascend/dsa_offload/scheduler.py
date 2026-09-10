@@ -264,7 +264,7 @@ class DSAOffloadScheduler(Scheduler):
         l3_store_enabled = bool(getattr(self, "dsa_l3_enabled", False))
         dram_ready_block_counts = (
             [0] * row_count
-            if self.dsa_coordinator.enable_caching or l3_store_enabled
+            if self.dsa_coordinator.enable_caching or l3_store_enabled or self.num_spec_tokens
             else []
         )
         resident_replacements: list[DSAResidentBlockTableReplacement] = []
@@ -522,7 +522,7 @@ class DSAOffloadScheduler(Scheduler):
     ) -> dict[int, EngineCoreOutputs]:
         # 此调用只会发生在所有 worker 成功返回以后。必须在 super() 可能
         # finish/free 请求之前发布完整 DRAM bundle 的 hash。
-        if self.dsa_coordinator.enable_caching:
+        if self.dsa_coordinator.enable_caching or getattr(self, "num_spec_tokens", 0):
             if not isinstance(scheduler_output, DSAOffloadSchedulerOutput):
                 raise RuntimeError(
                     "DSA prefix-ready update requires "
@@ -571,6 +571,6 @@ class DSAOffloadScheduler(Scheduler):
                 continue
             self.dsa_coordinator.release_prefill_resident_blocks(
                 request_id,
-                preserve_tail_block=(request.num_prompt_tokens % self.block_size != 0),
+                num_computed_tokens=int(request.num_prompt_tokens),
             )
         return outputs

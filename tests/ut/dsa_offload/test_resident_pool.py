@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
 import torch
 
 from vllm_ascend.dsa_offload.contracts import DSA_LIDU_CACHE_ROW_ALIGNMENT
@@ -15,6 +16,20 @@ def _make_pool() -> DSAResidentTokenPool:
         max_resident_budget_tokens=4096,
         device=torch.device("cpu"),
     )
+
+
+@pytest.mark.parametrize("max_model_len,expected_width", [(8192, 8448), (262143, 262144), (262144, 262145)])
+def test_pool_metadata_column_stays_inside_native_capacity(max_model_len, expected_width) -> None:
+    pool = DSAResidentTokenPool(
+        max_num_reqs=1,
+        num_layers=1,
+        max_model_len=max_model_len,
+        max_resident_budget_tokens=8192,
+        device=torch.device("cpu"),
+    )
+    assert pool.cache_row_width == expected_width
+    assert pool.cache_metadata_index == expected_width - 1
+    assert max_model_len <= pool.cache_metadata_index <= 262144
 
 
 def test_pool_row_is_stable_until_request_release() -> None:
@@ -34,6 +49,36 @@ def test_pool_row_is_stable_until_request_release() -> None:
     pool.get_cache_slots(0)[first, 0] = 123
     assert pool.acquire("req-c") == first
     assert pool.get_cache_slots(0)[first, 0].item() == -1
+
+
+def test_lifecycle_row_reuse_does_not_read_back_device_state(monkeypatch) -> None:
+    pool = DSAResidentTokenPool(
+        max_num_reqs=2,
+        num_layers=1,
+        max_model_len=8192,
+        max_resident_budget_tokens=4096,
+        device=torch.device("cpu"),
+    )
+
+    # Allocation/ENTER/release use CPU ownership without a device readback.
+    def no_readback(*args, **kwargs):
+        raise AssertionError("pool lifecycle must not inspect device tensors")
+
+    with monkeypatch.context() as patch:
+        for name in ("cpu", "item", "tolist", "numpy"):
+            patch.setattr(torch.Tensor, name, no_readback)
+        assert pool.acquire("short") == 0
+        assert pool.acquire("long") == 1
+        assert pool.acquire("long") == 1
+        pool.prepare_sparse_request("long", target_budget_tokens=4096)
+        pool.prepare_sparse_request("long", target_budget_tokens=4096)
+        assert pool.release("short") == 0
+        assert pool.release("long") == 1
+        assert pool.release("long") is None
+        assert pool.acquire("next-short") == 1
+        assert pool.acquire("next-long") == 0
+    assert pool.get_cache_slots(0)[0, -1].item() == 0
+    assert pool.get_cache_slots(0)[1, -1].item() == 0
 
 
 def test_enter_marks_every_layer_for_first_fill_once() -> None:

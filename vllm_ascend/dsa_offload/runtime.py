@@ -36,7 +36,8 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.utils import CpuGpuBuffer
 
 from vllm_ascend.dsa_offload.contracts import (
-    DSA_A5_ATTENTION_CAPACITY,
+    DSA_A5_MTP_ATTENTION_CAPACITY,
+    DSA_A5_NOMTP_ATTENTION_CAPACITY,
     DSA_DRAM_NULL_BLOCK_ID,
     DSA_DUMP_NOOP_DST_BLOCK_ID,
     DSA_LIDU_OUTPUT_CAPACITY,
@@ -147,17 +148,34 @@ class DSAOffloadRuntime:
             DSALightningIndexerOutputs,
         ] = {}
         self._a5_attention_slots: torch.Tensor | None = None
+        self._a5_attention_src_ids: torch.Tensor | None = None
+        self._a5_per_query_miss_counts: torch.Tensor | None = None
         self._a5_resident_seq_lengths: torch.Tensor | None = None
         if self.packed_c8:
+            attention_capacity = (
+                DSA_A5_MTP_ATTENTION_CAPACITY if self.max_decode_query_len > 1 else DSA_A5_NOMTP_ATTENTION_CAPACITY
+            )
+            attention_shape = (
+                self.max_num_reqs * self.max_decode_query_len,
+                1,
+                attention_capacity,
+            )
             self._a5_attention_slots = torch.empty(
-                (
-                    self.max_num_reqs * self.max_decode_query_len,
-                    1,
-                    DSA_A5_ATTENTION_CAPACITY,
-                ),
+                attention_shape,
                 dtype=torch.int32,
                 device=self.device,
             )
+            if self.max_decode_query_len > 1:
+                self._a5_attention_src_ids = torch.empty(
+                    attention_shape,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                self._a5_per_query_miss_counts = torch.empty(
+                    attention_shape[0],
+                    dtype=torch.int32,
+                    device=self.device,
+                )
             self._a5_resident_seq_lengths = torch.empty(
                 self.max_num_reqs,
                 dtype=torch.int32,
@@ -714,8 +732,8 @@ class DSAOffloadRuntime:
         普通 Q=1 的 DENSE 行候选区是当前完整序列，SPARSE 行只覆盖最后
         一个物理 tail 之前的完整逻辑块。MTP target Q=4 验算时，DENSE 写
         完整可见长度；SPARSE 的该列专门表示已经持久化到 DRAM 的 durable
-        prefix。每个 query 真正的 LI candidate 由 LIM 根据 final length 在
-        设备侧独立推导，避免 graph prepare 构造 T=4B 的 host 元数据。
+        prefix D。同一请求的所有 query 共享 [0,D) 的 LI 候选域；LIM 根据
+        final length 逐 query 追加因果可见的双尾 [D,V)，不让 tail 参与 LI。
         """
 
         num_reqs = self.active_num_reqs
@@ -855,6 +873,19 @@ class DSAOffloadRuntime:
         self.dump_launch_count = int(launch_count)
         self._reset_selection_source()
         return execution_num_reqs
+
+    def dummy_query_lengths(self, *, row_count: int | None, num_tokens: int, query_len: int) -> np.ndarray:
+        """按最终 native descriptor 构造 uniform dummy 行，不按原 batch 倍增。"""
+
+        if not 0 < query_len <= self.max_decode_query_len:
+            raise ValueError("DSA dummy query shape is outside runtime capacity")
+        if row_count is None:
+            row_count = num_tokens // query_len
+        if not 0 < row_count <= self.max_num_reqs:
+            raise ValueError("DSA dummy query shape is outside runtime capacity")
+        if row_count * query_len != num_tokens:
+            raise ValueError("DSA uniform dummy descriptor has inconsistent row/token counts")
+        return np.full(row_count, query_len, dtype=np.int32)
 
     def prepare_graph_capture(self, *, row_count: int) -> None:
         """为原生 dummy-run 安装固定地址 DRAM/dump 输入。"""
@@ -1342,8 +1373,8 @@ class DSAOffloadRuntime:
         dram_table = self.active_dram_block_table.np
         for row_value in rows:
             row = int(row_value)
-            # LIDU 把最后一个非空块作为 dense tail；只有它之前的完整块
-            # 会成为 KSC 的 DRAM source。
+            # candidate 是 KSC 可读的完整块前缀。MTP 使用共同 durable D，
+            # 未 durable 的因果双尾仍在 HBM，不因尾块已填满而纳入此范围。
             required_blocks = (
                 int(state.candidate_lens_cpu[row]) // self.block_size
             )
@@ -1480,6 +1511,8 @@ class DSALayerOffloadContext:
                 raise RuntimeError("DSA A5 C8 decode metadata is incomplete")
             indexer_key, indexer_scale = self.indexer_cache
             attention_slots_buffer = self.runtime._a5_attention_slots
+            attention_src_ids_buffer = self.runtime._a5_attention_src_ids
+            per_query_miss_counts_buffer = self.runtime._a5_per_query_miss_counts
             resident_seq_lengths_buffer = self.runtime._a5_resident_seq_lengths
             if attention_slots_buffer is None or resident_seq_lengths_buffer is None:
                 raise RuntimeError("DSA A5 C8 context has no preallocated selection scratch")
@@ -1491,28 +1524,47 @@ class DSALayerOffloadContext:
                 )
             attention_slots = attention_slots_buffer[:num_query_rows]
             resident_seq_lengths = resident_seq_lengths_buffer[:num_reqs]
-            a5_lidu = (
-                a5_lightning_indexer_decode_update_mtp_c8
-                if self.runtime.max_decode_query_len > 1
-                else a5_lightning_indexer_decode_update_c8
-            )
-            a5_lidu(
-                index_weights=weights,
-                query=query.view(query_shape),
-                query_dequant_scale=query_dequant_scale.view(query_shape[:-1]),
-                actual_seq_lengths_query=actual_seq_lengths_query,
-                index_key_cache=indexer_key,
-                index_key_dequant_scale=indexer_scale,
-                index_block_table=indexer_block_table,
-                candidate_lens=candidate_lens,
-                final_seq_lengths_kv=actual_seq_lengths_key,
-                row_modes=row_modes,
-                req_pool_entries=resident_pool_indices,
-                cache_slots=self.runtime.resident_token_pool.get_cache_slots(self.selection_state_id),
-                attention_slots=attention_slots,
-                resident_seq_lengths=resident_seq_lengths,
-                outputs=outputs,
-            )
+            cache_slots = self.runtime.resident_token_pool.get_cache_slots(self.selection_state_id)
+            if self.runtime.max_decode_query_len > 1:
+                if attention_src_ids_buffer is None or per_query_miss_counts_buffer is None:
+                    raise RuntimeError("DSA A5 MTP context has no per-query selection scratch")
+                a5_lightning_indexer_decode_update_mtp_c8(
+                    index_weights=weights,
+                    query=query.view(query_shape),
+                    query_dequant_scale=query_dequant_scale.view(query_shape[:-1]),
+                    actual_seq_lengths_query=actual_seq_lengths_query,
+                    index_key_cache=indexer_key,
+                    index_key_dequant_scale=indexer_scale,
+                    index_block_table=indexer_block_table,
+                    candidate_lens=candidate_lens,
+                    final_seq_lengths_kv=actual_seq_lengths_key,
+                    row_modes=row_modes,
+                    req_pool_entries=resident_pool_indices,
+                    cache_slots=cache_slots,
+                    attention_slots=attention_slots,
+                    attention_src_ids=attention_src_ids_buffer[:num_query_rows],
+                    per_query_miss_counts=per_query_miss_counts_buffer[:num_query_rows],
+                    resident_seq_lengths=resident_seq_lengths,
+                    outputs=outputs,
+                )
+            else:
+                a5_lightning_indexer_decode_update_c8(
+                    index_weights=weights,
+                    query=query.view(query_shape),
+                    query_dequant_scale=query_dequant_scale.view(query_shape[:-1]),
+                    actual_seq_lengths_query=actual_seq_lengths_query,
+                    index_key_cache=indexer_key,
+                    index_key_dequant_scale=indexer_scale,
+                    index_block_table=indexer_block_table,
+                    candidate_lens=candidate_lens,
+                    final_seq_lengths_kv=actual_seq_lengths_key,
+                    row_modes=row_modes,
+                    req_pool_entries=resident_pool_indices,
+                    cache_slots=cache_slots,
+                    attention_slots=attention_slots,
+                    resident_seq_lengths=resident_seq_lengths,
+                    outputs=outputs,
+                )
             store = self.runtime.dram_store
             if store is None:
                 raise RuntimeError("DSA layer has no bound DRAM store")

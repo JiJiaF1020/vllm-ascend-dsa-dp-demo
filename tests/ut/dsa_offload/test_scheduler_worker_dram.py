@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -36,6 +38,25 @@ def _make_store() -> DSAWorkerDRAMStore:
         device=torch.device("cpu"),
         arena_factory=_cpu_arena,
     )
+
+
+def test_ready_watermark_without_prefix_hashes_is_committed_monotonically():
+    directory = DSASchedulerDRAMBlockDirectory(
+        usable_blocks=8, max_logical_blocks=8, block_size=128, enable_caching=False,
+    )
+    request = SimpleNamespace(request_id="mtp-without-prefix")
+    directory.ensure_request_blocks(request.request_id, 3)
+    assert directory.get_ready_block_count(request.request_id) == 0
+    directory.mark_ready_prefix(request, 1)
+    directory.mark_ready_prefix(request, 2)
+    assert directory.get_ready_block_count(request.request_id) == 2
+    with pytest.raises(RuntimeError, match="watermark"):
+        directory.mark_ready_prefix(request, 1)
+    previous_ids = directory.get_request_blocks(request.request_id)
+    directory.free_request(request.request_id)
+    assert directory.get_ready_block_count(request.request_id) == 0
+    directory.ensure_request_blocks("next", 3)
+    assert directory.get_request_blocks("next") == tuple(reversed(previous_ids))
 
 
 def test_dram_capacity_uses_fractional_multiplier_with_ceil() -> None:

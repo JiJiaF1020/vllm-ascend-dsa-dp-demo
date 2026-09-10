@@ -22,6 +22,7 @@ MTP3 的 resident 表在 ENTER 时一次排成 ``budget + parity0 + parity1``；
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from vllm.logger import logger
@@ -295,21 +296,62 @@ def _allocate_dense_plan(
     return manager.create_kv_cache_blocks(new_blocks)
 
 
+def _resident_blocks_to_preserve(
+    coordinator: DSAKVCacheCoordinator,
+    request: Request,
+    plan: DSARequestCachePlan,
+) -> tuple[tuple[int, KVCacheBlock], ...] | None:
+    """在改表前定位未 durable 的已验证满块和部分尾块，不保留 lookahead。"""
+
+    blocks = coordinator.resident_manager.req_to_blocks.get(request.request_id, [])
+    block_size = coordinator.resident_manager.block_size
+    computed = int(request.num_computed_tokens)
+    full_count, partial = divmod(computed, block_size)
+    state = coordinator.request_cache_layout.get_state(request.request_id)
+    if state is not None and state.prefill_resident_released:
+        if len(blocks) != int(bool(partial)):
+            raise RuntimeError("DSA released prefill resident table lost its computed tail")
+        preserved = ((full_count, blocks[0]),) if partial else ()
+    else:
+        first = full_count
+        if plan.resident_tail_block_count > 1:
+            first = coordinator.dram_directory.get_ready_block_count(request.request_id)
+        end = full_count + int(bool(partial))
+        if first > full_count or end > len(blocks) or end - first > plan.resident_tail_block_count:
+            raise RuntimeError("DSA ENTER pending resident source exceeds its allocated fixed tail capacity")
+        preserved = tuple((index, blocks[index]) for index in range(first, end))
+    if any(block.is_null or block.ref_cnt < 1 for _, block in preserved):
+        raise RuntimeError("DSA ENTER cannot repurpose a free or null resident tail")
+    if len({block.block_id for _, block in preserved}) != len(preserved):
+        raise RuntimeError("DSA ENTER pending resident sources alias one physical block")
+    if any(index == full_count and block.ref_cnt != 1 for index, block in preserved):
+        raise RuntimeError("DSA ENTER partial resident tail must be private")
+    if any(block.ref_cnt > 1 for _, block in preserved):
+        # A completed but not-yet-durable block may have been prefix-touched
+        # by a peer. One more dense step dumps it without making it writable.
+        return None
+    return preserved
+
+
 def _release_resident_blocks_for_enter(
     coordinator: DSAKVCacheCoordinator,
     request_id: str,
     *,
-    preserve_tail_block: bool,
-) -> KVCacheBlock | None:
+    preserved_blocks: tuple[tuple[int, KVCacheBlock], ...],
+) -> None:
     resident_manager = coordinator.resident_manager
     req_blocks = resident_manager.req_to_blocks.get(request_id, [])
-    preserved_tail = req_blocks[-1] if preserve_tail_block and req_blocks else None
-    releasable = req_blocks[:-1] if preserved_tail is not None else req_blocks
+    preserved_ids = {block.block_id for _, block in preserved_blocks}
+    releasable = [block for block in req_blocks if block.block_id not in preserved_ids]
+    # A pending full block may already carry a dense HBM hash. Its bytes stay
+    # live for prewrite dump, but its new writable parity role must not be hit.
+    hashed_ids = {block.block_id for _, block in preserved_blocks if block.block_hash is not None}
+    if hashed_ids:
+        resident_manager.block_pool.evict_blocks(hashed_ids)
     resident_manager.req_to_blocks[request_id] = []
     if releasable:
         resident_manager.block_pool.free_blocks(reversed(releasable))
     resident_manager.num_cached_block.pop(request_id, None)
-    return preserved_tail
 
 
 def _allocate_sparse_plan(
@@ -351,22 +393,39 @@ def _allocate_sparse_plan(
             return None
 
     resident_new_blocks_needed = 0
-    preserve_tail = False
+    preserved_blocks: tuple[tuple[int, KVCacheBlock], ...] = ()
     releasable_resident_blocks = 0
     if plan.replace_resident_blocks:
         existing_resident_blocks = resident_manager.req_to_blocks.get(
             request_id,
             [],
         )
-        preserve_tail = plan.preserve_resident_tail_block and bool(existing_resident_blocks)
-        releasable_resident_blocks = len(existing_resident_blocks) - int(preserve_tail)
+        preserved = _resident_blocks_to_preserve(coordinator, request, plan)
+        if preserved is None:
+            dense_plan = replace(
+                plan,
+                stage=DSARequestCacheStage.DENSE_DECODE,
+                sparse_budget_tokens=0,
+                resident_valid_tokens=-1,
+                preserve_resident_tail_block=False,
+            )
+            return _allocate_dense_plan(
+                manager, coordinator, request, dense_plan,
+                tuple(() for _ in range(coordinator.num_single_type_manager)), 0, 0,
+            )
+        preserved_blocks = preserved
+        preserved_ids = {block.block_id for _, block in preserved_blocks}
+        releasable_resident_blocks = sum(
+            block.ref_cnt == 1 and not block.is_null and block.block_id not in preserved_ids
+            for block in existing_resident_blocks
+        )
         budget_blocks = (
             plan.sparse_budget_tokens + resident_manager.block_size - 1
         ) // resident_manager.block_size
         target_resident_blocks = (
             budget_blocks + plan.resident_tail_block_count
         )
-        resident_new_blocks_needed = target_resident_blocks - int(preserve_tail)
+        resident_new_blocks_needed = target_resident_blocks - len(preserved_blocks)
         resident_available_after_release = (
             resident_manager.block_pool.get_num_free_blocks() + releasable_resident_blocks
         )
@@ -412,10 +471,10 @@ def _allocate_sparse_plan(
             )
     new_resident_blocks: list[KVCacheBlock] = []
     if plan.replace_resident_blocks:
-        preserved_tail = _release_resident_blocks_for_enter(
+        _release_resident_blocks_for_enter(
             coordinator,
             request_id,
-            preserve_tail_block=preserve_tail,
+            preserved_blocks=preserved_blocks,
         )
         budget_block_count = (
             plan.sparse_budget_tokens + resident_manager.block_size - 1
@@ -423,7 +482,7 @@ def _allocate_sparse_plan(
         resident_slots_to_allocate = (
             budget_block_count
             + plan.resident_tail_block_count
-            - int(preserved_tail is not None)
+            - len(preserved_blocks)
         ) * resident_manager.block_size
         new_resident_blocks = resident_manager.allocate_new_blocks(
             request_id,
@@ -449,11 +508,7 @@ def _allocate_sparse_plan(
         tail_blocks: list[KVCacheBlock | None] = [
             None
         ] * plan.resident_tail_block_count
-        if preserved_tail is not None:
-            preserved_logical_block = (
-                int(request.num_computed_tokens)
-                // resident_manager.block_size
-            )
+        for preserved_logical_block, preserved_tail in preserved_blocks:
             tail_blocks[
                 preserved_logical_block
                 % plan.resident_tail_block_count
@@ -502,8 +557,9 @@ def allocate_dsa_slots(
     """为 DSA 多物理池执行请求生命周期感知的分配。
 
     DENSE/PREFILL 同时扩展 target Indexer、target resident 和可选 MTP
-    full-cache plane；ENTER 只执行一次 target resident 块表收缩并保留
-    不满尾块；SPARSE 继续扩展完整上下文 Indexer 与 MTP full cache，
+    full-cache plane；ENTER 收缩 target resident 表并保留尚未 durable 的
+    已验证满块及不满尾块；共享待 dump 满块先走一轮 DENSE 后再收缩。
+    SPARSE 继续扩展完整上下文 Indexer 与 MTP full cache，
     target resident 的 budget+固定尾区物理表保持不变。所有阶段都先完成
     component-wise 容量预检，再修改 block table，最后 commit 请求账本。
     """

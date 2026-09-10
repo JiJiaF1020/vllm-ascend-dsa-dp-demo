@@ -24,6 +24,7 @@ from typing import Any
 
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
+from vllm_ascend.dsa_offload.contracts import DSA_A5_MTP_ATTENTION_SEMANTICS
 from vllm_ascend.dsa_offload.kv_cache import (
     dsa_mtp_cache_identity,
     is_dsa_indexer_spec,
@@ -200,6 +201,8 @@ class DSAL3KeySchema:
                 "plane_count": mtp_plane_count,
                 "spec": _cache_spec_identity(mtp_group.kv_cache_spec),
             }
+            if bool(getattr(resident_spec, "cache_sparse_sfa_c8", False)):
+                descriptor["target_attention_semantics"] = DSA_A5_MTP_ATTENTION_SEMANTICS
         encoded = json.dumps(
             descriptor,
             sort_keys=True,
