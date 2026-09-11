@@ -5,6 +5,7 @@ sphinx-copybutton
 sphinx-design
 sphinx-togglebutton
 myst-parser
+sphinxcontrib-mermaid
 msgspec
 sphinx-substitution-extensions
 sphinx-intl

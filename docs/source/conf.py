@@ -54,6 +54,7 @@ extensions = [
     "sphinx.ext.autodoc",
     "sphinx.ext.autosummary",
     "myst_parser",
+    "sphinxcontrib.mermaid",
     "sphinxarg.ext",
     "sphinx_design",
     "tools.docs_i18n.sphinx_extension",
@@ -63,6 +64,8 @@ extensions = [
 ]
 
 myst_enable_extensions = ["colon_fence", "amsmath", "dollarmath", "substitution"]
+# Preserve GitHub-compatible Mermaid fences in Sphinx HTML as well.
+myst_fence_as_directive = ["mermaid"]
 
 # Change this when cut down release
 _REPO_ROOT = Path(__file__).resolve().parents[2]

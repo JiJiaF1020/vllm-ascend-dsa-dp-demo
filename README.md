@@ -9,6 +9,24 @@ TorchNPU 2.10.0.post4、Triton Ascend 3.2.2。
 > [README.upstream.md](README.upstream.md) 和
 > [README.upstream.zh.md](README.upstream.zh.md)。
 
+## 架构与工程文档
+
+先读[系统总设计](docs/source/developer_guide/Design_Documents/dsa_sparse_offload/architecture.md)，
+完整导航见[DSA架构与工程指南](docs/source/developer_guide/Design_Documents/dsa_sparse_offload/index.md)。
+
+| 文档类别 | 快速入口 | 内容与状态 |
+|---|---|---|
+| 总设计 | [系统架构](docs/source/developer_guide/Design_Documents/dsa_sparse_offload/architecture.md) | 全局数据流、模块所有权、统一metadata；第11/12、18至23节含A3/A5算子详细设计与接口 |
+| 图模式背景 | [图模式原理与调用链](docs/source/developer_guide/Design_Documents/dsa_sparse_offload/architecture.md#136-图模式入门执行程序与记录设备任务) | 编译与设备图、五种策略、capture/replay、bucket/PAD、固定地址和v0.23实际执行边界 |
+| 特性路线图 | [特性演进与实施路线图](docs/source/developer_guide/Design_Documents/dsa_sparse_offload/feature_roadmap.md) | 从基础卸载到MTP/多级缓存/DP的适配进展及待实施方向，不混入debug流水账 |
+| 已确认专题设计 | [多级KV缓存](docs/source/developer_guide/Design_Documents/dsa_sparse_offload/features/multilevel_kv_cache.md)、[MTP](docs/source/developer_guide/Design_Documents/dsa_sparse_offload/features/speculative_decoding.md)、[数据并行](docs/source/developer_guide/Design_Documents/dsa_sparse_offload/features/data_parallel_inference.md) | 分别标明设计状态、实施范围和未开放扩展 |
+| 未决设计草案 | [自适应推测解码](docs/source/developer_guide/Design_Documents/dsa_sparse_offload/proposals/adaptive_speculation.md)、[分布式执行与状态恢复](docs/source/developer_guide/Design_Documents/dsa_sparse_offload/proposals/execution_and_recovery.md) | 理想MTP、打断恢复、PD、跨机DP等尚未定稿方案，不是可用配置 |
+| 方法与经验 | [问题分析与工程经验](docs/source/developer_guide/Design_Documents/dsa_sparse_offload/engineering/diagnostics_and_lessons.md) | 排查方法、修复机制、证据与已知风险 |
+| 上手测试 | [DSA demo说明](examples/dsa_demo/README.md) | 顶部配置直接修改；基础离线DP脚本保持三轮流程 |
+
+文档目录为`docs/source/developer_guide/Design_Documents/dsa_sparse_offload/`。
+“设计已确认”“已适配”“已验证”分别表达不同状态；草案和单次测试通过不扩大当前支持矩阵。
+
 ## 当前能力
 
 - HBM KV cache 拆分为完整 Indexer K 平面和有界 resident MLA 平面；
@@ -31,6 +49,11 @@ TorchNPU 2.10.0.post4、Triton Ascend 3.2.2。
 - `DENSE`、`ENTER`、`SPARSE` 任意混排、不同 resident budget 和
   graph PAD 行可以复用同一 FULL decode 图族；
 - DSA 关闭时保留 vLLM-Ascend v0.23 原生 cache 和执行路径。
+- L1完整pair/triple、L2 complete bundle与Mooncake TCP L3联合prefix检索，
+  支持HBM-only回填、异步write-behind及L3→L2→HBM回载；
+- 固定MTP3 target双尾与七输出LIM，proposer保持原生BF16 full cache，
+  verified满块参与多级prefix；
+- 约定单机DP2/TP4/EP8的独立L1/L2、共享L3、dummy隔离与全域缓存管理主路径。
 
 ```mermaid
 flowchart LR
@@ -151,8 +174,9 @@ A5 两个开关全关或半开会在启动期明确拒绝；A3 继续使用既�
 `vllm_a5_li_manage_nomtp_c8 -> vllm_a5_kvcache_scatter_copy_c8 -> native QSFA`；
 妥协版 MTP target 路径使用
 `vllm_a5_li_manage_c8 -> vllm_a5_kvcache_scatter_copy_c8 -> native QSFA`，
-框架与算子代码已接入，仍处于 A5 编译和端到端验收阶段。MTP proposer
-保持社区基线的 BF16 Indexer+MLA forward，不进入 DSA resident/DRAM 数据面；
+框架与算子代码已接入，固定版本的单卡及Eager/Graph主路径已有验证。MTP proposer
+保持社区基线的 BF16 Indexer+MLA forward，不做 token-wise resident swap；
+启用多级prefix时，verified满块仍镜像到L2/L3完整bundle。
 其 Cache 作为第三个原生 full-cache group 全量驻留 HBM，并与 target
 Indexer 使用相同的 `indexer_mla_block_ratio` token coverage。默认 ratio=3
 时，三个物理 pool 的容量为 target Indexer `3N`、target resident `N`、
@@ -184,25 +208,26 @@ MTP3 下 B 个请求对应 `4 * B` 个 target query token。SPARSE resident 固�
 
 - prefill/decode mixed batch；
 - async scheduling；
-- HBM Indexer/dense-MLA 热副本协同命中与 L3 prefix cache；本地 DRAM
-  complete-bundle prefix 第一版已实现，仍待 NPU 端到端验收；
+- 任意component独立source mask、L3 direct-HBM与layerwise异步加载；
+  HBM完整pair/triple、L2 complete bundle及Mooncake TCP L3 prefix已实现；
 - preemption/resume；
 - 非 MTP speculative method、MTP draft 数不等于 3、非 greedy MTP；
-- 外部 KV transfer connector；
+- 除当前DSAL3Connector/Mooncake TCP之外的任意外部connector组合；
 - decode/prefill context parallel 和 pipeline parallel；
 - KV-cache metrics/events；
 - GLM-5.2 A5 C8 的正式 QA、长稳并发与性能验收；
 - A5 BF16 DSA 算子链。
-- 多机 TP 的按节点 DRAM 容量规划（当前自动规划只承诺单机 TP）。
+- 多机 TP/DP 的按节点 DRAM 容量规划。
 
 具有显式配置入口的未支持组合会在启动期拒绝，preemption/resume 会在当前
-运行边界明确失败。A5 GLM-5.1 与 GLM-5.2 MTP 已取得上板冒烟结果，但仍以
-DP=1 为主；DP 扩展、完整数据集与性能验收属于下一阶段。
+运行边界明确失败。A5单机DP2/TP4/EP8与固定MTP3、多级prefix的正常功能主路径
+已阶段性闭环；完整数值、故障/长稳、性能和native干净退出仍有独立验收缺口。
 
 ## 文档与测试入口
 
-- [DSA 稀疏卸载详细设计](docs/source/developer_guide/Design_Documents/dsa_offload_design.md)
-- [DSA L1/L2/L3 分层缓存详细设计](docs/source/developer_guide/Design_Documents/dsa_l2_l3_cache_design.md)
+- [DSA 文档中心：总设计、特性路线、设计草案与工程经验](docs/source/developer_guide/Design_Documents/dsa_sparse_offload/index.md)
+- [DSA 稀疏卸载详细设计](docs/source/developer_guide/Design_Documents/dsa_sparse_offload/architecture.md)
+- [DSA L1/L2/L3 分层缓存详细设计](docs/source/developer_guide/Design_Documents/dsa_sparse_offload/features/multilevel_kv_cache.md)
 - [DSA demo 与测试说明](examples/dsa_demo/README.md)
 - [上游 vLLM-Ascend README](README.upstream.md)
 

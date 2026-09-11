@@ -23,38 +23,24 @@
 | `online_long_context_dataset_test.py` | 在线长上下文数据集分桶回归 |
 | `L3_cache_sys_api_test/` | Mooncake/MemCache 独立 API、baseline L3 与后续 DSA 分层缓存测试 |
 
+总架构、特性路线图、已确认专题、未决草案和工程经验统一见
+[DSA 文档中心](../../docs/source/developer_guide/Design_Documents/dsa_sparse_offload/index.md)。
 当前架构和稳定 ABI 见
-[DSA 稀疏卸载详细设计](../../docs/source/developer_guide/Design_Documents/dsa_offload_design.md)。
-该文档第16节包含模块职责、v0.23基线对照和后续PD/打断续推的扩展规则；
+[DSA 稀疏卸载详细设计](../../docs/source/developer_guide/Design_Documents/dsa_sparse_offload/architecture.md)。
+该文档包含模块职责、v0.23基线对照和统一元数据合同；
 按资源所有权复用现有模块，不按DP/PD/MTP组合复制运行时。
-L3 接入、异步 write-behind 和 HBM 热层后续方案见
-[DSA L1/L2/L3 分层缓存详细设计](../../docs/source/developer_guide/Design_Documents/dsa_l2_l3_cache_design.md)。
-阶段优先级与退出门禁见
-[DSA 稀疏卸载后续开发 RoadMap](../../docs/source/developer_guide/Design_Documents/dsa_offload_roadmap.md)。
+L3 接入、异步 write-behind 和 HBM 热层复用设计见
+[DSA L1/L2/L3 分层缓存详细设计](../../docs/source/developer_guide/Design_Documents/dsa_sparse_offload/features/multilevel_kv_cache.md)。
+特性适配进展与后续实施方向见
+[DSA 稀疏卸载后续开发 RoadMap](../../docs/source/developer_guide/Design_Documents/dsa_sparse_offload/feature_roadmap.md)。
 
 ## A5 MTP 算子升级验证
 
-### 当前精度回归：pool行置换修复
+### 专项回归：pool行置换
 
-`5454d950`的行日志显示两个DP的70k均为R2 pool=1/A、R3 pool=0/B、R4 pool=1/A。
-随后单卡受控实验确认：相同逻辑初态和输入，换pool行号会改变steady阶段的resident映射，
-并引出QSFA差异。step1的集合及顺序仍相同，原始QSFA max_abs=3.0517578125e-05；
-按逻辑token排序仍有1.52587890625e-04差异，不能只归结为列表排序。step2进一步出现
-miss数6494之后的6435/6434分叉，原始QSFA max_abs=7.62939453125e-04。
-
-修复只将`HashVictimScanSeed`改成candidate-only，保留旧pool0扫描；快速/精确补扫共用它。
-真实poolRow仍用于状态地址，不改变allocator、七输出、双尾、KSC或正式attention列表排列。
-没有增加搬运/排序/同步，但victim选择改变后的命中率和性能仍需实测。
-修复后的单卡、整网Eager及Graph受控复现场景已通过；详见本节验证记录。
-
-**首次部署LIM修复时需重新编译安装，不能只同步Python。**已经通过修复后测试的环境
-不必因本次诊断清理再次编译。沿用已有SOC/CANN配置，不要求清空build/output，例如：
-
-```bash
-COMPILE_CUSTOM_KERNELS=1 python -m pip install -e . --no-build-isolation --no-deps
-```
-
-可单独执行不加载模型的严格行置换回归：
+修复机制、关键证据与分析方法统一维护于
+[问题分析与工程经验](../../docs/source/developer_guide/Design_Documents/dsa_sparse_offload/engineering/diagnostics_and_lessons.md)。
+已部署配套算子的环境，可单独执行不加载模型的严格回归：
 
 ```bash
 ASCEND_VISIBLE_DEVICES=0 ASCEND_RT_VISIBLE_DEVICES=0 \
@@ -63,55 +49,10 @@ python -m pytest tests/e2e/nightly/single_node/ops/singlecard_ops/test_dsa_a5_c8
 ```
 
 0改为分配到的空闲A5卡号；该测试不需要模型权重、Mooncake或DP集群。
-反馈完整`mtp_pool_row_fixed.log`即可。名称保留diagnostic以兼容旧命令，但现已加入严格断言。
-
-用例保留DENSE+SPARSE、candidate=73472、budget=12288、pool width=100096、8条query，
-以相同输入序列运行row0-a、row1、row0-b，分别观察first-fill和两个steady更新。
-QSFA用合法的合成packed-C8数据，CPU按实际resident映射物化相同逻辑KV，**刻意绕过KSC**；
-这是排除复制错误后检查LIM/QSFA元数据效应，不是完整框架复现。
-
-打印三行`[mtp-pool-row]` JSON，字段含义：
-- `same_row_repeat`：同一行从相同初态重跑是否一致，作为实验自身的控制。
-- `same_logical_state_before`与`same_resident_map_after`：当前步骤前/后，把选中的pool行
-  归一化后是否相同；修复后不应因换行号而分叉。
-- `same_selected_sets/order`、`same_slots`：逻辑选择集合、排列及resident位置是否变化。
-- `qsfa_*`：原始slot列表下稀疏请求的QSFA差异；`ordered_qsfa_*`只在测试内把TopK按逻辑
-  token排序作控制，保留因果tail和无效后缀，不排序物理block ID，不修改正式推理。
-
-修复回归要求所有一致性字段为true，copy_counts两侧相同；否则打印全部指标后失败，
-不放宽浮点容差。成功末尾打印`POOL_ROW_INVARIANCE_PASSED`。仍打印`EVIDENCE_ONLY`
-说明测试文件未更新；旧内核配新测试应在steady阶段失败。
-2026-09-11服务器已通过此单卡严格回归（1 passed，62 deselected）：三步一致性字段
-全部为true，原始/逻辑排序QSFA的max_abs均为0，copy counts依次为12288、6494、6435，
-两侧相同。此结果闭环该合成行置换用例，不等于GLM整网精度问题全部解决；正式推理
-未引入测试内的排序控制。
-
-修复后的全量框架/单卡门禁尚未收到结果；若已跑过通过，只反馈summary，不必重复。
-未跑过则用既有入口，已经编译成功的环境不需再编译：
-
-```bash
-ASCEND_VISIBLE_DEVICES=0 ASCEND_RT_VISIBLE_DEVICES=0 \
-python examples/dsa_demo/run_a5_mtp_operator_tests.py
-```
-
-2026-09-11整网Eager运行`simple-dp-cc0755dfaeb04b8daf4c67d31be33ddb`已完成16请求。
-两域70k在R2/R3/R4仍使用pool行1/0/1，但热路径不再出现A/B/A：8k与70k共8组
-相邻热轮比较均为128 tokens/text相同、返回top-5相同、共同候选logprob差值0。
-R4每个TP均实际完成8k的59块及70k的520块L3读取；后者从logical_start=53加载，
-与本地公共前缀拼成573块。两域各13个store计划全部完成，failed/pending/inflight均为0。
-这不是固定pool行或跳过L3得到的通过。R1/R2差异仍在，且70k R1已命中6784 tokens，
-不是纯冷算；冷算/复用等价性、全量logits和性能不在本次结论内。
-
-同日Graph运行`simple-dp-3ca6ff2eef804f59b86ea7ea8f2f05c0`也完成16请求，两个DP均有
-`Replaying aclgraph`记录；这证明实际执行过Graph，不声称日志逐步覆盖所有forward。
-70k热轮仍为pool1/0/1，8组热比较均128 tokens/text和返回top-5一致、差值0。
-与上述Eager对照，16条完整输出token/text也逐条相同；原始逐token的跨模式全量logprobs
-未随精简工件提供，不据此声称完整logits相同。R4读取及13个store完成计数与Eager一致。
-当前可关闭这次LIM物理行号依赖的复现场景，不扩大为冷算/复用、所有并发形状或性能认证。
-
-验证后已删除专用行日志、trace配置/runner接线和独立DP salt开关；恢复下方基础三轮
-Graph样例，保留自动摘要及严格单卡回归。不改allocator、算子、图元数据或L3协议。
-旧四轮脚本不要配清理后的框架使用；同步新的simple-DP脚本即可使用三轮入口。
+名称保留diagnostic以兼容旧命令，但用例是严格断言。它覆盖DENSE+SPARSE、first-fill和
+两个steady步骤，比较row0/row1/row0的映射、选择、copy count及QSFA；CPU物化KV刻意
+绕过KSC，所以不能替代完整搬运链门禁。成功末尾打印`POOL_ROW_INVARIANCE_PASSED`。
+默认simple-DP仍为三轮基础流程，不带已撤销的行trace/独立salt开关。
 
 `simple_dp_prompt_test.py`正常完成推理后会自动生成精度证据摘要，不需要独立过滤脚本。
 同一次运行目录下的`precision_compact/precision_summary.txt`用于先反馈，
