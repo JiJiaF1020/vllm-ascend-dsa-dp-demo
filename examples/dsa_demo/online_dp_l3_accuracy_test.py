@@ -268,7 +268,7 @@ async def _collect(concurrent_pairs: list[tuple[str, str]] | None = None) -> Pat
         if not DP_RANKS or len(set(DP_RANKS)) != len(DP_RANKS) or any(rank not in (0, 1) for rank in DP_RANKS):
             raise ValueError("DSA_DP_ACCURACY_RANKS must select distinct ranks from 0,1")
         if not LABELS or len(set(LABELS)) != len(LABELS) or any(label not in cases for label in LABELS):
-            raise ValueError("DSA_DP_ACCURACY_LABELS must select distinct labels from 5k,8k,40k,70k")
+            raise ValueError("DSA_DP_ACCURACY_LABELS must select distinct labels from 5k,10k,40k,64k")
         scenarios = [("serial", ((rank, label),)) for rank in DP_RANKS for label in LABELS]
         mode = "serial"
     else:
@@ -427,8 +427,8 @@ async def _collect(concurrent_pairs: list[tuple[str, str]] | None = None) -> Pat
 
 def _parse_pair(value: str) -> tuple[str, str]:
     labels = tuple(item.strip() for item in value.split(","))
-    if len(labels) != 2 or any(label not in ("5k", "8k", "40k", "70k") for label in labels):
-        raise argparse.ArgumentTypeError("use DP0_LABEL,DP1_LABEL with labels from 5k,8k,40k,70k")
+    if len(labels) != 2 or any(label not in ("5k", "10k", "40k", "64k") for label in labels):
+        raise argparse.ArgumentTypeError("use DP0_LABEL,DP1_LABEL with labels from 5k,10k,40k,64k")
     return labels
 
 

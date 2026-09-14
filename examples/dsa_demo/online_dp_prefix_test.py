@@ -162,14 +162,14 @@ async def _main() -> None:
             if failures:
                 raise AssertionError(f"DP prefix batch failed: {failures}; evidence={result_path}")
 
-        routing = (("5k", 0), ("8k", 1), ("40k", 0), ("70k", 1))
+        routing = (("5k", 0), ("10k", 1), ("40k", 0), ("64k", 1))
         for phase, hit in (("mixed-cold", False), ("mixed-warm", True)):
             await batch((phase, label, rank, "mixed", hit) for label, rank in routing)
 
         # Warm short prefill/decode on DP1 overlaps a cold long prefill on DP0.
         await batch(
             (
-                ("asymmetric", "70k", 0, "asymmetric", False),
+                ("asymmetric", "64k", 0, "asymmetric", False),
                 ("asymmetric", "40k", 1, "isolation", True),
             )
         )

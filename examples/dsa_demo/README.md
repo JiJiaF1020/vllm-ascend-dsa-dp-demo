@@ -3,6 +3,11 @@
 本目录是 v0.23 DSA 的 tester-facing 验收入口。脚本以 GLM-5.1/GLM-5.2
 为首要模型，DeepSeek-V3.2 使用相同配置做强制回归。
 
+随仓提供 `novel_dataset.py`：`chinese_5k`、`chinese_10k`、`chinese_23k`、
+`chinese_40k`、`chinese_64k`、`chinese_104k`。每项是包含一条 prompt 的列表。
+当前客户端已将旧 `8k/70k` 标签替换为 `10k/64k`；下方历史验收记录中的
+旧标签和测量结果保留，仅表示当时使用的数据。
+
 ## 公开版 GLM-5.2 权重
 
 A5 DSA offload 的 Indexer C8 类型按 `quant_model_description.json` 中
@@ -494,7 +499,7 @@ DP 服务统一使用 `serve_dsa.sh`；文中的 `dp_serve_dsa.sh` 指使用者�
 | `DSA_DP_ACCURACY_LABELS` / `DSA_DP_ACCURACY_RANKS` | `40k` / `0` | 精度串行模式；`0,1`仍为顺序测试，并非并发 |
 | `DSA_DP_ACCURACY_RESULT_DIR` | 脚本旁 `results/dp_accuracy` | 精度客户端 |
 
-精度客户端的`--concurrent-pair 8k,70k`左右分别指定DP0/DP1，此时不使用精度串行的
+精度客户端的`--concurrent-pair 10k,64k`左右分别指定DP0/DP1，此时不使用精度串行的
 LABELS/RANKS选择场景；可重复传参。功能L3客户端也支持该参数，但流程不同：
 左右指定初始写入域，跨域读取时交换，两次并发回载共8请求，并忽略`DSA_DP_L3_LABELS`。
 精度客户端的`--analyze <JSONL>`只分析已有结果，
@@ -1698,7 +1703,7 @@ bash examples/dsa_demo/serve_dsa.sh 2>&1 | tee dsa-online-l2-l3.log
 ```
 
 确保服务器上的 `novel_dataset.py` 可被 Python 导入，且包含
-`chinese_5k`、`chinese_8k`、`chinese_40k`、`chinese_70k`。客户端顶部的
+`chinese_5k`、`chinese_10k`、`chinese_40k`、`chinese_64k`。客户端顶部的
 `SERVER_RUN_MODE` 必须与服务端 `RUN_MODE` 一致，然后运行：
 
 ```bash

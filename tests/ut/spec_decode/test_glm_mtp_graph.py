@@ -1021,7 +1021,7 @@ def test_custom_smoke_shares_mtp_graph_config(monkeypatch, tp, dp, mtp_graph, of
     smoke = importlib.util.module_from_spec(spec)
     monkeypatch.syspath_prepend(str(source.parent))
     monkeypatch.setitem(sys.modules, "novel_dataset", SimpleNamespace(
-        chinese_5k=["测试"], chinese_8k=["测试"], chinese_40k=["测试"], chinese_70k=["测试"],
+        chinese_5k=["测试"], chinese_10k=["测试"], chinese_40k=["测试"], chinese_64k=["测试"],
     ))
     spec.loader.exec_module(smoke)
     settings = smoke._settings()

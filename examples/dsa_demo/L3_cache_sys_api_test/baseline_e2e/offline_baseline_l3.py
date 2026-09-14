@@ -46,7 +46,7 @@ def configure_environment() -> tuple[str, int] | None:
     os.environ.update(
         {
             "HCCL_OP_EXPANSION_MODE": "AIV",
-            "HCCL_BUFFSIZE": "200",
+            "HCCL_BUFFSIZE": "512",
             "OMP_NUM_THREADS": "10",
             "OMP_PROC_BIND": "false",
             "PYTHONHASHSEED": "114514",

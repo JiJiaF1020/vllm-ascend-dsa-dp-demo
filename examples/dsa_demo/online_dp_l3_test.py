@@ -11,7 +11,7 @@ DSA_DP_MAX_TOKENS（默认 32）；调用 prefix 的请求辅助函数时显式�
 DSA_DP_L3_LABELS 默认 40k，STORE_WAIT_SECONDS 默认 10 秒，RESULT_DIR
 用于持久结果目录；这三个设置均使用 DSA_DP_L3_ 环境变量前缀。
 P6-A运行时加 --mtp，检查一次Eagle末块回退，建议 DSA_DP_MAX_TOKENS=128。
---concurrent-pair 8k,70k并发冷写后交换DP回载，再本地重放及清本地回载，共8请求。
+--concurrent-pair 10k,64k并发冷写后交换DP回载，再本地重放及清本地回载，共8请求。
 此模式不使用DSA_DP_L3_LABELS；两份来源使用独立salt，即使长度相同也不混淆本地命中。
 """
 
@@ -44,8 +44,8 @@ RESULT_DIR = Path(os.getenv("DSA_DP_L3_RESULT_DIR", str(Path(__file__).resolve()
 
 def _parse_pair(value: str) -> tuple[str, str]:
     labels = tuple(item.strip() for item in value.split(","))
-    if len(labels) != 2 or any(label not in ("5k", "8k", "40k", "70k") for label in labels):
-        raise argparse.ArgumentTypeError("use DP0_LABEL,DP1_LABEL with labels from 5k,8k,40k,70k")
+    if len(labels) != 2 or any(label not in ("5k", "10k", "40k", "64k") for label in labels):
+        raise argparse.ArgumentTypeError("use DP0_LABEL,DP1_LABEL with labels from 5k,10k,40k,64k")
     return labels
 
 
@@ -56,7 +56,7 @@ async def _main(*, mtp: bool = False, concurrent_pairs: list[tuple[str, str]] | 
     cases = {case.label: case for case in _load_cases()}
     if concurrent_pairs is None:
         if not LABELS or len(set(LABELS)) != len(LABELS) or any(label not in cases for label in LABELS):
-            raise ValueError("DSA_DP_L3_LABELS must contain distinct labels from 5k,8k,40k,70k")
+            raise ValueError("DSA_DP_L3_LABELS must contain distinct labels from 5k,10k,40k,64k")
     elif not concurrent_pairs or any(
         len(pair) != 2 or any(label not in cases for label in pair) for pair in concurrent_pairs
     ):

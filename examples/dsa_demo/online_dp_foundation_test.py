@@ -57,17 +57,17 @@ def _load_cases() -> list[PromptCase]:
     try:
         from novel_dataset import (
             chinese_5k,
-            chinese_8k,
+            chinese_10k,
             chinese_40k,
-            chinese_70k,
+            chinese_64k,
         )
     except ImportError as exc:
         raise RuntimeError("online DP test requires novel_dataset.py on PYTHONPATH") from exc
     return [
         PromptCase("5k", _first_prompt(chinese_5k, name="chinese_5k")),
-        PromptCase("8k", _first_prompt(chinese_8k, name="chinese_8k")),
+        PromptCase("10k", _first_prompt(chinese_10k, name="chinese_10k")),
         PromptCase("40k", _first_prompt(chinese_40k, name="chinese_40k")),
-        PromptCase("70k", _first_prompt(chinese_70k, name="chinese_70k")),
+        PromptCase("64k", _first_prompt(chinese_64k, name="chinese_64k")),
     ]
 
 

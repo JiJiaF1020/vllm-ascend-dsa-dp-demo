@@ -38,8 +38,8 @@ RUN_MODE = "graph"  # eager / graph
 VISIBLE_DEVICES = "0,1,2,3,4,5,6,7"  # 本用例固定单机DP2/TP4，需要8张卡
 ENABLE_MTP = True  # 固定MTP3，proposer eager
 ENABLE_L3 = True  # 同时开启write-behind与prefix loadback；Master需已运行
-# 常规小规模回归：六请求；完整矩阵用("5k", "8k", "40k", "70k")。
-PROMPT_LABELS = ("8k", "40k")
+# 常规小规模回归：六请求；完整矩阵用("5k", "10k", "40k", "64k")。
+PROMPT_LABELS = ("10k", "40k")
 MAX_TOKENS = 128  # 验收固定ignore_eos=True，跨越decode满块边界
 MAX_NUM_SEQS = 2  # 每个DP域的上限，不是全机总数
 MAX_MODEL_LEN = 100000
@@ -100,7 +100,7 @@ def _parse_args(argv=None):
     if args.indexer_mla_ratio < 1 or not 0 < args.hot_cpu_block_multiple < float("inf"):
         parser.error("invalid DSA HBM ratio or L2 block multiple")
     labels = tuple(args.labels.split(","))
-    if len(labels) not in (2, 4) or len(set(labels)) != len(labels) or not set(labels) <= {"5k", "8k", "40k", "70k"}:
+    if len(labels) not in (2, 4) or len(set(labels)) != len(labels) or not set(labels) <= {"5k", "10k", "40k", "64k"}:
         parser.error("--labels must contain two or four distinct dataset labels")
     if args.max_tokens < 2 or args.chunk_size < 128 or args.max_model_len <= args.max_tokens:
         parser.error("invalid token/model/chunk capacity")
@@ -274,7 +274,7 @@ def _worker(rank, args, run_id, port, cases, barrier, result_dir):
         "VLLM_DP_SIZE": "2", "VLLM_DP_RANK": str(rank), "VLLM_DP_RANK_LOCAL": str(rank),
         "VLLM_DP_MASTER_IP": "127.0.0.1", "VLLM_DP_MASTER_PORT": str(port),
         "VLLM_ENABLE_V1_MULTIPROCESSING": "1", "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
-        "HCCL_OP_EXPANSION_MODE": "AIV", "HCCL_BUFFSIZE": "200",
+        "HCCL_OP_EXPANSION_MODE": "AIV", "HCCL_BUFFSIZE": "512",
         "OMP_NUM_THREADS": "10", "OMP_PROC_BIND": "false",
         "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True", "VLLM_ASCEND_ENABLE_MLAPO": "1",
         "VLLM_LOGGING_LEVEL": "INFO",

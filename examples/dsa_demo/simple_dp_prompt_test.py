@@ -31,17 +31,20 @@ from urllib.parse import urlsplit
 SUMMARY_ONLY_DIR = ""  # 填已有simple-dp-xxx目录后，只生成摘要，不加载数据/模型或连接Mooncake
 # 只需python运行本脚本，无额外命令行参数；处理完旧结果后改回""才能重新推理。
 
+ENABLE_PROFILE = False
+PROFILE_DIR = "/home/vllm_test_new/"
+
 # =============================================================================
 # 1. 输入与采样：PROMPTS是整份输入，不是每个DP必须复制的一份
 # =============================================================================
 # 数据导入与PROMPTS由使用者直接维护；可替换为自己的数据或字符串列表。
 if not SUMMARY_ONLY_DIR:
-    from novel_dataset import chinese_5k, chinese_8k, chinese_40k, chinese_70k
+    from novel_dataset import chinese_5k, chinese_10k, chinese_40k, chinese_64k
 
-    PROMPTS = chinese_8k + chinese_5k + chinese_70k + chinese_40k
+    PROMPTS = chinese_64k * 8
 else:
     PROMPTS = []  # 只分析已有JSONL时无需novel_dataset。
-MAX_TOKENS = 128  # 默认观察MTP decode跨满块；只看短输出时可自行调小
+MAX_TOKENS = 256  # 默认观察MTP decode跨满块；只看短输出时可自行调小
 TEMPERATURE = 0.0  # 0为greedy；本样例开启MTP时只允许0
 IGNORE_EOS = True  # 忽略EOS，避免跨满块测试因提前停止而没有覆盖到目标路径
 LOGPROBS = 5  # 保存逐token的top-5候选概率；只看文本/性能时可设0关闭
@@ -50,7 +53,7 @@ PRINT_TOKEN_IDS = True  # 终端同时打印token IDs与文本；长输出可关
 # =============================================================================
 # 2. vLLM/vLLM-Ascend基线通用配置
 # =============================================================================
-MODEL_PATH = "/mnt/share/weights/GLM-5.2-w4a4c8-mxfp4"  # 修改为本机权重目录
+MODEL_PATH = "/home/models/GLM-5.2-w4a4c8-mxfp4"  # 修改为本机权重目录
 RUN_MODE = "graph"  # eager / graph；关DSA用下方ENABLE_DSA_OFFLOAD，不改成disabled
 QUANTIZATION = "ascend"  # 按模型实际配置；非量化模型可改为None
 TRUST_REMOTE_CODE = True
@@ -59,11 +62,11 @@ MAX_NUM_SEQS = 4  # 每个DP的并发上限；PROMPTS可以更多，多出来的
 MAX_MODEL_LEN = 100000  # prompt加输出的上下文上限，不是固定实际输入长度
 MAX_NUM_BATCHED_TOKENS = 8192  # 每个DP每轮token预算，不是整机总预算
 ENABLE_CHUNKED_PREFILL = True  # False时上面的token预算至少要覆盖MAX_MODEL_LEN
-GPU_MEMORY_UTILIZATION = 0.90
+GPU_MEMORY_UTILIZATION = 0.78
 ENABLE_EXPERT_PARALLEL = True  # MoE专家跨DP*TP布置；DSA+DP初版要求开启
 ENABLE_A5_PACKED_C8_DSA = True  # A5/GLM W4A4C8原生LI/SFA布局开关，两者一起开
 # 即使关DSA，也保留以上packed-C8开关做同布局基线对照；不要把它当作DSA总开关。
-GRAPH_CAPTURE_ROW_SIZES = [1, 2, 4, 8]  # 请求行数，自动过滤大于MAX_NUM_SEQS的值
+GRAPH_CAPTURE_ROW_SIZES = [1, 2, 4, 8,11]  # 请求行数，自动过滤大于MAX_NUM_SEQS的值
 # 开MTP3时自动乘4，转换为target验算token数；只用于RUN_MODE="graph"。
 # 本样例固定async_scheduling=False、PP=1、mp executor，不同时试验跨机/异步调度。
 
@@ -82,21 +85,22 @@ DP_MASTER_PORT = 0  # 0自动选择空闲端口；需要指定时填写未占用
 # 4. DSA稀疏卸载：L2是工作缓存，关闭prefix cache也仍然需要它
 # =============================================================================
 ENABLE_DSA_OFFLOAD = True  # False为基线DP对照；此时必须同时关闭DSA L3开关
+ENABLE_FUSED_COPYSFA = False
 DSA_SPARSE_ACTIVATION_TOKENS = 6144  # 非MTP下超过该长度才进入稀疏路径
 DSA_PROMPT_BUDGET_THRESHOLDS = [32768, 65536]
 DSA_RESIDENT_BUDGET_TOKENS = [6144, 10240, 12288]  # 非MTP三个长度档的HBM驻留预算
 # 当前妥协版MTP3固定使用activation=8192、驻留预算[8192,10240,12288]。
-DSA_INDEXER_MLA_BLOCK_RATIO = 2  # Indexer/MLA块容量比例，不是DP之间的比例
+DSA_INDEXER_MLA_BLOCK_RATIO = 4  # Indexer/MLA块容量比例，不是DP之间的比例
 DSA_HOT_CPU_BLOCK_MULTIPLE = 1.0  # 每域L2相对本域Indexer块数的倍数，仍受节点预算限制
 DSA_MAX_ACTIVE_REQS = 256  # resident元数据行容量，必须>=MAX_NUM_SEQS
 
 # =============================================================================
 # 5. Prefix cache与重复推理：是否复用、复用几轮、是否清本地缓存
 # =============================================================================
-ENABLE_PREFIX_CACHING = True  # 关DSA时控制原生HBM prefix；开DSA时控制L1/L2 prefix
-REPLAY_ROUNDS = 3  # 默认：首次生成 -> 本地prefix复用 -> 清本地并交换DP后从L3回载
-RESET_LOCAL_CACHE_BEFORE_LAST_REPLAY = True  # 最后一轮前两域都只清本地HBM/L2，保留L3
-SWAP_DP_ON_LAST_REPLAY = True  # 最后一轮循环交换各域输入，观察跨域复用；只适用于round_robin
+ENABLE_PREFIX_CACHING = False                # 关DSA时控制原生HBM prefix；开DSA时控制L1/L2 prefix
+REPLAY_ROUNDS = 1                            # 默认：首次生成 -> 本地prefix复用 -> 清本地并交换DP后从L3回载
+RESET_LOCAL_CACHE_BEFORE_LAST_REPLAY = False # 最后一轮前两域都只清本地HBM/L2，保留L3
+SWAP_DP_ON_LAST_REPLAY = False               # 最后一轮循环交换各域输入，观察跨域复用；只适用于round_robin
 # 本地prefix观察：ENABLE_PREFIX_CACHING=True、REPLAY_ROUNDS=2，reset/swap保持False。
 # L3观察：ENABLE_L3_WRITE_BEHIND=True、ENABLE_L3_PREFIX_LOADBACK=True、
 # ENABLE_PREFIX_CACHING=True、REPLAY_ROUNDS=3、RESET_LOCAL_CACHE_BEFORE_LAST_REPLAY=True。
@@ -107,15 +111,15 @@ SWAP_DP_ON_LAST_REPLAY = True  # 最后一轮循环交换各域输入，观察�
 # 6. MTP：固定3-token草稿；不改变target的RUN_MODE
 # =============================================================================
 ENABLE_MTP = True
-ENABLE_MTP_GRAPH = False  # True：target graph时启用三轮合并图；卸载/baseline共用
+ENABLE_MTP_GRAPH = True         # True：target graph时启用三轮合并图；卸载/baseline共用
 MTP_NUM_SPECULATIVE_TOKENS = 3  # 本样例仅支持已适配的固定MTP3，且TEMPERATURE=0
 # DSA下MTP层仍全量驻留，不做关键token swap；prefix开启后durable满块可下沉L2/L3。
 
 # =============================================================================
 # 7. DSA L3：当前只开放Mooncake Store-owned TCP，Master需手动提前启动
 # =============================================================================
-ENABLE_L3_WRITE_BEHIND = True  # 新durable满块L2->L3异步上传，允许独立于prefix开启
-ENABLE_L3_PREFIX_LOADBACK = True  # True要求ENABLE_L3_WRITE_BEHIND和ENABLE_PREFIX_CACHING都为True
+ENABLE_L3_WRITE_BEHIND = False     # 新durable满块L2->L3异步上传，允许独立于prefix开启
+ENABLE_L3_PREFIX_LOADBACK = False  # True要求ENABLE_L3_WRITE_BEHIND和ENABLE_PREFIX_CACHING都为True
 # 仅开启ENABLE_L3_WRITE_BEHIND为kv_producer；读写同时开启为kv_both。
 # 当前读取固定L3->L2->HBM，不提供direct-HBM开关。
 MOONCAKE_CONFIG_PATH = (
@@ -133,7 +137,7 @@ DSA_L3_MAX_DESCRIPTORS_PER_PUT = 128
 LOGGING_LEVEL = "INFO"
 NATIVE_RUNTIME_ENV = {
     "HCCL_OP_EXPANSION_MODE": "AIV",
-    "HCCL_BUFFSIZE": "200",
+    "HCCL_BUFFSIZE": "512",
     "OMP_NUM_THREADS": "10",
     "OMP_PROC_BIND": "false",
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
@@ -305,6 +309,7 @@ def _build_kwargs(c):
     if c["ENABLE_DSA_OFFLOAD"]:
         additional["dsa_sparse_config"] = {
             "enabled": True,
+            "enable_fused_copy_sfa": ENABLE_FUSED_COPYSFA,
             "split_indexer_cache": True,
             "indexer_mla_block_ratio": c["DSA_INDEXER_MLA_BLOCK_RATIO"],
             "hot_cpu_block_multiple": c["DSA_HOT_CPU_BLOCK_MULTIPLE"],
@@ -437,7 +442,21 @@ def _worker(rank, c, prompts, port, barrier, run_dir):
     try:
         from vllm import LLM, SamplingParams
 
-        llm = LLM(**_build_kwargs(c))
+        kwargs = _build_kwargs(c)
+        if c["ENABLE_PROFILE"]:
+            from vllm.config import ProfilerConfig
+
+            profile_dir = Path(c["PROFILE_DIR"]).resolve() / f"dp{rank}"
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            kwargs["profiler_config"] = ProfilerConfig(
+                profiler="torch",
+                torch_profiler_dir=str(profile_dir),
+                torch_profiler_with_stack=True,
+                torch_profiler_record_shapes=True,
+                torch_profiler_with_memory=True,
+            )
+        llm = LLM(**kwargs)
+        
         actual = llm.llm_engine.vllm_config
         pc = actual.parallel_config
         kv = actual.kv_transfer_config
@@ -498,7 +517,15 @@ def _worker(rank, c, prompts, port, barrier, run_dir):
             barrier.wait(timeout=c["PROCESS_TIMEOUT_SECONDS"])
             selected = _indices(c, len(prompts), rank, round_index)
             inputs = [{"prompt": prompts[index], "cache_salt": cache_salt} for index in selected]
-            outputs = llm.generate(inputs, params, use_tqdm=False)
+            
+            if c["ENABLE_PROFILE"]:
+                llm.start_profile()
+            try:
+                outputs = llm.generate(inputs, params, use_tqdm=False)
+            finally:
+                if c["ENABLE_PROFILE"]:
+                    llm.stop_profile()
+            
             if len(outputs) != len(selected):
                 raise RuntimeError("request/output count mismatch")
             with (run_dir / f"dp{rank}.jsonl").open("a", encoding="utf-8") as handle:
