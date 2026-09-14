@@ -40,10 +40,12 @@ from vllm_ascend.dsa_offload.contracts import (
     DSA_A5_NOMTP_ATTENTION_CAPACITY,
     DSA_DRAM_NULL_BLOCK_ID,
     DSA_DUMP_NOOP_DST_BLOCK_ID,
+    DSA_KV_LORA_RANK,
     DSA_LIDU_OUTPUT_CAPACITY,
     DSA_ROW_MODE_SPARSE,
 )
 from vllm_ascend.dsa_offload.ops import (
+    DSAFusedCopyPlan,
     DSALightningIndexerOutputs,
     DSAOffloadSelectionOutput,
     a5_kvcache_scatter_copy_c8,
@@ -53,6 +55,7 @@ from vllm_ascend.dsa_offload.ops import (
     dump_full_cache_plane_bytes,
     dump_full_kv_cache_blocks,
     dump_full_kv_cache_blocks_c8,
+    fused_copy_sparse_attention_c8,
     kvcache_scatter_copy,
     lightning_indexer_decode_update,
     sparse_flash_attention_for_offload,
@@ -87,6 +90,7 @@ class DSAOffloadRuntime:
         pin_memory: bool,
         packed_c8: bool = False,
         max_decode_query_len: int = 1,
+        fused_copy_sfa: bool = False,
         enable_prefix_caching: bool = False,
         mtp_durable_offload: bool = False,
     ) -> None:
@@ -98,6 +102,10 @@ class DSAOffloadRuntime:
         self.device = torch.device(device)
         self.packed_c8 = bool(packed_c8)
         self.max_decode_query_len = int(max_decode_query_len)
+        self.fused_copy_sfa = bool(fused_copy_sfa)
+        if self.fused_copy_sfa and not (self.packed_c8 and self.max_decode_query_len > 1):
+            raise ValueError("CopySFA requires packed-C8 MTP selection metadata")
+        self._fused_attention_outputs: dict[tuple[int, torch.dtype], torch.Tensor] = {}
         self.enable_prefix_caching = bool(enable_prefix_caching)
         self.mtp_durable_offload = bool(mtp_durable_offload)
         if self.mtp_durable_offload and self.max_decode_query_len <= 1:
@@ -1393,6 +1401,22 @@ class DSAOffloadRuntime:
                     "Refusing to let KSC read the null DRAM block."
                 )
 
+    def prepare_fused_attention_output(self, *, num_heads: int, dtype: torch.dtype) -> None:
+        """Called at layer binding, never during decode or graph capture."""
+        if not (0 < num_heads <= 64 or num_heads == 128) or dtype not in (torch.bfloat16, torch.float16):
+            raise ValueError("CopySFA requires bf16/fp16 query heads=1..64 or 128")
+        key = (num_heads, dtype)
+        if key not in self._fused_attention_outputs:
+            self._fused_attention_outputs[key] = torch.empty(
+                (self.max_num_reqs * self.max_decode_query_len, num_heads, DSA_KV_LORA_RANK),
+                dtype=dtype,
+                device=self.device,
+            )
+
+    def get_fused_attention_output(self, query: torch.Tensor) -> torch.Tensor:
+        output = self._fused_attention_outputs[(query.shape[1], query.dtype)]
+        return output[: query.shape[0]]
+
     def get_lidu_outputs(
         self,
         *,
@@ -1479,6 +1503,35 @@ class DSALayerOffloadContext:
     selection_state_id: int | None = None
     selection_source_layer_id: int | None = None
     packed_c8: bool = False
+
+    def _copy_or_defer_c8(
+        self,
+        *,
+        resident_packed_cache: torch.Tensor,
+        dram_packed_arena: torch.Tensor,
+        resident_block_table: torch.Tensor,
+        dram_block_table: torch.Tensor,
+        outputs: DSALightningIndexerOutputs,
+        num_query_rows: int,
+    ) -> DSAFusedCopyPlan | None:
+        if self.runtime.fused_copy_sfa:
+            return DSAFusedCopyPlan(
+                dram_packed_arena=dram_packed_arena,
+                dram_block_table=dram_block_table,
+                attention_src_ids=self.runtime._a5_attention_src_ids[:num_query_rows],
+                per_query_miss_counts=self.runtime._a5_per_query_miss_counts[:num_query_rows],
+                outputs=outputs,
+            )
+        a5_kvcache_scatter_copy_c8(
+            resident_packed_cache=resident_packed_cache,
+            dram_packed_arena=dram_packed_arena,
+            resident_block_table=resident_block_table,
+            dram_block_table=dram_block_table,
+            source_token_ids=outputs.topk_index,
+            destination_slots=outputs.topk_slots,
+            copy_counts=outputs.miss_count,
+        )
+        return None
 
     def execute_decode_selection(
         self,
@@ -1571,22 +1624,22 @@ class DSALayerOffloadContext:
             packed_arena = store.get_layer_arenas(self.layer_id).packed
             if packed_arena is None:
                 raise RuntimeError("DSA A5 layer has no packed DRAM arena")
-            a5_kvcache_scatter_copy_c8(
+            fused_copy_plan = self._copy_or_defer_c8(
                 resident_packed_cache=resident_cache[0],
                 dram_packed_arena=packed_arena,
                 resident_block_table=resident_block_table,
                 dram_block_table=dram_block_table,
-                source_token_ids=outputs.topk_index,
-                destination_slots=outputs.topk_slots,
-                copy_counts=outputs.miss_count,
+                outputs=outputs,
+                num_query_rows=num_query_rows,
             )
-            # KSC 已发射后再公布 full 层来源，shared 层只会消费一份
-            # 同时包含 copy plan 和 attention metadata 的完整融合输出。
+            # Publish the complete selection. In fused mode each physical
+            # layer consumes the plan with its OWN HBM/DRAM at attention time.
             self.runtime._selection_source_layer = self.layer_id
             return DSAOffloadSelectionOutput(
                 sparse_indices=attention_slots,
                 tail_info=outputs.tail_info,
                 resident_seq_lengths=resident_seq_lengths,
+                fused_copy_plan=fused_copy_plan,
             )
 
         if not isinstance(self.indexer_cache, torch.Tensor):
@@ -1671,19 +1724,19 @@ class DSALayerOffloadContext:
                 )
             attention_slots = attention_slots_buffer[:num_query_rows]
             resident_seq_lengths = resident_seq_lengths_buffer[:num_reqs]
-            a5_kvcache_scatter_copy_c8(
+            fused_copy_plan = self._copy_or_defer_c8(
                 resident_packed_cache=resident_cache[0],
                 dram_packed_arena=arenas.packed,
                 resident_block_table=resident_block_table,
                 dram_block_table=dram_block_table,
-                source_token_ids=outputs.topk_index,
-                destination_slots=outputs.topk_slots,
-                copy_counts=outputs.miss_count,
+                outputs=outputs,
+                num_query_rows=num_query_rows,
             )
             return DSAOffloadSelectionOutput(
                 sparse_indices=attention_slots,
                 tail_info=outputs.tail_info,
                 resident_seq_lengths=resident_seq_lengths,
+                fused_copy_plan=fused_copy_plan,
             )
         if len(resident_cache) < 2:
             raise RuntimeError("DSA bf16 shared layer requires NOPE and ROPE resident caches")
@@ -1721,6 +1774,17 @@ class DSALayerOffloadContext:
             resident_seq_lengths = selection.resident_seq_lengths
             if resident_seq_lengths is None:
                 raise RuntimeError("DSA A5 C8 selection has no resident sequence lengths")
+            if selection.fused_copy_plan is not None:
+                packed_query = torch.cat([query, query_rope], dim=-1)
+                return fused_copy_sparse_attention_c8(
+                    query=packed_query,
+                    packed_kv=resident_cache[0],
+                    selection=selection,
+                    scale_value=scale_value,
+                    block_table=resident_block_table,
+                    actual_seq_lengths_query=actual_seq_lengths_query,
+                    attention_out=self.runtime.get_fused_attention_output(packed_query),
+                )
             return sparse_flash_attention_for_offload_c8(
                 query=torch.cat([query, query_rope], dim=-1),
                 packed_kv=resident_cache[0],

@@ -234,6 +234,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "vllm_a5_li_manage_nomtp_c8"
         "vllm_a5_li_manage_c8"
         "vllm_a5_kvcache_scatter_copy_c8"
+        "vllm_a5_fused_copy_sfa_c8"
         "kv_cache_full_block_dump_c8"
         "kv_cache_full_block_dump_bytes"
     )

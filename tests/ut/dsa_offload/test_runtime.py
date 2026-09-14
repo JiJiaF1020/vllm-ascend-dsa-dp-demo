@@ -42,6 +42,7 @@ def _make_runtime(
     max_decode_query_len: int = 1,
     resident_layer_count: int = 2,
     selection_state_count: int = 2,
+    fused_copy_sfa: bool = False,
     enable_prefix_caching: bool = False,
     mtp_durable_offload: bool = False,
 ) -> tuple[
@@ -67,6 +68,7 @@ def _make_runtime(
         pin_memory=False,
         packed_c8=packed_c8,
         max_decode_query_len=max_decode_query_len,
+        fused_copy_sfa=fused_copy_sfa,
         enable_prefix_caching=enable_prefix_caching,
         mtp_durable_offload=mtp_durable_offload,
     )
@@ -95,6 +97,35 @@ def test_lidu_scratch_is_shared_but_cache_slots_remain_per_layer() -> None:
     assert first.topk_index.data_ptr() == runtime._lidu_topk_index.data_ptr()
     assert first.topk_slots.data_ptr() == runtime._lidu_topk_slots.data_ptr()
     assert resident_pool.get_cache_slots(0).data_ptr() != resident_pool.get_cache_slots(1).data_ptr()
+
+
+def test_copysfa_output_is_preallocated_and_stable_across_decode_shapes() -> None:
+    _, split_runtime, _ = _make_runtime(packed_c8=True, max_decode_query_len=4)
+    assert split_runtime._fused_attention_outputs == {}
+    _, runtime, _ = _make_runtime(
+        max_num_reqs=2,
+        packed_c8=True,
+        max_decode_query_len=4,
+        fused_copy_sfa=True,
+    )
+    runtime.prepare_fused_attention_output(num_heads=64, dtype=torch.bfloat16)
+    small = runtime.get_fused_attention_output(torch.empty(2, 64, 576, dtype=torch.bfloat16))
+    runtime.prepare_fused_attention_output(num_heads=64, dtype=torch.bfloat16)
+    large = runtime.get_fused_attention_output(torch.empty(8, 64, 576, dtype=torch.bfloat16))
+    assert small.shape == (2, 64, 512)
+    assert large.shape == (8, 64, 512)
+    assert small.data_ptr() == large.data_ptr()
+    assert large.is_contiguous()
+    with pytest.raises(ValueError, match="query heads"):
+        runtime.prepare_fused_attention_output(num_heads=65, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="query heads"):
+        runtime.prepare_fused_attention_output(num_heads=64, dtype=torch.float32)
+
+
+@pytest.mark.parametrize("packed,routes", [(False, 4), (True, 1)])
+def test_copysfa_runtime_rejects_incompatible_cache_or_nomtp(packed, routes) -> None:
+    with pytest.raises(ValueError, match="packed-C8 MTP"):
+        _make_runtime(packed_c8=packed, max_decode_query_len=routes, fused_copy_sfa=True)
 
 
 @pytest.mark.parametrize("query_len", [1, 4])
@@ -736,16 +767,18 @@ def test_a5_mtp_selection_chain_reuses_per_query_outputs(monkeypatch, query_coun
     assert captured["copy_counts"].data_ptr() != captured["per_query_miss_counts"].data_ptr()
 
 
-@pytest.mark.parametrize("routes", [1, 4])
+@pytest.mark.parametrize("routes,fused", [(1, False), (4, False), (4, True)])
 def test_a5_shared_layer_reuses_full_lidu_and_own_packed_arena(
     monkeypatch,
     routes,
+    fused,
 ) -> None:
     resident_pool, runtime, store = _make_runtime(
         packed_c8=True,
         resident_layer_count=2,
         selection_state_count=1,
         max_decode_query_len=routes,
+        fused_copy_sfa=fused,
     )
     resident_caches = (
         torch.empty(4, 128, 1, 656, dtype=torch.int8),
@@ -759,6 +792,7 @@ def test_a5_shared_layer_reuses_full_lidu_and_own_packed_arena(
 
     fused_lidu_calls = 0
     scatter_calls: list[dict] = []
+    attention_calls: list[dict] = []
 
     def _fake_fused_lidu(*, outputs, attention_slots, resident_seq_lengths, **kwargs) -> None:
         nonlocal fused_lidu_calls
@@ -780,6 +814,18 @@ def test_a5_shared_layer_reuses_full_lidu_and_own_packed_arena(
         _fake_scatter,
     )
 
+    def _fused_attention(**kwargs):
+        attention_calls.append(kwargs)
+        kwargs["attention_out"].fill_(len(attention_calls))
+        return kwargs["attention_out"]
+
+    monkeypatch.setattr(runtime_module, "fused_copy_sparse_attention_c8", _fused_attention)
+    monkeypatch.setattr(
+        runtime_module, "sparse_flash_attention_for_offload_c8", lambda **kwargs: attention_calls.append(kwargs)
+    )
+    if fused:
+        runtime.prepare_fused_attention_output(num_heads=64, dtype=torch.bfloat16)
+
     full = DSALayerOffloadContext(
         layer_id=0,
         indexer_cache=(
@@ -794,7 +840,7 @@ def test_a5_shared_layer_reuses_full_lidu_and_own_packed_arena(
         "resident_block_table": torch.zeros(1, 64, dtype=torch.int32),
         "dram_block_table": torch.zeros(1, 64, dtype=torch.int32),
     }
-    full.execute_decode_selection(
+    full_selection = full.execute_decode_selection(
         query=torch.empty(routes, 32, 128),
         weights=torch.empty(routes, 32),
         row_modes=torch.tensor([1], dtype=torch.int32),
@@ -807,6 +853,19 @@ def test_a5_shared_layer_reuses_full_lidu_and_own_packed_arena(
         query_dequant_scale=torch.ones(routes, 32),
         query_shape=(routes, 32, 128),
         **common_tables,
+    )
+    attention_args = {
+        "query": torch.empty(routes, 64, 512, dtype=torch.bfloat16),
+        "query_rope": torch.empty(routes, 64, 64, dtype=torch.bfloat16),
+        "resident_block_table": common_tables["resident_block_table"],
+        "actual_seq_lengths_query": torch.tensor([routes], dtype=torch.int32),
+        "actual_seq_lengths_kv": torch.tensor([4096], dtype=torch.int32),
+        "scale_value": 576**-0.5,
+    }
+    full_attention = full.execute_sparse_attention(
+        resident_cache=(resident_caches[0],),
+        selection=full_selection,
+        **attention_args,
     )
 
     shared = DSALayerOffloadContext(
@@ -825,8 +884,29 @@ def test_a5_shared_layer_reuses_full_lidu_and_own_packed_arena(
 
     assert resident_pool.num_layers == 1
     assert fused_lidu_calls == 1
-    assert len(scatter_calls) == 2
     own_arena = store.get_layer_arenas(1).packed
+    shared_attention = shared.execute_sparse_attention(
+        resident_cache=(resident_caches[1],),
+        selection=selection,
+        **attention_args,
+    )
+    assert len(attention_calls) == 2
+    if fused:
+        assert scatter_calls == []
+        assert full_selection.fused_copy_plan.dram_packed_arena is store.get_layer_arenas(0).packed
+        assert selection.fused_copy_plan.dram_packed_arena is own_arena
+        assert selection.fused_copy_plan.outputs is full_selection.fused_copy_plan.outputs
+        assert selection.fused_copy_plan.attention_src_ids.data_ptr() == runtime._a5_attention_src_ids.data_ptr()
+        assert (
+            selection.fused_copy_plan.per_query_miss_counts.data_ptr() == runtime._a5_per_query_miss_counts.data_ptr()
+        )
+        assert attention_calls[0]["packed_kv"] is resident_caches[0]
+        assert attention_calls[1]["packed_kv"] is resident_caches[1]
+        assert full_attention.data_ptr() == shared_attention.data_ptr()
+        return
+    assert full_selection.fused_copy_plan is None
+    assert selection.fused_copy_plan is None
+    assert len(scatter_calls) == 2
     assert scatter_calls[1]["dram_packed_arena"] is own_arena
     outputs = runtime.get_lidu_outputs(num_reqs=1)
     assert scatter_calls[1]["source_token_ids"] is outputs.topk_index

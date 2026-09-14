@@ -16,6 +16,96 @@ from vllm_ascend.dsa_offload.ops import (
 )
 
 
+def test_copysfa_is_required_only_when_enabled(monkeypatch) -> None:
+    monkeypatch.setattr(dsa_ops, "load_custom_op_library", lambda: True)
+    monkeypatch.setattr(dsa_ops, "_REQUIRED_A5_C8_OPS", ())
+    monkeypatch.setattr(dsa_ops, "_REQUIRED_A5_MTP_OPS", ())
+    monkeypatch.setattr(dsa_ops, "_REQUIRED_A5_NATIVE_OPS", ())
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace())
+    outputs = (
+        "sparse_and_tail_slots", "sparse_and_tail_src_ids", "per_query_miss_counts",
+        "resident_seq_lengths", "copy_src_ids", "copy_dst_slots", "copy_counts",
+    )
+    arguments = [f"Tensor input{i}" for i in range(12)] + [f"Tensor {name}" for name in outputs]
+    schema = torch._C.parse_schema(f"npu_dsa_a5_li_manage_c8_out({', '.join(arguments)}) -> ()")
+    monkeypatch.setattr(
+        torch.ops, "_C_ascend",
+        SimpleNamespace(npu_dsa_a5_li_manage_c8_out=SimpleNamespace(default=SimpleNamespace(_schema=schema))),
+    )
+    dsa_ops.require_dsa_offload_ops(packed_c8=True, mtp=True)
+    with pytest.raises(RuntimeError, match="npu_dsa_a5_fused_copy_sfa_c8_out"):
+        dsa_ops.require_dsa_offload_ops(packed_c8=True, mtp=True, fused_copy_sfa=True)
+    with pytest.raises(ValueError, match="MTP"):
+        dsa_ops.require_dsa_offload_ops(packed_c8=True, fused_copy_sfa=True)
+
+
+def test_copysfa_wrapper_preserves_metadata_and_caller_owned_outputs(monkeypatch) -> None:
+    args_seen = []
+    monkeypatch.setattr(
+        torch.ops,
+        "_C_ascend",
+        SimpleNamespace(
+            npu_dsa_a5_fused_copy_sfa_c8_out=lambda *args: args_seen.append(args),
+        ),
+    )
+    b, t, h = 2, 5, 64
+    query = torch.empty(t, h, 576, dtype=torch.bfloat16)
+    hbm = torch.empty(4, 128, 1, 656, dtype=torch.float8_e4m3fn)
+    dram = torch.empty_like(hbm)
+    slots = torch.empty(t, 1, 2304, dtype=torch.int32)
+    source = torch.empty_like(slots)
+    misses = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32)
+    ends = torch.tensor([1, 5], dtype=torch.int32)
+    resident = torch.tensor([0, 8448], dtype=torch.int32)
+    table = torch.zeros(b, 2, dtype=torch.int32)
+    copies = dsa_ops.DSALightningIndexerOutputs(
+        torch.empty(b, 1, 16384, dtype=torch.int32),
+        torch.empty(b, 1, 16384, dtype=torch.int32),
+        torch.tensor([0, 8192], dtype=torch.int32),
+        torch.empty(b, 2, dtype=torch.int32),
+    )
+    plan = dsa_ops.DSAFusedCopyPlan(dram, table, source, misses, copies)
+    selection = dsa_ops.DSAOffloadSelectionOutput(slots, copies.tail_info, resident, plan)
+    out = torch.empty(t, h, 512, dtype=query.dtype)
+    assert (
+        dsa_ops.fused_copy_sparse_attention_c8(
+            query=query,
+            packed_kv=hbm,
+            selection=selection,
+            scale_value=0.125,
+            block_table=table,
+            actual_seq_lengths_query=ends,
+            attention_out=out,
+        )
+        is out
+    )
+    assert len(args_seen) == 1
+    actual = args_seen[0]
+    assert len(actual) == 15
+    assert actual[1].dtype == actual[2].dtype == torch.int8
+    assert actual[1].data_ptr() == hbm.data_ptr() and actual[2].data_ptr() == dram.data_ptr()
+    expected = (
+        query,
+        hbm,
+        dram,
+        table,
+        table,
+        slots,
+        source,
+        misses,
+        ends,
+        resident,
+        copies.topk_index,
+        copies.topk_slots,
+        copies.miss_count,
+        0.125,
+        out,
+    )
+    for index in (0, *range(3, 13), 14):
+        assert actual[index] is expected[index]
+    assert actual[13] == expected[13]
+
+
 def test_packed_c8_op_check_loads_extension_before_schema_check(monkeypatch) -> None:
     load_calls = 0
 

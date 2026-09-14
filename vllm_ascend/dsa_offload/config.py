@@ -48,6 +48,7 @@ _PUBLIC_CONFIG_KEYS = frozenset(
         "max_active_reqs",
         "hot_cpu_block_multiple",
         "enable_row_mode_decode_graph",
+        "enable_fused_copy_sfa",
         "trace_points",
     }
 )
@@ -166,6 +167,7 @@ class DSAOffloadConfig:
     max_active_reqs: int = 256
     hot_cpu_block_multiple: float = 3.0
     enable_row_mode_decode_graph: bool = False
+    enable_fused_copy_sfa: bool = False
     trace_points: DSAOffloadTraceConfig = field(default_factory=DSAOffloadTraceConfig)
     model_capabilities: DSAOffloadModelCapabilities | None = field(
         default=None,
@@ -294,6 +296,10 @@ class DSAOffloadConfig:
                 field_name="enable_row_mode_decode_graph",
             ),
             trace_points=DSAOffloadTraceConfig.from_value(raw_config.get("trace_points")),
+            enable_fused_copy_sfa=_strict_bool(
+                raw_config.get("enable_fused_copy_sfa", False),
+                field_name="enable_fused_copy_sfa",
+            ),
         )
         config._validate_static_contract()
         if config.enabled and vllm_config is not None:
@@ -313,6 +319,8 @@ class DSAOffloadConfig:
         return config
 
     def _validate_static_contract(self) -> None:
+        if self.enable_fused_copy_sfa and not self.enabled:
+            raise ValueError("enable_fused_copy_sfa requires DSA offload")
         thresholds = self.prompt_budget_thresholds
         budgets = self.resident_budget_tokens
         if len(budgets) != len(thresholds) + 1:

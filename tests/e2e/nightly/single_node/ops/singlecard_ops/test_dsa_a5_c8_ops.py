@@ -314,6 +314,33 @@ def _make_fused_lidu_inputs(
     }
 
 
+def _make_disjoint_mtp_lidu_inputs(*, query_counts, max_candidate, heads, seed=7):
+    """Independent request index blocks, with production-style block strides."""
+    batch = len(query_counts)
+    total_rows = sum(query_counts)
+    inputs = _make_fused_lidu_inputs(
+        candidate_len=max_candidate,
+        final_len=max_candidate + 2 * _BLOCK_SIZE,
+        row_mode=2,
+        batch=total_rows,
+        heads=heads,
+        seed=seed,
+    )
+    capacity = max_candidate + 2 * _BLOCK_SIZE
+    blocks = (capacity + _BLOCK_SIZE - 1) // _BLOCK_SIZE
+    key_storage = torch.randn(
+        (batch * blocks, _BLOCK_SIZE + 2, 1, 128), dtype=torch.bfloat16, device="npu"
+    ).to(torch.float8_e4m3fn)
+    scale_storage = torch.ones((batch * blocks, _BLOCK_SIZE + 8, 1), dtype=torch.float32, device="npu")
+    inputs["key"] = key_storage[:, :_BLOCK_SIZE]
+    inputs["key_scale"] = scale_storage[:, :_BLOCK_SIZE]
+    inputs["block_table"] = torch.arange(batch * blocks, dtype=torch.int32, device="npu").view(batch, blocks)
+    for name in ("candidate_lens", "final_lens", "row_modes", "req_entries"):
+        inputs[name] = inputs[name][:batch].clone()
+    inputs["query_ends"] = torch.tensor(query_counts, dtype=torch.int32).cumsum(0, dtype=torch.int32).to("npu")
+    return inputs
+
+
 def _allocate_fused_lidu_outputs(
     batch: int = 1,
     total_query_rows: int | None = None,
@@ -2116,6 +2143,273 @@ def test_packed_c8_ksc_copies_one_opaque_row() -> None:
     torch.npu.synchronize()
 
     assert torch.equal(hbm[0, 3, 0].cpu(), expected)
+
+
+def _make_copysfa_chain_case(query_counts, modes, *, miss_count=300, first_fill=False, tail=64):
+    """Real SIMT LIM inputs; attention golden uses original logical KV + native LI."""
+    candidate, budget = 12288, 8192
+    batch, total = len(query_counts), sum(query_counts)
+    inputs = _make_disjoint_mtp_lidu_inputs(
+        query_counts=query_counts,
+        max_candidate=candidate,
+        heads=32,
+        seed=193,
+    )
+    inputs["row_modes"].copy_(torch.tensor(modes, dtype=torch.int32, device="npu"))
+    inputs["final_lens"].fill_(candidate + tail)
+    for b, mode in enumerate(modes):
+        if mode == 0:
+            inputs["candidate_lens"][b] = 0
+            inputs["final_lens"][b] = 0
+            inputs["req_entries"][b] = -1
+    topk = _native_mtp_topk_rows(inputs)
+    pool_cpu = torch.full((batch + 1, _cache_row_width(candidate + 256)), -1, dtype=torch.int32)
+    pool_cpu[:, -1].zero_()
+    cached = []
+    begin = 0
+    for b, (routes, mode) in enumerate(zip(query_counts, modes)):
+        if mode == 2:
+            union = torch.cat(topk[begin : begin + routes]).unique().long()
+            missing = union[:miss_count]
+            kept = union[miss_count:]
+            fillers = torch.arange(candidate)[~torch.isin(torch.arange(candidate), union)]
+            tokens = torch.cat((kept, fillers))[:budget]
+            if first_fill and b == batch - 1:
+                pool_cpu[b, -1] = -budget
+                tokens = tokens[:0]
+            else:
+                pool_cpu[b, tokens] = torch.arange(budget, dtype=torch.int32)
+                pool_cpu[b, -1] = budget
+                assert not torch.isin(missing, tokens).any()
+            cached.append(tokens)
+        else:
+            cached.append(torch.empty(0, dtype=torch.long))
+        begin += routes
+    pool_initial = pool_cpu.to("npu")
+    pool = pool_initial.clone()
+    outputs = _allocate_mtp_lidu_outputs(batch, total)
+    _launch_mtp_lim(inputs, pool, outputs)
+    torch.npu.synchronize()
+    _assert_mtp_selection(inputs, pool_initial, pool, outputs, topk)
+
+    generator = torch.Generator().manual_seed(197)
+    blocks = (candidate + 256) // _BLOCK_SIZE + 1  # one guard block per request
+    table = torch.stack([b * blocks + torch.randperm(blocks, generator=generator).int() for b in range(batch)])
+    dram_table = torch.stack([b * blocks + torch.randperm(blocks, generator=generator).int() for b in range(batch)])
+    logical = torch.zeros((batch, blocks * _BLOCK_SIZE, _PACKED_ROW_BYTES), dtype=torch.int8)
+    logical[:, :, :512] = (
+        torch.randint(
+            -4,
+            5,
+            (batch, blocks * _BLOCK_SIZE, 512),
+            generator=generator,
+        )
+        .float()
+        .to(torch.float8_e4m3fn)
+        .view(torch.int8)
+    )
+    logical[:, :, 512:640] = (
+        torch.empty(batch, blocks * _BLOCK_SIZE, 64)
+        .uniform_(
+            -0.5,
+            0.5,
+            generator=generator,
+        )
+        .to(torch.bfloat16)
+        .view(torch.int8)
+    )
+    logical[:, :, 640:] = (
+        torch.empty(batch, blocks * _BLOCK_SIZE, 4)
+        .uniform_(
+            0.02,
+            0.08,
+            generator=generator,
+        )
+        .view(torch.int8)
+    )
+    initial = torch.full((batch * blocks * _BLOCK_SIZE, _PACKED_ROW_BYTES), -91, dtype=torch.int8)
+    dram_cpu = torch.empty_like(initial)
+
+    def physical(bt, b, ids):
+        return bt[b, ids // _BLOCK_SIZE].long() * _BLOCK_SIZE + ids % _BLOCK_SIZE
+
+    all_ids = torch.arange(blocks * _BLOCK_SIZE)
+    for b, mode in enumerate(modes):
+        dram_cpu[physical(dram_table, b, all_ids)] = logical[b]
+        if mode == 1:
+            ids = torch.arange(candidate + tail)
+            initial[physical(table, b, ids)] = logical[b, ids]
+        if mode == 2:
+            tokens = cached[b]
+            initial[physical(table, b, torch.arange(len(tokens)))] = logical[b, tokens]
+            ids = torch.arange(candidate, candidate + tail)
+            initial[physical(table, b, budget + ids % 256)] = logical[b, ids]
+    expected = initial.clone()
+    sources, destinations, counts = (tensor.cpu() for tensor in outputs[4:])
+    for b, count in enumerate(counts.tolist()):
+        ids, dst = sources[b, 0, :count].long(), destinations[b, 0, :count].long()
+        initial[physical(table, b, dst)] = -91
+        expected[physical(table, b, dst)] = logical[b, ids]
+    query = torch.randn(total, 64, 576, generator=generator).bfloat16()
+    golden = torch.zeros(total, 64, 512)
+    begin = 0
+    for b, (routes, mode) in enumerate(zip(query_counts, modes)):
+        for row in range(begin, begin + routes):
+            if mode == 0:
+                continue
+            ids = topk[row].long()
+            if mode == 2:
+                visible = candidate + tail - (begin + routes - 1 - row)
+                ids = torch.cat((ids, torch.arange(candidate, visible)))
+            raw = logical[b, ids].contiguous()
+            latent = raw[:, :512].contiguous().view(torch.float8_e4m3fn).float()
+            scales = raw[:, 640:].contiguous().view(torch.float32).repeat_interleave(128, -1)
+            value = (latent * scales).bfloat16().float()
+            rope = raw[:, 512:640].contiguous().view(torch.bfloat16).float()
+            key = torch.cat((value, rope), -1)
+            golden[row] = (query[row].float() @ key.T * 576**-0.5).softmax(-1) @ value
+        begin += routes
+    shape = (batch * blocks, _BLOCK_SIZE, 1, _PACKED_ROW_BYTES)
+    dram = _swapped_arena(shape)
+    _write_swapped_arena(dram, dram_cpu.view(shape))
+    tensors = dict(
+        inputs=inputs,
+        pool=pool,
+        outputs=outputs,
+        query=query.to("npu"),
+        hbm=initial.view(shape).to("npu"),
+        dram=dram,
+        htable=table.to("npu"),
+        dtable=dram_table.to("npu"),
+        out=torch.empty(total, 64, 512, dtype=torch.bfloat16, device="npu"),
+    )
+    return dict(
+        tensors=tensors,
+        pool_initial=pool_initial,
+        initial=tensors["hbm"].clone(),
+        expected=expected.view(shape),
+        golden=golden,
+        topk=topk,
+    )
+
+
+def _launch_copysfa_chain(state):
+    d = state["tensors"]
+    _launch_mtp_lim(d["inputs"], d["pool"], d["outputs"])
+    slots, sources, misses, resident, cs, cd, counts = d["outputs"]
+    torch.ops._C_ascend.npu_dsa_a5_fused_copy_sfa_c8_out(
+        d["query"],
+        d["hbm"],
+        d["dram"],
+        d["htable"],
+        d["dtable"],
+        slots,
+        sources,
+        misses,
+        d["inputs"]["query_ends"],
+        resident,
+        cs,
+        cd,
+        counts,
+        576**-0.5,
+        d["out"],
+    )
+
+
+def _check_copysfa_chain(state, reference):
+    torch.npu.synchronize()
+    d = state["tensors"]
+    _assert_mtp_selection(d["inputs"], reference["pool_initial"], d["pool"], d["outputs"], reference["topk"])
+    _assert_exact_int_tensor(d["hbm"].cpu(), reference["expected"])
+    actual, golden = d["out"].cpu().float(), reference["golden"]
+    assert torch.isfinite(actual).all()
+    # Same strict fused tolerances as the operator repository. No SFA XFAIL.
+    torch.testing.assert_close(actual, golden, atol=0.008, rtol=0.05)
+    relative = (actual - golden).flatten(1).norm(dim=1) / golden.flatten(1).norm(dim=1).clamp_min(1e-7)
+    assert (relative <= 0.08).all()
+
+
+def _copysfa_reset(state, reference):
+    d, src = state["tensors"], reference["tensors"]
+    for name, tensor in d["inputs"].items():
+        tensor.copy_(src["inputs"][name])
+    for name in ("query", "htable", "dtable"):
+        d[name].copy_(src[name])
+    d["pool"].copy_(reference["pool_initial"])
+    d["hbm"].copy_(reference["initial"])
+    d["out"].fill_(float("nan"))
+
+
+def test_packed_c8_copysfa_simt_chain_eager_and_dynamic_graph():
+    require_dsa_offload_ops(packed_c8=True, mtp=True, fused_copy_sfa=True)
+    # Every state has identical allocation shapes but a different device-side
+    # lifecycle/query distribution. Independent physical blocks for each request.
+    states = [
+        _make_copysfa_chain_case([1, 2, 3, 4], [2, 2, 2, 2], miss_count=0),
+        _make_copysfa_chain_case([1, 2, 3, 4], [2, 2, 2, 2], miss_count=300),
+        _make_copysfa_chain_case([4, 1, 2, 3], [0, 1, 2, 2], miss_count=512, tail=129),
+        _make_copysfa_chain_case([1, 2, 3, 4], [2, 2, 2, 2], miss_count=513),
+        _make_copysfa_chain_case([4, 1, 2, 3], [0, 1, 2, 2], first_fill=True, tail=256),
+    ]
+    # Keep references immutable while overwriting the captured input buffers.
+    active = _make_copysfa_chain_case([1, 2, 3, 4], [2, 2, 2, 2], miss_count=0)
+    for reference in states:
+        _copysfa_reset(active, reference)
+        _launch_copysfa_chain(active)
+        _check_copysfa_chain(active, reference)
+    _copysfa_reset(active, states[0])
+    _launch_copysfa_chain(active)
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        _launch_copysfa_chain(active)
+    d = active["tensors"]
+    owners = (*d["inputs"].values(), d["pool"], *d["outputs"], d["hbm"], d["out"])
+    pointers = tuple(t.data_ptr() for t in owners)
+    for reference in (*states[1:], states[1]):
+        for _ in range(3):
+            _copysfa_reset(active, reference)
+            graph.replay()
+            _check_copysfa_chain(active, reference)
+            assert pointers == tuple(t.data_ptr() for t in owners)
+
+
+def test_packed_c8_copysfa_workspace_graph_stream_isolation():
+    require_dsa_offload_ops(packed_c8=True, mtp=True, fused_copy_sfa=True)
+    states = [
+        _make_copysfa_chain_case([4], [2], miss_count=300),
+        _make_copysfa_chain_case([2, 4], [2, 2], miss_count=500),
+        _make_copysfa_chain_case([4, 4, 4, 4], [2, 2, 2, 2], miss_count=300),
+    ]
+    capture_stream = torch.npu.Stream()
+    capture_stream.wait_stream(torch.npu.current_stream())
+    graphs = []
+    for state in states[:2]:
+        with torch.npu.stream(capture_stream):
+            _copysfa_reset(state, state)
+            _launch_copysfa_chain(state)
+        capture_stream.synchronize()
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph, stream=capture_stream):
+            _launch_copysfa_chain(state)
+        graphs.append(graph)
+    with torch.npu.stream(capture_stream):
+        _copysfa_reset(states[2], states[2])
+        _launch_copysfa_chain(states[2])  # grow eager workspace after graph capture
+    torch.npu.synchronize()
+    torch.npu.empty_cache()
+    streams = [torch.npu.Stream(), torch.npu.Stream(), capture_stream]
+    for _ in range(3):
+        for index, (state, stream) in enumerate(zip(states, streams)):
+            with torch.npu.stream(stream):
+                _copysfa_reset(state, state)
+                if index < len(graphs):
+                    graphs[index].replay()
+                else:
+                    _launch_copysfa_chain(state)
+        torch.npu.synchronize()
+        for state in states:
+            _check_copysfa_chain(state, state)
 
 
 def test_packed_c8_ksc_honors_permuted_l2_and_hbm_block_tables() -> None:

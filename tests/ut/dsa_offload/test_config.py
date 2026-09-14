@@ -120,10 +120,19 @@ def _mtp_config(
     )
 
 
+def test_copysfa_config_requires_offload_and_bool() -> None:
+    with pytest.raises(ValueError, match="requires DSA offload"):
+        DSAOffloadConfig.from_dict({"enable_fused_copy_sfa": True})
+    with pytest.raises(TypeError, match="must be bool"):
+        DSAOffloadConfig.from_dict({"enabled": True, "enable_fused_copy_sfa": "1"})
+    assert DSAOffloadConfig.from_dict({"enabled": True, "enable_fused_copy_sfa": True}).enable_fused_copy_sfa
+
+
 def test_disabled_config_uses_typed_defaults() -> None:
     config = DSAOffloadConfig.from_dict(None)
 
     assert config.enabled is False
+    assert config.enable_fused_copy_sfa is False
     assert config.split_indexer_cache is False
     assert config.resident_budget_tokens == (6144, 10240, 12288)
     assert config.max_resident_budget_tokens == 12288

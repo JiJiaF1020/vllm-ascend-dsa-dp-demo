@@ -40,12 +40,23 @@ class DSALightningIndexerOutputs(NamedTuple):
     tail_info: torch.Tensor
 
 
+class DSAFusedCopyPlan(NamedTuple):
+    """Layer-local copy sources deferred until the fused attention launch."""
+
+    dram_packed_arena: torch.Tensor
+    dram_block_table: torch.Tensor
+    attention_src_ids: torch.Tensor
+    per_query_miss_counts: torch.Tensor
+    outputs: DSALightningIndexerOutputs
+
+
 class DSAOffloadSelectionOutput(NamedTuple):
-    """LIDU/KSC 完成后交给 SFA-Offload 的逐行 resident 视图。"""
+    """LIDU 的逐行 resident 视图；CopySFA 可延后 copy 至 attention 发射。"""
 
     sparse_indices: torch.Tensor
     tail_info: torch.Tensor
     resident_seq_lengths: torch.Tensor | None = None
+    fused_copy_plan: DSAFusedCopyPlan | None = None
 
 
 _REQUIRED_OPS = (
@@ -74,9 +85,12 @@ def require_dsa_offload_ops(
     *,
     packed_c8: bool = False,
     mtp: bool = False,
+    fused_copy_sfa: bool = False,
 ) -> None:
     """在 worker 初始化期确认当前 cache 模式所需设备算子均已部署。"""
 
+    if fused_copy_sfa and not (packed_c8 and mtp):
+        raise ValueError("CopySFA requires the A5 packed-C8 MTP path")
     if packed_c8 and not load_custom_op_library():
         raise RuntimeError(
             "DSA A5 packed-C8 custom operator library failed to load; "
@@ -93,6 +107,8 @@ def require_dsa_offload_ops(
     required_ops = _REQUIRED_A5_C8_OPS if packed_c8 else _REQUIRED_OPS
     if packed_c8 and mtp:
         required_ops = (*required_ops, *_REQUIRED_A5_MTP_OPS)
+    if fused_copy_sfa:
+        required_ops = (*required_ops, "npu_dsa_a5_fused_copy_sfa_c8_out")
     missing = [op_name for op_name in required_ops if not hasattr(torch.ops._C_ascend, op_name)]
     if missing:
         raise RuntimeError(f"DSA sparse offload custom operators are not installed: {tuple(missing)}")
@@ -319,6 +335,40 @@ def a5_kvcache_scatter_copy_c8(
         destination_slots,
         copy_counts,
     )
+
+
+def fused_copy_sparse_attention_c8(
+    *,
+    query: torch.Tensor,
+    packed_kv: torch.Tensor,
+    selection: DSAOffloadSelectionOutput,
+    scale_value: float,
+    block_table: torch.Tensor,
+    actual_seq_lengths_query: torch.Tensor,
+    attention_out: torch.Tensor,
+) -> torch.Tensor:
+    """One ACLNN launch, including the device-side >512 union-copy fallback."""
+    plan = selection.fused_copy_plan
+    if plan is None or selection.resident_seq_lengths is None:
+        raise ValueError("CopySFA requires a deferred MTP copy plan")
+    torch.ops._C_ascend.npu_dsa_a5_fused_copy_sfa_c8_out(
+        query,
+        _packed_byte_view(packed_kv, name="resident_packed_cache"),
+        _packed_byte_view(plan.dram_packed_arena, name="dram_packed_arena"),
+        block_table,
+        plan.dram_block_table,
+        selection.sparse_indices,
+        plan.attention_src_ids,
+        plan.per_query_miss_counts,
+        actual_seq_lengths_query,
+        selection.resident_seq_lengths,
+        plan.outputs.topk_index,
+        plan.outputs.topk_slots,
+        plan.outputs.miss_count,
+        float(scale_value),
+        attention_out,
+    )
+    return attention_out
 
 
 def sparse_flash_attention_for_offload_c8(

@@ -3,6 +3,27 @@
 本目录是 v0.23 DSA 的 tester-facing 验收入口。脚本以 GLM-5.1/GLM-5.2
 为首要模型，DeepSeek-V3.2 使用相同配置做强制回归。
 
+## CopySFA 融合开关（默认关闭）
+
+在现有 `additional_config["dsa_sparse_config"]` 内添加
+`"enable_fused_copy_sfa": True` 开启融合；省略或设为 `False` 时保持
+copy + SFA 分离路径。不要用此字段覆盖其它 DSA 配置。
+
+目前仅支持 A5 packed-C8 + DSA offload + MTP 的 2304-slot 接口，
+不满足条件时显式报错。只改变 target 稀疏 attention 的 copy/SFA 调用，
+不改变 LIM、prefix/L3 或 MTP durable cache 生命周期。
+算子内部保留大 copy-count 回退路径；开启不代表每种形状都获得加速。
+
+首次使用需在昇腾环境重新编译安装本仓库的 CANN 算子和 Torch 扩展。
+单卡 eager/graph 对照测试：
+
+```bash
+pytest -sv tests/e2e/nightly/single_node/ops/singlecard_ops/test_dsa_a5_c8_ops.py -k copysfa
+```
+
+随后用相同输入分别设置开关为 `False`/`True` 做整网精度及性能对照；
+单算子通过不能替代整网（包括 prefix/L3）验收。
+
 | 文件 | 用途 |
 |---|---|
 | `simple_prompt_test.py` | 基线隔离、cache-init、eager 和 graph 冒烟 |

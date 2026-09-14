@@ -406,6 +406,10 @@ class NPUModelRunner(GPUModelRunner):
                     "itself keeps its native BF16 full cache"
                 )
         self.dsa_kv_cache_group_ids: DSAKVCacheGroupIds | None = None
+        if dsa_config.enable_fused_copy_sfa and not (
+            self.dsa_offload_packed_c8 and dsa_config.mtp_enabled
+        ):
+            raise RuntimeError("CopySFA requires A5 packed-C8 DSA offload with MTP (2304 slots)")
         target_resident_layer_count = self.model_config.get_num_layers(
             self.parallel_config
         )
@@ -445,6 +449,7 @@ class NPUModelRunner(GPUModelRunner):
                 pin_memory=self.pin_memory,
                 packed_c8=self.dsa_offload_packed_c8,
                 max_decode_query_len=self.uniform_decode_query_len,
+                fused_copy_sfa=dsa_config.enable_fused_copy_sfa,
                 enable_prefix_caching=bool(
                     vllm_config.cache_config.enable_prefix_caching
                 ),
@@ -4843,6 +4848,7 @@ class NPUModelRunner(GPUModelRunner):
         require_dsa_offload_ops(
             packed_c8=self.dsa_offload_packed_c8,
             mtp=self.ascend_config.dsa_offload_config.mtp_enabled,
+            fused_copy_sfa=self.ascend_config.dsa_offload_config.enable_fused_copy_sfa,
         )
         binding_order = get_dsa_kv_cache_binding_order(kv_cache_config)
         expected_dsa_layers = set(binding_order)
@@ -5164,6 +5170,12 @@ class NPUModelRunner(GPUModelRunner):
                     packed_c8=self.dsa_offload_packed_c8,
                 )
             )
+            if runtime.fused_copy_sfa:
+                # Target layers run in stream order and share the same scratch.
+                runtime.prepare_fused_attention_output(
+                    num_heads=resident_impl.local_num_heads,
+                    dtype=self.model_config.dtype,
+                )
 
         if next_selection_state_id != resident_pool.num_layers:
             raise RuntimeError(
