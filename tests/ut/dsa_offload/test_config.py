@@ -202,7 +202,8 @@ def test_single_node_dp_foundation_rejects_later_phase_features(
 
 @pytest.mark.parametrize("prefix", [False, True])
 @pytest.mark.parametrize("graph", [False, True])
-def test_single_node_dp_accepts_fixed_mtp_with_eager_proposer(prefix, graph) -> None:
+@pytest.mark.parametrize("draft_eager", [False, True])
+def test_single_node_dp_accepts_fixed_mtp_with_eager_or_graph_proposer(prefix, graph, draft_eager) -> None:
     config = DSAOffloadConfig.from_dict(
         {
             "enabled": True, "enable_row_mode_decode_graph": graph,
@@ -211,7 +212,7 @@ def test_single_node_dp_accepts_fixed_mtp_with_eager_proposer(prefix, graph) -> 
         },
         vllm_config=_vllm_config(
             data_parallel_size=2, tensor_parallel_size=4,
-            speculative_config=_mtp_config(draft_tensor_parallel_size=4),
+            speculative_config=_mtp_config(draft_tensor_parallel_size=4, enforce_eager=draft_eager),
             enable_prefix_caching=prefix, enable_chunked_prefill=True,
             enforce_eager=not graph,
             cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY if graph else CUDAGraphMode.NONE,
@@ -223,7 +224,6 @@ def test_single_node_dp_accepts_fixed_mtp_with_eager_proposer(prefix, graph) -> 
 
 
 @pytest.mark.parametrize(("spec", "message"), [
-    (_mtp_config(enforce_eager=False), "enforce_eager=True"),
     (_mtp_config(draft_tensor_parallel_size=1), "same target and draft"),
 ])
 def test_single_node_dp_mtp_rejects_unsupported_proposer_modes(spec, message) -> None:

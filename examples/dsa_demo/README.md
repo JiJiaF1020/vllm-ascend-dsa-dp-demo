@@ -3,6 +3,25 @@
 本目录是 v0.23 DSA 的 tester-facing 验收入口。脚本以 GLM-5.1/GLM-5.2
 为首要模型，DeepSeek-V3.2 使用相同配置做强制回归。
 
+## GLM MTP 三轮合并图（卸载与 baseline 共用）
+
+`simple_dp_prompt_test.py` 设置 `RUN_MODE="graph"`、`ENABLE_MTP=True`、
+`ENABLE_MTP_GRAPH=True` 即可启用；`ENABLE_DSA_OFFLOAD` 独立控制卸载。
+`ENABLE_MTP_GRAPH` 默认 `False`，保留已有 eager drafter 对照。
+其它入口设置 `speculative_config.enforce_eager=False`、`num_speculative_tokens=3`，
+并令 `draft_tensor_parallel_size` 等于 target TP。
+
+支持 A5 GLM DSA 模型、target `FULL_DECODE_ONLY`、PP/PCP/DCP=1、同步调度，
+不启用 SP、shared-expert-DP、FlashComm2、lm-head TP。不满足条件时 drafter 回退 eager。
+普通 decode 使用独立的三轮 MTP 合并图，设备端 padding、slot/position 和 RoPE
+前处理包含在图内；host staging 和 DP 模式协商仍在图外。
+baseline 的 MTP MLA/Indexer 缓存保持 BF16 full cache，target C8 不变。
+
+custom 的 MTP durable dump step（prefix/L3）继续走 eager，任何 DP rank
+需要此路径时全组回退，避免捕获动态 dump job/epoch；prefill/mixed 也走 eager。
+确认实际回放请查看 `[GLM MTP graph] Replaying separate merged 3-step draft graph`。
+建议先短 prompt eager/graph 对照，再验证长 prompt、跨满块及 prefix/L3 回载精度。
+
 ## CopySFA 融合开关（默认关闭）
 
 在现有 `additional_config["dsa_sparse_config"]` 内添加
@@ -402,11 +421,11 @@ R3应有非零L3 load/restore完成，具体块数取决于本次prompt共享前
 | 调整输入 | 直接修改脚本顶部的数据导入及`PROMPTS` |
 | 每个DP跑相同输入 | `PROMPT_DISTRIBUTION="replicate"`、`SWAP_DP_ON_LAST_REPLAY=False`；仍共享本次run salt |
 | 仅Local prefix重放 | 关闭两个L3开关及reset/swap，保留prefix，`REPLAY_ROUNDS=2` |
-| 非MTP对照 | `ENABLE_MTP=False`；MTP3默认已开启，proposer固定eager |
+| 非MTP对照 | `ENABLE_MTP=False`；MTP3默认已开启，proposer默认eager，可设`ENABLE_MTP_GRAPH=True` |
 | 混合三轮跨域读取 | 当前默认；配好`PROMPTS`，保留round_robin、三轮、L3及reset/swap开关 |
 | 不加载模型的配置检查 | `CHECK_ONLY=True`，先检查配置、路径、依赖以及启用时的Master监听 |
 
-L3当前固定Mooncake TCP，Master需自己启动；MTP proposer固定eager。
+L3当前固定Mooncake TCP，Master需自己启动；MTP proposer默认eager，入图配置见文首。
 Master预检遵循实际worker的地址优先级：脚本内`NATIVE_RUNTIME_ENV`的覆盖、父进程
 `MOONCAKE_MASTER`环境变量、最后才是配置文件。显式空值会在加载模型前报错，
 不表示取消覆盖；要使用文件地址，应移除对应覆盖项，而不是赋空字符串。

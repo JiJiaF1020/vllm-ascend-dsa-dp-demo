@@ -989,7 +989,12 @@ class NPUModelRunner(GPUModelRunner):
         if self.dp_size == 1:
             return num_tokens, None, cudagraph_mode
 
-        if should_skip_allreduce_across_dp_group(self.vllm_config, is_draft_model):
+        # Merged MTP graphs need mode consensus even for baseline/idle ranks.
+        mtp_graph_sync = is_draft_model and (
+            (self.dsa_offload_enabled and self.ascend_config.dsa_offload_config.mtp_enabled)
+            or getattr(getattr(self, "drafter", None), "use_glm_mtp_graph", False)
+        )
+        if should_skip_allreduce_across_dp_group(self.vllm_config, is_draft_model) and not mtp_graph_sync:
             num_tokens_after_padding = torch.tensor([num_tokens] * self.dp_size, device="cpu", dtype=torch.int32)
             return num_tokens, num_tokens_after_padding, cudagraph_mode
 
@@ -2383,8 +2388,17 @@ class NPUModelRunner(GPUModelRunner):
                     if self.use_aux_hidden_state_outputs:
                         target_hidden_states = torch.cat([h for h in aux_hidden_states], dim=-1)
                 else:
+                    if (
+                        getattr(self.drafter, "use_glm_mtp_graph", False)
+                        and not self.vllm_config.speculative_config.disable_padded_drafter_batch
+                    ):
+                        # prepare_inputs_padded returns arange(total_tokens):
+                        # no compaction/reordering, so these gathers are views.
+                        token_indices = slice(0, common_attn_metadata.num_actual_tokens)
+                        target_positions = self._get_positions(common_attn_metadata.num_actual_tokens)
+                    else:
+                        target_positions = self._get_positions(token_indices)
                     target_token_ids = self.input_ids.gpu[token_indices]
-                    target_positions = self._get_positions(token_indices)
                     if self.use_aux_hidden_state_outputs:
                         target_hidden_states = torch.cat([h[token_indices] for h in aux_hidden_states], dim=-1)
                     else:
@@ -6388,18 +6402,11 @@ class NPUModelRunner(GPUModelRunner):
                     enable_sparse_li_c8_for_layer = bool(getattr(impl, "enable_sparse_li_c8", False))
 
                     layer_index = extract_layer_index(layer_name)
-                    is_mtp_full_cache_layer = (
-                        dsa_offload_enabled
-                        and self.ascend_config.dsa_offload_config.is_mtp_cache_layer_index(
+                    is_mtp_full_cache_layer = bool(getattr(impl, "is_mtp_full_cache_layer", False))
+                    if dsa_offload_enabled and is_mtp_full_cache_layer != (
+                        self.ascend_config.dsa_offload_config.is_mtp_cache_layer_index(
                             layer_index,
                             target_resident_layer_count,
-                        )
-                    )
-                    if is_mtp_full_cache_layer != bool(
-                        getattr(
-                            impl,
-                            "is_dsa_mtp_full_cache_layer",
-                            False,
                         )
                     ):
                         raise RuntimeError(
@@ -6496,7 +6503,7 @@ class NPUModelRunner(GPUModelRunner):
                     elif is_mtp_full_cache_layer:
                         if not has_indexer:
                             raise RuntimeError(
-                                "DSA MTP full-cache layer must keep its local "
+                                "MTP full-cache layer must keep its local "
                                 f"baseline Indexer: layer={layer_name}"
                             )
                         sparse_head_dim = (

@@ -104,9 +104,10 @@ SWAP_DP_ON_LAST_REPLAY = True  # 最后一轮循环交换各域输入，观察�
 # 仅打开L3开关不等于实际发生load；ENABLE_L3_PREFIX_LOADBACK=False时清本地后可重算。
 
 # =============================================================================
-# 6. MTP：固定3-token草稿，proposer eager；不改变target的RUN_MODE
+# 6. MTP：固定3-token草稿；不改变target的RUN_MODE
 # =============================================================================
 ENABLE_MTP = True
+ENABLE_MTP_GRAPH = False  # True：target graph时启用三轮合并图；卸载/baseline共用
 MTP_NUM_SPECULATIVE_TOKENS = 3  # 本样例仅支持已适配的固定MTP3，且TEMPERATURE=0
 # DSA下MTP层仍全量驻留，不做关键token swap；prefix开启后durable满块可下沉L2/L3。
 
@@ -316,7 +317,11 @@ def _build_kwargs(c):
     if additional:
         kwargs["additional_config"] = additional
     if c["ENABLE_MTP"]:
-        kwargs["speculative_config"] = {"method": "mtp", "num_speculative_tokens": 3, "enforce_eager": True}
+        kwargs["speculative_config"] = {
+            "method": "mtp", "num_speculative_tokens": 3,
+            "enforce_eager": not (graph and c["ENABLE_MTP_GRAPH"]),
+            "draft_tensor_parallel_size": c["TENSOR_PARALLEL_SIZE"],
+        }
     if graph:
         rows = {x for x in c["GRAPH_CAPTURE_ROW_SIZES"] if x <= c["MAX_NUM_SEQS"]} | {c["MAX_NUM_SEQS"]}
         kwargs["compilation_config"] = {
@@ -560,6 +565,7 @@ _SUMMARY_SETTINGS = (
     "ENABLE_DSA_OFFLOAD",
     "ENABLE_A5_PACKED_C8_DSA",
     "ENABLE_MTP",
+    "ENABLE_MTP_GRAPH",
     "MTP_NUM_SPECULATIVE_TOKENS",
     "ENABLE_PREFIX_CACHING",
     "ENABLE_L3_WRITE_BEHIND",

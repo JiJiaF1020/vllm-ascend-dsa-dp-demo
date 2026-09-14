@@ -531,8 +531,8 @@ class DSAOffloadConfig:
                     f"{unsupported_nomtp_budgets}"
                 )
         if data_parallel_size > 1 and speculative_config is not None:
-            if not bool(getattr(speculative_config, "enforce_eager", False)):
-                raise ValueError("DSA DP MTP requires speculative_config.enforce_eager=True for the proposer")
+            # The proposer gates merged GLM MTP graphs and coordinates eager
+            # fallbacks across DP; enforce_eager=True remains an opt-out.
             draft_tp = getattr(speculative_config, "draft_tensor_parallel_size", None)
             target_tp = int(getattr(parallel_config, "tensor_parallel_size", 1))
             if draft_tp is not None and int(draft_tp) != target_tp:
