@@ -7,6 +7,8 @@
 #include "vllm_a5_li_manage_c8_fast_union_vf.h"
 #include "vllm_a5_li_manage_c8_fast_victim_vf.h"
 #include "vllm_a5_li_manage_c8_fast_workspace.h"
+#include "vllm_a5_li_manage_c8_victim_scan.h"
+#include "lim_simt_postprocess.h"
 
 namespace vllm_a5_li_manage_c8_fast {
 using namespace AscendC;
@@ -107,6 +109,15 @@ public:
     }
 
 private:
+#if LIM_SIMT_REQUEST_META_CACHE
+    struct SparseRequestMetadata {
+        uint32_t candidate;
+        uint32_t finalLen;
+        uint32_t poolRow;
+        uint32_t budget;
+    };
+#endif
+
     __aicore__ inline uint32_t Deduplicate(
         LocalTensor<float> merged, uint32_t total,
         LocalTensor<int32_t> output)
@@ -120,21 +131,6 @@ private:
         // The following victim phase reuses the merged-pair UB allocation.
         UnionSync<HardEvent::V_S>(HardEvent::V_S);
         return count;
-    }
-
-    __aicore__ inline uint32_t HashVictimScanSeed(uint32_t candidate)
-    {
-        // poolRow is an address, not part of the logical cache policy. Mixing
-        // it into this seed changes slot placement after request-row reuse,
-        // which can change QSFA numerics even for identical selected tokens.
-        // Preserve the old row-zero scan while making other rows equivalent.
-        uint32_t value = candidate ^ 0x9e3779b9U;
-        value ^= value >> 16U;
-        value *= 0x7feb352dU;
-        value ^= value >> 15U;
-        value *= 0x846ca68bU;
-        value ^= value >> 16U;
-        return value;
     }
 
     __aicore__ inline uint32_t ReadBudget(
@@ -199,6 +195,7 @@ private:
     __aicore__ inline uint32_t CompactSafeVictims(
         uint32_t batch, uint32_t candidate, uint32_t poolRow,
         uint32_t budget, uint32_t required, uint32_t routeCount,
+        uint32_t scanSeed,
         const uint16_t thresholds[UNION_ROUTES],
         LocalTensor<int32_t> destinations,
         LocalTensor<int32_t> victimSources)
@@ -225,8 +222,7 @@ private:
 
         const uint32_t chunks =
             (candidate + VICTIM_SCAN_CHUNK - 1U) / VICTIM_SCAN_CHUNK;
-        const uint32_t firstChunk =
-            HashVictimScanSeed(candidate) % chunks;
+        const uint32_t firstChunk = scanSeed % chunks;
         const uint64_t requestScoreBase =
             static_cast<uint64_t>(batch) * UNION_ROUTES * scoreRowStride_;
         const uint64_t cacheBase =
@@ -311,10 +307,27 @@ private:
             const uint32_t compactCount = static_cast<uint32_t>(
                 GetSpr<SpecialPurposeReg::AR>() / sizeof(uint32_t));
             PipeBarrier<PIPE_V>();
+#if !LIM_SIMT_VICTIM_UNPACK
             UnionSync<HardEvent::V_S>(HardEvent::V_S);
+#endif
             const uint32_t remaining = required - written;
             const uint32_t keep =
                 compactCount < remaining ? compactCount : remaining;
+#if LIM_SIMT_VICTIM_UNPACK
+            if (keep != 0U) {
+                asc_vf_call<lim_simt::UnpackVictims>(
+                    dim3(LIM_SIMT_THREADS),
+                    (__ubuf__ uint32_t *)compact.GetPhyAddr(),
+                    (__ubuf__ int32_t *)destinations.GetPhyAddr() + written,
+                    (__ubuf__ int32_t *)victimSources.GetPhyAddr() + written,
+                    keep);
+            }
+            // SIMD compaction and SIMT unpack share PIPE_V. Wait after
+            // unpack (instead of before scalar unpack) before reusing the
+            // scratch or letting AppendExactVictims read destinations.
+            // This also completes compaction when keep==0; no empty VF.
+            UnionSync<HardEvent::V_S>(HardEvent::V_S);
+#else
             for (uint32_t index = 0U; index < keep; ++index) {
                 const uint32_t payload = compact.GetValue(index);
                 destinations.SetValue(
@@ -325,6 +338,7 @@ private:
                     written + index,
                     static_cast<int32_t>(payload & UNION_SOURCE_MASK));
             }
+#endif
             written += keep;
         }
         return written;
@@ -334,6 +348,7 @@ private:
         uint32_t batch, uint32_t candidate, uint32_t poolRow,
         uint32_t budget, uint32_t written, uint32_t required,
         uint32_t routeCount, uint32_t queryStart,
+        uint32_t scanSeed,
         LocalTensor<int32_t> destinations,
         LocalTensor<int32_t> victimSources)
     {
@@ -372,8 +387,7 @@ private:
 
         const uint32_t chunks =
             (candidate + VICTIM_SCAN_CHUNK - 1U) / VICTIM_SCAN_CHUNK;
-        const uint32_t firstChunk =
-            HashVictimScanSeed(candidate) % chunks;
+        const uint32_t firstChunk = scanSeed % chunks;
         const uint64_t cacheBase =
             static_cast<uint64_t>(poolRow) * poolStride_;
         for (uint32_t visit = 0U;
@@ -405,7 +419,10 @@ private:
 
     __aicore__ inline uint32_t FindVictims(
         uint32_t batch, uint32_t count, uint32_t routeCount,
-        uint32_t queryStart,
+        uint32_t queryStart, uint32_t scanSeed,
+#if LIM_SIMT_REQUEST_META_CACHE
+        const SparseRequestMetadata &metadata,
+#endif
         LocalTensor<int32_t> destinations,
         LocalTensor<int32_t> victimSources)
     {
@@ -419,35 +436,69 @@ private:
         LocalTensor<uint16_t> thresholdLocal = thresholdBuf_.Get<uint16_t>();
         uint16_t thresholds[UNION_ROUTES];
         LoadThresholds(batch, thresholdLocal, routeCount, thresholds);
+#if LIM_SIMT_REQUEST_META_CACHE
+        const uint32_t candidate = metadata.candidate;
+        const uint32_t poolRow = metadata.poolRow;
+        const uint32_t budget = metadata.budget;
+#else
         const uint32_t candidate = static_cast<uint32_t>(
             candidateLensGm_.GetValue(batch));
         const uint32_t poolRow = static_cast<uint32_t>(
             reqPoolEntriesGm_.GetValue(batch));
         const uint32_t budget = ReadBudget(batch, poolRow);
+#endif
         uint32_t written = CompactSafeVictims(
-            batch, candidate, poolRow, budget, count, routeCount, thresholds,
+            batch, candidate, poolRow, budget, count, routeCount,
+            scanSeed, thresholds,
             destinations, victimSources);
         written = AppendExactVictims(
             batch, candidate, poolRow, budget, written, count,
-            routeCount, queryStart,
+            routeCount, queryStart, scanSeed,
             destinations, victimSources);
         return written;
     }
 
     __aicore__ inline uint32_t ApplyCacheUpdates(
         uint32_t batch, uint32_t count,
+#if LIM_SIMT_REQUEST_META_CACHE
+        const SparseRequestMetadata &metadata,
+#endif
         LocalTensor<int32_t> sources,
         LocalTensor<int32_t> destinations,
         LocalTensor<int32_t> victimSources)
     {
+#if LIM_SIMT_REQUEST_META_CACHE
+        (void)batch;
+        const uint32_t candidate = metadata.candidate;
+        const uint32_t poolRow = metadata.poolRow;
+        const uint32_t budget = metadata.budget;
+#else
         const uint32_t candidate = static_cast<uint32_t>(
             candidateLensGm_.GetValue(batch));
         const uint32_t poolRow = static_cast<uint32_t>(
             reqPoolEntriesGm_.GetValue(batch));
         const uint32_t budget = ReadBudget(batch, poolRow);
+#endif
         const uint64_t cacheBase =
             static_cast<uint64_t>(poolRow) * poolStride_;
         uint32_t updated = 0U;
+#if LIM_SIMT_POSTPROCESS
+        // countBuf_[1] is idle until PublishFinalOutputs rewrites all count
+        // rows. Keep it separate from the live source/destination arrays.
+        LocalTensor<uint32_t> validPrefix = countBuf_.Get<uint32_t>()[1U];
+        validPrefix.SetValue(0U, count);
+        UnionSync<HardEvent::S_V>(HardEvent::S_V);
+        asc_vf_call<lim_simt::ApplyUpdates>(
+            dim3(LIM_SIMT_THREADS),
+            (__gm__ int32_t *)cacheSlotsGm_.GetPhyAddr(), cacheBase,
+            (__ubuf__ int32_t *)sources.GetPhyAddr(),
+            (__ubuf__ int32_t *)destinations.GetPhyAddr(),
+            (__ubuf__ int32_t *)victimSources.GetPhyAddr(),
+            (__ubuf__ uint32_t *)validPrefix.GetPhyAddr(),
+            count, candidate, budget);
+        UnionSync<HardEvent::V_S>(HardEvent::V_S);
+        updated = validPrefix.GetValue(0U);
+#else
         for (uint32_t index = 0U; index < count; ++index) {
             const int32_t source = sources.GetValue(index);
             const int32_t destination = destinations.GetValue(index);
@@ -464,6 +515,7 @@ private:
                 cacheBase + static_cast<uint32_t>(source), destination);
             ++updated;
         }
+#endif
         if (updated != 0U) {
             PipeBarrier<PIPE_ALL>();
         }
@@ -478,6 +530,37 @@ private:
         LocalTensor<int32_t> allDestinations)
     {
         LocalTensor<int32_t> routePairs = pairInputBuf_.Get<int32_t>();
+#if LIM_SIMT_BATCHED_REPAIR
+        static_assert(UNION_ROUTES == 4U && UNION_TOPK == lim_simt::REPAIR_TOPK,
+            "batched repair must match the fixed route-pair workspace rows");
+        // Each DMA owns a separate pairInput row. No route overwrites data
+        // still being read by another route, so one MTE2_V wait is sufficient.
+        const uint64_t requestPairBase =
+            static_cast<uint64_t>(batch) * UNION_CAPACITY * 2U;
+        for (uint32_t route = 0U; route < routeCount; ++route) {
+            const uint32_t length = lengths[route];
+            if (length != 0U) {
+                const uint32_t pairOffset = route * UNION_PAIR_WORDS;
+                DataCopyPad(
+                    routePairs[pairOffset],
+                    routePairsGm_[requestPairBase + pairOffset],
+                    {1, length * 2U * static_cast<uint32_t>(sizeof(int32_t)),
+                     0, 0, 0},
+                    {false, 0, 0, 0});
+            }
+        }
+        UnionSync<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+        asc_vf_call<lim_simt::RepairMissSlotsBatched>(
+            dim3(LIM_SIMT_THREADS),
+            (__ubuf__ int32_t *)routePairs.GetPhyAddr(),
+            (__ubuf__ int32_t *)unionSources.GetPhyAddr(),
+            (__ubuf__ int32_t *)unionDestinations.GetPhyAddr(),
+            (__ubuf__ int32_t *)allDestinations.GetPhyAddr(),
+            lengths[0], lengths[1], lengths[2], lengths[3], unionCount);
+        // Complete all pair reads before PublishFinalOutputs reuses their
+        // UB for causal tails. Keep the existing final V_MTE3 publication.
+        UnionSync<HardEvent::V_MTE2>(HardEvent::V_MTE2);
+#else
         // pairInputBuf_ has 16384 int32 words. One 4096-word interleaved
         // route-pair row and four 2048-word destination prefixes are disjoint.
         const uint64_t requestPairBase =
@@ -494,10 +577,23 @@ private:
                 {1, length * 2U * static_cast<uint32_t>(sizeof(int32_t)),
                  0, 0, 0},
                 {false, 0, 0, 0});
-            UnionSync<HardEvent::MTE2_S>(HardEvent::MTE2_S);
-
             LocalTensor<int32_t> rowDestinations =
                 allDestinations[route * UNION_TOPK];
+#if LIM_SIMT_POSTPROCESS
+            UnionSync<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+            asc_vf_call<lim_simt::RepairMissSlots>(
+                dim3(LIM_SIMT_THREADS),
+                (__ubuf__ int32_t *)routePairs.GetPhyAddr(),
+                (__ubuf__ int32_t *)unionSources.GetPhyAddr(),
+                (__ubuf__ int32_t *)unionDestinations.GetPhyAddr(),
+                (__ubuf__ int32_t *)rowDestinations.GetPhyAddr(),
+                length, unionCount);
+            // Next route reuses routePairs for MTE2. Do not overwrite it
+            // while the current VF still reads it. Final MTE3 publication
+            // retains the existing V_MTE3 dependency.
+            UnionSync<HardEvent::V_MTE2>(HardEvent::V_MTE2);
+#else
+            UnionSync<HardEvent::MTE2_S>(HardEvent::MTE2_S);
             uint32_t unionCursor = 0U;
             for (uint32_t miss = 0U; miss < length; ++miss) {
                 // BuildSortedMissPairs emits source IDs in ascending order,
@@ -515,7 +611,9 @@ private:
                         : -1;
                 rowDestinations.SetValue(miss, destination);
             }
+#endif
         }
+#endif
     }
 
     __aicore__ inline void PublishFinalOutputs(
@@ -523,6 +621,9 @@ private:
         uint32_t routeCount,
         const uint32_t lengths[UNION_ROUTES],
         uint32_t count, LocalTensor<int32_t> countLocal,
+#if LIM_SIMT_REQUEST_META_CACHE
+        const SparseRequestMetadata &metadata,
+#endif
         LocalTensor<int32_t> unionSources,
         LocalTensor<int32_t> unionDestinations,
         LocalTensor<int32_t> topkMissDestinations)
@@ -534,9 +635,15 @@ private:
         static_assert(2U * UNION_ROUTES * TAIL <= UNION_PAIR_WORDS,
             "tail scratch must not overlap live miss destinations");
         // PrepareTopkMissPrefixes has finished reading route pairs. Reuse
-        // only [0,4096); miss destinations in [4096,12288) stay live for DMA.
+        // only [0,4096): legacy repair keeps live slots in [4096,12288),
+        // batched repair keeps them in pairOutput's former victim half.
         LocalTensor<int32_t> tailSlots = pairInputBuf_.Get<int32_t>();
         LocalTensor<int32_t> tailSources = tailSlots[UNION_ROUTES * TAIL];
+#if LIM_SIMT_REQUEST_META_CACHE
+        const uint32_t budget = metadata.budget;
+        const uint32_t finalLen = metadata.finalLen;
+        const uint32_t candidate = metadata.candidate;
+#else
         const uint32_t poolRow = static_cast<uint32_t>(
             reqPoolEntriesGm_.GetValue(batch));
         const uint32_t budget = ReadBudget(batch, poolRow);
@@ -544,6 +651,7 @@ private:
             finalSeqLengthsKvGm_.GetValue(batch));
         const uint32_t candidate = static_cast<uint32_t>(
             candidateLensGm_.GetValue(batch));
+#endif
         VllmA5LiManageC8FastUnionVF::BuildCausalTailRows(
             (__ubuf__ uint32_t *)tailSlots.GetPhyAddr(),
             (__ubuf__ uint32_t *)tailSources.GetPhyAddr(),
@@ -781,6 +889,13 @@ private:
             PublishError(batch, queryStart, routeCount);
             return;
         }
+#if LIM_SIMT_REQUEST_META_CACHE
+        // ValidateSparse has already read and checked these four values.
+        // Keep only a request-local snapshot, never a member / GM / UB cache:
+        // the next request and every graph replay validate fresh metadata.
+        // Steady updates change token columns, not the positive budget word.
+        const SparseRequestMetadata metadata{candidate, finalLen, poolRow, budget};
+#endif
 
         LocalTensor<float> pairs = pairInputBuf_.Get<float>();
         LocalTensor<float> merged = pairOutputBuf_.Get<float>();
@@ -823,7 +938,11 @@ private:
         if (total == 0U) {
             PublishFinalOutputs(
                 batch, queryStart, routeCount, lengths,
-                0U, countLocal, sources, sources, sources);
+                0U, countLocal,
+#if LIM_SIMT_REQUEST_META_CACHE
+                metadata,
+#endif
+                sources, sources, sources);
             return;
         }
 
@@ -859,28 +978,52 @@ private:
         LocalTensor<int32_t> destinations = victimStorage;
         LocalTensor<int32_t> victimSources =
             victimStorage[UNION_CAPACITY];
+        // Reuse the validated request-local length; both victim passes must
+        // start from the same seed, refreshed on every invocation/replay.
+        const uint32_t scanSeed =
+            vllm_a5_li_manage_c8_victim_scan::HashVictimScanSeed(
+                finalLen);
         const uint32_t found = FindVictims(
-            batch, count, routeCount, queryStart,
+            batch, count, routeCount, queryStart, scanSeed,
+#if LIM_SIMT_REQUEST_META_CACHE
+            metadata,
+#endif
             destinations, victimSources);
         if (found != count) {
             PublishError(batch, queryStart, routeCount);
             return;
         }
         const uint32_t updated = ApplyCacheUpdates(
-            batch, count, sources, destinations, victimSources);
+            batch, count,
+#if LIM_SIMT_REQUEST_META_CACHE
+            metadata,
+#endif
+            sources, destinations, victimSources);
         if (updated != count) {
             PublishError(batch, queryStart, routeCount);
             return;
         }
+#if LIM_SIMT_BATCHED_REPAIR
+        // ApplyCacheUpdates has completed (V_S + PIPE_ALL). Victim sources
+        // are now dead; reuse these 8192 words for four repaired prefixes.
+        // The first half of pairOutput (union destinations) stays read-only
+        // until PublishFinalOutputs finishes MTE3. No extra UB allocation.
+        LocalTensor<int32_t> topkMissDestinations = victimSources;
+#else
         LocalTensor<int32_t> topkScratch = pairInputBuf_.Get<int32_t>();
         LocalTensor<int32_t> topkMissDestinations =
             topkScratch[UNION_PAIR_WORDS];
+#endif
         PrepareTopkMissPrefixes(
             batch, routeCount, lengths, updated,
             sources, destinations, topkMissDestinations);
         PublishFinalOutputs(
             batch, queryStart, routeCount, lengths, updated,
-            countLocal, sources, destinations, topkMissDestinations);
+            countLocal,
+#if LIM_SIMT_REQUEST_META_CACHE
+            metadata,
+#endif
+            sources, destinations, topkMissDestinations);
     }
 
     __aicore__ inline void ProcessRequest(uint32_t batch)

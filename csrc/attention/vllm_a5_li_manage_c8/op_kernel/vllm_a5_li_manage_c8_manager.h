@@ -9,6 +9,7 @@
 
 #include "kernel_operator.h"
 #include "vllm_a5_li_manage_c8_tiling.h"
+#include "vllm_a5_li_manage_c8_victim_scan.h"
 
 #ifndef VLLM_A5_LI_MANAGE_C8_MANAGER_H
 #define VLLM_A5_LI_MANAGE_C8_MANAGER_H
@@ -626,6 +627,7 @@ private:
 
     __aicore__ inline bool ProcessSteady(
         uint32_t batch, uint32_t queryStart, uint32_t queryEnd,
+        uint32_t poolRow,
         uint64_t poolBase, uint32_t sourceLen, uint32_t finalLen,
         uint32_t budget, LocalTensor<int32_t> topk,
         LocalTensor<int32_t> slots, LocalTensor<int32_t> sources,
@@ -687,9 +689,16 @@ private:
         uint32_t assigned = 0;
         uint32_t missHashPosition = 0;
         DataCopyPadExtParams<int32_t> pad{false, 0, 0, 0};
-        for (uint32_t chunkBase = 0;
-             chunkBase < sourceLen && assigned < missCount;
-             chunkBase += CACHE_CHUNK) {
+        // A first-fill elsewhere in the batch must not make this steady
+        // request repeatedly evict from token zero. Match the fast seed.
+        const uint32_t chunks = (sourceLen + CACHE_CHUNK - 1U) / CACHE_CHUNK;
+        const uint32_t firstChunk =
+            vllm_a5_li_manage_c8_victim_scan::HashVictimScanSeed(
+                finalLen) % chunks;
+        for (uint32_t visit = 0;
+             visit < chunks && assigned < missCount; ++visit) {
+            const uint32_t chunkBase =
+                ((firstChunk + visit) % chunks) * CACHE_CHUNK;
             const uint32_t chunkLen =
                 MinU32(CACHE_CHUNK, sourceLen - chunkBase);
             DataCopyExtParams copy{
@@ -820,7 +829,8 @@ private:
                 protectedSlotBuf_.Get<uint8_t>(),
                 hashBuf_.Get<uint32_t>())
             : ProcessSteady(
-                batch, queryStart, queryEnd, poolBase, sourceLen,
+                batch, queryStart, queryEnd, static_cast<uint32_t>(poolRow),
+                poolBase, sourceLen,
                 static_cast<uint32_t>(finalLen), budget, topk, slots,
                 sources,
                 cacheChunkBuf_.Get<int32_t>(),

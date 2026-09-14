@@ -7,6 +7,7 @@
  */
 
 #include "kernel_operator.h"
+#include "lim_simt_config.h"
 #include "lib/matmul_intf.h"
 #include "vllm_a5_li_manage_c8_tiling.h"
 #include "arch35/quant_lightning_indexer_common.h"

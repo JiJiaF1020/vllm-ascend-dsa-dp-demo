@@ -192,7 +192,14 @@ __aicore__ inline void QLIVector<QLIT>::InitParams(
     kCacheBlockSize_ = constInfo.kCacheBlockSize;
     maxBlockNumPerBatch_ = constInfo.maxBlockNumPerBatch;
     blockId_ = GetBlockIdx();
+    // The cold first-fill path also shares this kernel's UB reservation.
+    // A smaller sorting chunk saves 32 KiB; candidate domain / TopK / cache
+    // management semantics stay unchanged. The stable payload QLI is intact.
+#if LIM_SIMT_POSTPROCESS
+    trunkLen_ = 8192U;
+#else
     trunkLen_ = TRUNK_LEN_16K;
+#endif
     topkCount_ = constInfo.sparseCount;
     topkCountAlign256_ = QLICommon::Align(constInfo.sparseCount, (uint64_t)256); // topkCount对齐到256
     topkOp_.Init(topkCount_, trunkLen_);

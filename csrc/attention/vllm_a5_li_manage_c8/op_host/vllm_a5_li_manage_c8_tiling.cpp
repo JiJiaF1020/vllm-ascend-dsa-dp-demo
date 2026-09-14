@@ -7,6 +7,7 @@
 #include <limits>
 
 #include "../op_kernel/vllm_a5_li_manage_c8_tiling.h"
+#include "../op_kernel/lim_simt_config.h"
 #include "../op_kernel/vllm_a5_li_manage_c8_fast_workspace.h"
 #include "register/op_impl_registry.h"
 #include "tiling/platform/platform_ascendc.h"
@@ -246,6 +247,13 @@ static ge::graphStatus TilingVllmA5LiManageC8(
     context->SetBlockDim(platform.CalcTschBlockDim(
         usedCoreNum * 2U, usedCoreNum, usedCoreNum * 2U));
     context->SetScheduleMode(1);
+#if LIM_SIMT_POSTPROCESS
+    // TPipe's low-address buffers must not overlap the SIMT Data Cache.
+    // Reserve the same user-UB extent for every graph-replay branch.
+    if (context->SetLocalMemorySize(LIM_SIMT_USER_UB_BYTES) != ge::GRAPH_SUCCESS) {
+        return ge::GRAPH_FAILED;
+    }
+#endif
     return ge::GRAPH_SUCCESS;
 }
 
