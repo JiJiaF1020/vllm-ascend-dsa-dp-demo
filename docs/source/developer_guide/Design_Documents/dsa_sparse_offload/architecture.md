@@ -11,6 +11,9 @@ DSA稀疏卸载保留完整Indexer上下文，把target MLA的HBM开销限制为
 
 当前不开放async scheduling、请求抢占恢复、PD、跨机DP/节点内存规划、PP/PCP/DCP、动态MTP、proposer Graph和任意外部connector组合。已有L3是DSAL3Connector/Mooncake Store-owned TCP，不是通用KV transfer能力全开放。
 
+PD首版范围已讨论，详细合同见[P/D分离设计草案](proposals/prefill_decode_disaggregation.md)。
+该草案尚待评审、编码和设备验证，不改变本页现有支持矩阵；PD不以前置完成自动抢占恢复为条件。
+
 ## 2. 文档层次与阅读方式
 
 本文保留系统级的实现推导、接口、例子和代码地图；专题文档展开多级缓存、MTP和DP。设计状态与实施进展分开，实验流水不作为当前合同。

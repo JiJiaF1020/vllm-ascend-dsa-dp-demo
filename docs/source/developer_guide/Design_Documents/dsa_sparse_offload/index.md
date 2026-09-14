@@ -13,7 +13,8 @@
 | 已确认设计 | [MTP 与推测解码](features/speculative_decoding.md) | 固定MTP3、双尾、七输出、proposer和多级prefix |
 | 已确认设计 | [数据并行推理](features/data_parallel_inference.md) | DP/TP/EP基础、单机DP资源预算、dummy与管理事务 |
 | 未决设计草案 | [自适应推测解码](proposals/adaptive_speculation.md) | 理想版MTP的容量适应、有效query数、采样与图合同 |
-| 未决设计草案 | [分布式执行与状态恢复](proposals/execution_and_recovery.md) | 打断恢复、PD、跨机DP及异步加载的候选方案与待决策项 |
+| 详细设计草案 | [P/D分离](proposals/prefill_decode_disaggregation.md) | 已确认首版范围、v0.23/新版依据、接管/尾页/MTP/DP合同及验证门禁；待评审、未实现 |
+| 未决设计草案 | [分布式执行与状态恢复](proposals/execution_and_recovery.md) | 打断恢复、跨机DP及异步加载的候选方案与待决策项；PD转到独立草案 |
 | 工程经验 | [问题分析与工程经验](engineering/diagnostics_and_lessons.md) | 排查方法、已修复机制、未定界问题、证据和测试边界 |
 
 推荐顺序：**系统架构 → 对应专题 → 特性路线图**。遇到故障再查工程经验；规划新能力时才进入草案。
@@ -35,7 +36,7 @@ DP专题先介绍基线逐token教学，再解释DSA已确认的增量。
 
 - **设计已确认 / 已适配**：当前三个专题的已实施主路径，受各自支持矩阵约束。
 - **设计已确认 / 待适配**：只有接口、所有权、时序和失败语义都已确认，才能标为此状态。后续出现这类任务时，放入相应专题并在路线图列明实施缺口。
-- **目标已确认 / 方案待定**：例如更完整的分层复用、动态MTP、PD与恢复。目标共识不等于可直接实现的方案，详细讨论留在`proposals/`。
+- **目标已确认 / 方案待定或待评审**：例如更完整的分层复用、动态MTP、PD与恢复。PD已有独立详细设计草案，但仍需评审与介质门禁；目标共识不等于可直接实现的方案，详细讨论留在`proposals/`。
 - **已适配 / 验证有边界**：功能可运行不等于任意模型、拓扑、数值质量、性能与长稳都已认证。
 
 各特性的当前状态以路线图和对应专题为准。草案不解除现有gate，也不构成自动开工指令。
@@ -71,6 +72,7 @@ features/data_parallel_inference
 :maxdepth: 1
 :caption: 设计草案与工程经验
 proposals/adaptive_speculation
+proposals/prefill_decode_disaggregation
 proposals/execution_and_recovery
 engineering/diagnostics_and_lessons
 :::

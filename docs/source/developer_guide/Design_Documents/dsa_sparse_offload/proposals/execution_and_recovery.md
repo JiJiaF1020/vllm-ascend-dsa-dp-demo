@@ -1,6 +1,7 @@
 # 分布式执行与状态恢复设计草案
 
-> 状态：目标与部分原则已确认，实施方案未定稿。覆盖打断恢复、PD、跨机DP及相关加载优化，不是当前支持矩阵。
+> 状态：目标与部分原则已确认，实施方案未定稿。覆盖打断恢复、跨机DP及相关加载优化，不是当前支持矩阵。
+> PD已于2026-09-14转入[独立详细设计草案](prefill_decode_disaggregation.md)，本页不再维护第二份PD协议。
 
 ## 1. 共同不变量
 
@@ -56,80 +57,31 @@ scheduling 的组合也仍需独立适配。
 
 ## 3. P/D 分离
 
-Prefill通常不需要resident稀疏预算，可选择不同的Indexer/MLA容量比例；Decode接管后才进入固定budget数据面。发送稀疏TopK集合不足以支持后续Indexer重新选择。
+首版范围与详细合同现集中在[P/D分离设计](prefill_decode_disaggregation.md)，包括：
 
-两类候选：
+- 同TP、各P/D服务内部单机；D重算N-1，P构建必要MTP历史但不额外多步投机。
+- D完整Indexer/MTP HBM、MLA完整L2 backing、固定resident及私有边界页。
+- 独立PD交付与可选共享L3分开；P/D新满块可供后续复用。
+- 复用原生Request/KVConnector和现有DSA owner，Graph/Eager同源。
+- 保守准入、明确失败、安全回收；不以先完成自动preemption/resume为前置。
 
-- **Connector直传**：定义完整组件、目的布局、源pin、接管确认与失败回滚。
-- **共享L3中转**：定义内容指纹、可读完整bundle、首次restore/first-fill、实例生命周期及新满块持续发布。
-
-需要确认不同TP规模是否允许共享payload，权重身份如何保证，MTP草稿边界是否随请求迁移。HTTP已返回或对象key存在，不表示Decode已成功接管状态。
-
-可参考后续社区PD/offload组件，但必须标明所参考版本，再评估能否回用到v0.23。新社区源码中的能力不直接变成本分支支持。
+状态仍是详细设计待评审、未实现，不能据此移除配置gate。早期“任意TP”、
+“P首输出直接交接”及“默认Store中转”不再作为首版并列方案维护；介质未通过
+独立PD门禁时需重新讨论范围，不静默强制Store。
 
 ### 3.1 语义manifest不绑定物理group
 
-以下是待定稿的传输描述，不是当前已有的P/D API。Prefill侧可以采用Indexer/MLA
-约1:1的dense容量；Decode侧则分别规划完整Indexer、固定resident MLA和可选MTP
-full cache。两侧不必采用相同的group编号、block容量或tensor布局，不能为了复用
-connector强迫它们一致，也不能把旧方案中的`3N/N/3N`当作跨实例传输ABI。
-
-候选manifest至少要表达：
-
-| 语义字段 | 必须回答的问题 |
-|---|---|
-| `target_indexer` | 哪些真实full Indexer层、key/scale或BF16 plane；shared follower对应哪个physical source |
-| `target_mla` | 完整逻辑历史的NOPE/ROPE或packed C8 payload，不是当前resident TopK槽 |
-| `mtp_full`（启用时） | 原生BF16完整历史、proposer身份及drafting边界，不只传target KV |
-| `layout/dtype/shape/version` | block大小、plane顺序、量化/scale、schema及模型/权重身份能否兼容 |
-| 逻辑范围与接管身份 | 已完成/verified/durable边界、真实部分尾块、request与operation/epoch，如何拒绝迟到结果 |
-| 复制/分片语义 | TP变化后payload是同一副本、需重分片还是不可转换；由谁验证和转换 |
-
-P侧即使使用combined MLA spec，也必须由adapter导出D侧可解释的语义component。
-源物理ID、目的物理ID分别由各自allocator管理；group id恰好相同不证明布局兼容。
-基线“非对称TP”支持也不自动完成这些转换，尤其不能用相同block hash掩盖量化或
-proposer身份变化。单producer接管manifest与第13.2节远端多writer原子发布manifest
-职责不同，是否复用同一格式还需评审，不能因名称相同就混用。
+为保留旧链接，本节转向新草案第5节的组件/身份/传输描述；不再复制字段表。
 
 ### 3.2 接收端落点与候选状态流
 
-一种待评审的接管状态流可以写为：
-
-```text
-WAIT_EXTERNAL_CACHE
-  -> reserve complete L2 + required HBM destinations
-  -> load/restore required components
-  -> validate common ready boundary + commit local layout
-  -> rebuild drafting/frontier and first-fill as required
-  -> enter the agreed PREFILL/DENSE/ENTER/SPARSE path
-```
-
-这不是现有状态机的新增实现。若仍按普通prefix请求接入，当前请求必须经过
-PREFILL取得logits，不能直接first-fill后跳入sparse；若P已经交付首token或其他
-frontier状态，则需另定“不重复采样、不漏算边界”的接管协议。第8至10节的恢复
-及四个确认事件仍是约束，不因增加manifest而自动满足。
-
-旧候选曾按`L3 -> D L2（MLA）`、`L3 -> D HBM（Indexer/MTP）`拆路，再从L2
-first-fill resident。它依赖NPU-aware direct能力，**不能套到当前Store-owned TCP**。
-沿用当前数据面时，必需component应先落入D的完整L2 bundle，再恢复到所需HBM；
-将来即使支持混合落点，也必须在释放dense或进入sparse前具备完整、同代、可访问的
-durable backing，MTP历史不能缺席。
-
-L3中转与P2P各有前置条件：共享L3依赖稳定内容身份、完整可读对象及实例间接管确认；
-直接P2P若只能写D的HBM，就可能要求D临时容纳完整MLA，失去固定resident预算的
-容量优势。应先验证是否支持向D的固定L2 arena流式写入，再决定直传方案；少一次
-中转不自动意味着可接纳更多请求或端到端更快。
+见新草案第6至10节：介质、D-first、资源预留、N-1私有边界和直接first-fill。
+特别是“received有效范围”不等于“computed/公共durable”，不能直接套共部恢复公式。
 
 ### 3.3 Decode增量与最小接管门禁
 
-接管不是一次性prompt搬运。D继续产生的新完整块应在Indexer mirror、MLA、可选
-MTP及native block hash齐备后增量发布；下一轮“旧对话+新用户消息”仍须通过
-partial-prefix prefill合同，不能把decode追加数据可见等同于多轮请求已经可复用。
-
-候选验收需分别覆盖不同物理group/TP、缺失或短读component、真实部分尾块、MTP
-drafting边界、取消、producer提前退出及迟到确认。所有必需rank/layer就绪前不能
-forward；源释放、consumer读取、布局提交与请求归属按第10节分开确认。应复用
-connector及DSA adapter，不新写一套P/D scheduler或绕开现有完成协议。
+见新草案第11至14节的MTP、prefix、DP与失败合同，以及第19节验证矩阵。
+后续更新只修改该草案，不在此保留容易失配的简化协议。
 
 ## 4. 跨机DP
 
@@ -535,13 +487,8 @@ ready、Graph/eager 同源；先 no-MTP 证明，再讨论 MTP，不以整网完
 
 ## 10. P/D接管的确认边界
 
-不论直传或L3中转，至少区分“producer已产生数据”“consumer已读到数据”“consumer已
-提交本地布局”“可以释放producer源”四个事件。失败发生在任意两个事件之间时，哪个
-实例拥有请求、能否重试、源还能否读，都必须有明确答案。
-
-Decode端完整Indexer、MLA durable backing、真实部分尾块及可选proposer状态需要按
-同一逻辑边界接管；只传resident TopK不足以支持下一步重新选择。若TP规模或布局不同，
-应先验证转换/兼容性，不用相同prefix hash掩盖schema差异。
+为保留旧链接，本节转向[P/D详细设计](prefill_decode_disaggregation.md)第7、9、14节。
+生产可读、目标可见、布局提交和源允许回收仍是四类不同事件；详细条件与失败窗口仅在新草案维护。
 
 ## 11. Layerwise加载为何不能只开线程
 

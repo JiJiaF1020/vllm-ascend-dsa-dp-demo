@@ -1,6 +1,6 @@
 # 特性演进与实施路线图
 
-> 更新：2026-09-11；当前集成快照`b9d12863c2`。
+> 更新：2026-09-14；功能快照`b9d12863c2`，本轮文档基点`e74000d3ef`，未新增PD运行实现。
 > 本页记录特性适配，不记录逐轮debug、bugfix清单或实验日志。工程质量风险集中在[问题分析与工程经验](engineering/diagnostics_and_lessons.md)。
 
 ## 1. 状态定义
@@ -83,7 +83,7 @@
 | 特性 | 设计状态 | 实施状态与依赖 |
 |---|---|---|
 | 请求preemption/resume | 目标确认 / 待定稿 | 未开放；需先决定L2寿命、恢复水位、尾块和在途IO合同 |
-| P/D分离 | 目标确认 / 待定稿 | 未开放；依赖完整状态接管、失败协议及基线connector选型 |
+| P/D分离 | 首版范围确认 / 详细设计待评审 | [独立设计草案](proposals/prefill_decode_disaggregation.md)已编写；未开放，先验证独立介质与真实L2落点，再实现接管、MTP/DP组合；不依赖自动恢复先完成 |
 | 跨机DP | 目标确认 / 待定稿 | 未开放；需节点级预算域、身份/可达性和全域管理 |
 | 理想版自适应MTP | 目标确认 / 待定稿 | 未实施；有效query前缀必须贯通算子、采样、scheduler与Graph |
 | MTP proposer Graph | 研究候选 | 当前保持eager；需覆盖独立cache与多步draft控制流 |
@@ -103,9 +103,10 @@
         -> L2目录与完整bundle -> L3与HBM prefix
         -> 固定MTP3/多级prefix -> 单机DP与组合适配
 
-后续先决策：恢复的数据所有权与失败语义
-            + 跨实例/跨节点通信与部署边界
-            -> 对应preemption、PD或跨机DP实现
+当前PD：已确认范围 -> 详细设计评审 -> 独立介质门禁
+        -> 接管/边界 -> 多级prefix -> MTP -> 单机DP/Graph组合 -> 首版闭环
+
+独立后续：preemption/resume、跨机DP按各自所有权与失败合同另行设计
 
 性能扩展：layerwise/direct/proposer Graph/动态MTP分别立项
 ```
@@ -119,7 +120,7 @@
 | TTFT、重复长prompt、多轮对话 | L1/L2/L3及dense恢复式partial-prefix已适配；是否继续做layerwise或offload-aware prefill，由真实瓶颈与容量需求决定 |
 | 单请求decode性能、MTP效率 | 固定MTP3及proposer BF16 full-HBM已适配；proposer Graph与有效query前缀自适应各自立项，不阻塞缓存主线 |
 | 跨域/跨实例池化 | 约定单机DP共享L3已适配；跨机仍需节点级预算、可达性、共享身份和管理协议，不由backend有共享池自动推出 |
-| P/D分离 | 先解决单实例preemption/resume的所有权与恢复合同，再决定L3中转或P2P；P/D物理group和TP可不同，需语义manifest及D侧完整backing/first-fill |
+| P/D分离 | 首版同TP、各侧服务内部单机，保守准入及显式失败；独立PD交付与可选L3共享分开，D完整backing/私有边界/first-fill；不先实现自动preemption/resume |
 
 ### 6.2 进入详细设计的决策门禁
 
@@ -130,8 +131,9 @@
 - 每项依次给出数据合同、组件测试、集成测试与端到端门禁，不同时改变所有权、hash、异步完成和first-fill却缺少隔离验证。
 
 早期人周、月数和里程碑只记录当时范围下的工作量判断，不是当前剩余工作量或工期承诺。
-详细性能分析、候选source plan与实施方案归入[执行与恢复草案](proposals/execution_and_recovery.md)或
-[自适应推测解码草案](proposals/adaptive_speculation.md)，不在本页展开。
+PD的详细时序、改动位置与PD-0至PD-6验证阶段见[P/D分离草案](proposals/prefill_decode_disaggregation.md)。
+其他候选source plan、恢复及性能方案归入[执行与恢复草案](proposals/execution_and_recovery.md)或
+[自适应推测解码草案](proposals/adaptive_speculation.md)，不在本页展开；PD首版不设性能硬指标。
 
 ## 7. 维护边界
 
