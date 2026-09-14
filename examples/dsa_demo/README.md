@@ -3,6 +3,15 @@
 本目录是 v0.23 DSA 的 tester-facing 验收入口。脚本以 GLM-5.1/GLM-5.2
 为首要模型，DeepSeek-V3.2 使用相同配置做强制回归。
 
+## 公开版 GLM-5.2 权重
+
+A5 DSA offload 的 Indexer C8 类型按 `quant_model_description.json` 中
+逐层 `*.indexer.quant_type` 优先、全局 `indexer_quant_type` 兜底识别，
+支持 `INT8_DYNAMIC` / `FP8_DYNAMIC` / `W8A8_MXFP8`。
+不再用 `wq_b.weight` 的量化方式替代缓存类型。缺少上述声明的内部版保持
+原有行为；关闭 LI C8 开关仍有效，baseline 保留原生量化路径。
+测试时只需把 `MODEL_PATH` 指向公开版权重目录，不要修改权重描述文件。
+
 ## GLM MTP 三轮合并图（卸载与 baseline 共用）
 
 `simple_dp_prompt_test.py` 设置 `RUN_MODE="graph"`、`ENABLE_MTP=True`、

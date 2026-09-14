@@ -471,6 +471,20 @@ class AscendConfig:
     def is_sparse_li_c8_layer(self, layer_name: str | None) -> bool:
         if not self.enable_sparse_li_c8:
             return False
+        if self.dsa_offload_config.enabled and layer_name is not None:
+            from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+            if get_ascend_device_type() == AscendDeviceType.A5:
+                quant_description = getattr(self.vllm_config.quant_config, "quant_description", None)
+                if isinstance(quant_description, dict):
+                    # Public checkpoints can declare a global Indexer cache
+                    # type with per-layer overrides. A projection's wq_b.weight
+                    # quantization does not determine the runtime cache layout.
+                    prefix = layer_name.rstrip(".").removesuffix(".attn")
+                    layer_key = f"{prefix}.indexer.quant_type"
+                    if layer_key in quant_description or "indexer_quant_type" in quant_description:
+                        quant_type = quant_description.get(layer_key, quant_description.get("indexer_quant_type"))
+                        return quant_type in ("INT8_DYNAMIC", "FP8_DYNAMIC", "W8A8_MXFP8")
         if not self._sparse_li_c8_layer_filter_enabled:
             return True
         if layer_name is None:
