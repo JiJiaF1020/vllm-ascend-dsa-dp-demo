@@ -2457,11 +2457,11 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "Tensor index_weights, Tensor query, Tensor query_dequant_scale, "
         "Tensor actual_seq_lengths_query, Tensor index_key_cache, "
         "Tensor index_key_dequant_scale, Tensor index_block_table, "
-        "Tensor candidate_lens, Tensor final_seq_lengths_kv, "
+        "Tensor offloaded_lens, Tensor final_seq_lengths_kv, "
         "Tensor row_modes, Tensor req_pool_entries, "
         "Tensor(a!) cache_slots_pool, "
-        "Tensor(b!) sparse_and_tail_slots, "
-        "Tensor(c!) sparse_and_tail_src_ids, "
+        "Tensor(b!) topk_slots, "
+        "Tensor(c!) topk_index, "
         "Tensor(d!) per_query_miss_counts, "
         "Tensor(e!) resident_seq_lengths, Tensor(f!) copy_src_ids, "
         "Tensor(g!) copy_dst_slots, Tensor(h!) copy_counts) -> ()");
@@ -2483,7 +2483,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "npu_dsa_a5_fused_copy_sfa_c8_out("
         "Tensor query, Tensor(a!) hbm_kv_bytes, Tensor dram_kv_bytes, "
         "Tensor hbm_block_table, Tensor dram_block_table, "
-        "Tensor sparse_and_tail_slots, Tensor sparse_and_tail_src_ids, "
+        "Tensor topk_slots, Tensor topk_index, "
         "Tensor per_query_miss_counts, Tensor actual_seq_lengths_query, "
         "Tensor resident_seq_lengths, Tensor copy_src_ids, Tensor copy_dst_slots, "
         "Tensor copy_counts, float scale_value, Tensor(b!) attention_out) -> ()");

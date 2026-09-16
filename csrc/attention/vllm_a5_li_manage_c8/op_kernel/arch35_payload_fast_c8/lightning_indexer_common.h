@@ -89,6 +89,7 @@ struct RunInfo {
     uint32_t kScaleLoop;        // kScale pingpong
     uint32_t cacheRowIdx = 0;       // fused C8: req_pool_entries[bIdx] 指向的缓存行
     uint32_t cacheTokenCount = 0;   // fused C8: cache_tokens[bIdx] 预算 C
+    uint32_t offloadedLen = 0;      // durable prefix; selected tail is a resident hit
     // First fixed [B,4] private-workspace row of this request.  The vector
     // service derives the current route from outputRow-publicOutputBaseRow;
     // public outputs themselves stay compact TND when requests mix R=1..4.
@@ -112,11 +113,9 @@ struct RunInfo {
     bool isLastS2InnerLoop;
     bool isAllLoopEnd = false;
     bool isValid = false;
-    // li_manage_c8 unified steady path extensions.  SPARSE routes rank the
-    // shared durable prefix without a causal clip.  DENSE routes share one
-    // final-length score pass, then clip TopK independently to the causal
-    // length of the speculative route and publish plain token IDs without
-    // consulting cache_slots.
+    // All routes scan the final KV length and clip TopK independently to
+    // their causal visible length. DENSE publishes plain token IDs without
+    // consulting cache_slots; SPARSE classifies prefix/tail in the payload.
     bool causalClip = false;
     bool denseDirectPublish = false;
 };

@@ -1213,7 +1213,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(
                         static_cast<uint64_t>(info.cacheRowIdx) * constInfo_.cacheSlotsSize,
                         0, topkCount_, validS2LenAlign,
                         static_cast<uint32_t>(validS2Len), 0, 1,
-                        true, slotPrefetchCap);
+                        true, slotPrefetchCap, info.offloadedLen, info.cacheTokenCount);
                 }
             } else {
                 for (uint32_t loopIdx = 0; loopIdx < s2LoopNum; loopIdx++) {
@@ -1235,7 +1235,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(
                                 slotPrefetchLocal, slotStageLocal_, cacheSlotsGm,
                                 static_cast<uint64_t>(info.cacheRowIdx) * constInfo_.cacheSlotsSize,
                                 0, topkCount_, trunkLen_, trunkLen_,
-                                loopIdx, s2LoopNum, true, slotPrefetchCap);
+                                loopIdx, s2LoopNum, true, slotPrefetchCap, info.offloadedLen, info.cacheTokenCount);
                         }
                         continue;
                     }
@@ -1292,7 +1292,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(
                             static_cast<uint64_t>(info.cacheRowIdx) * constInfo_.cacheSlotsSize,
                             loopIdx * trunkLen_, topkCount_, mergedValidLen,
                             validTrunkLen, loopIdx, s2LoopNum,
-                            true, slotPrefetchCap);
+                            true, slotPrefetchCap, info.offloadedLen, info.cacheTokenCount);
                     }
                     SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT1);
                 }

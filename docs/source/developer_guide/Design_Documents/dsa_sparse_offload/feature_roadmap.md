@@ -55,7 +55,7 @@
 | 固定MTP3 target双尾 | 已适配 | 多query验算、冻结预算档位、跨128边界的parity尾区 |
 | Proposer原生BF16 full cache | 已适配 | active decode全HBM；不依赖缺失的BF16 sparse swap算子 |
 | MTP多级prefix | 已适配 | verified三组件bundle、联合回退边界、proposer后完成发布 |
-| LIM七输出与2304选择策略 | 已适配 | 共同durable TopK+因果双尾、query与request分轴、后续融合接口 |
+| LIM七输出与全可见域TopK2048 | 源码已适配，待本轮A5验收 | 入选tail为hit、仅prefix COPY，QSFA mode=0；双尾存储与非MTP路径不变 |
 | 算子跨特性集成 | 已适配 | LIDU/LIM/KSC更新与prefix、MTP、DP共享同一元数据合同 |
 
 当前L3后端是Mooncake Store-owned TCP。更细的component源选择和direct-HBM不由以上状态自动推出。详见[多级缓存](features/multilevel_kv_cache.md)、[MTP设计](features/speculative_decoding.md)。

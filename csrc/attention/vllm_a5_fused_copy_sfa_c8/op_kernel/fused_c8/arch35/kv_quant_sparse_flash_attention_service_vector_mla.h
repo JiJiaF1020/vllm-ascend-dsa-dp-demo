@@ -197,7 +197,7 @@ private:
         for (uint32_t t = scan.begin; t < query; ++t) {
             const uint32_t count = missesGm.GetValue(t);
             for (uint32_t i = 0; i < count; ++i) {
-                const int32_t slot = SparseIndicesGm.GetValue(static_cast<uint64_t>(t) * 2304 + i);
+                const int32_t slot = SparseIndicesGm.GetValue(static_cast<uint64_t>(t) * 2048 + i);
                 ASSERT(slot >= 0 && slot < 16384);
                 earlierMissSlots[slot / 32] |= 1U << (slot % 32);
             }

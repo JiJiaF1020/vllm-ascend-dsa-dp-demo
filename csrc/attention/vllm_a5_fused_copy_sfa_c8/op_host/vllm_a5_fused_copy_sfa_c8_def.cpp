@@ -13,8 +13,8 @@ public:
         this->Input("query").ParamType(REQUIRED).DataType(q).Format(nd);
         this->Input("hbm_kv_bytes").ParamType(REQUIRED).DataType(bytes).Format(nd);
         this->Input("dram_kv_bytes").ParamType(REQUIRED).DataType(bytes).Format(nd);
-        for (const char *input : {"hbm_block_table", "dram_block_table", "sparse_and_tail_slots",
-             "sparse_and_tail_src_ids", "per_query_miss_counts", "actual_seq_lengths_query",
+        for (const char *input : {"hbm_block_table", "dram_block_table", "topk_slots",
+             "topk_index", "per_query_miss_counts", "actual_seq_lengths_query",
              "resident_seq_lengths", "copy_src_ids", "copy_dst_slots", "copy_counts"}) {
             this->Input(input).ParamType(REQUIRED).DataType(ints).Format(nd);
         }

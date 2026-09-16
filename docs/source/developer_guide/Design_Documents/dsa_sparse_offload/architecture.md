@@ -664,7 +664,7 @@ outer step 执行 pre-write dump。第一版不会把该尾块标记 hash-ready�
 | 算子家族 | 当前接口/设计入口 | 不能混用的边界 |
 |---|---|---|
 | A5 non-MTP LIDU | 本节11.7五输出、11.8地址、11.9分工 | 17 tensor、2176、单尾；不使用MTP batch fast/cold gate |
-| A5 MTP LIM | 本节11.4、11.7至11.9及MTP专题 | 19 tensor、2304、共同durable历史和因果双尾 |
+| A5 MTP LIM | 本节11.4、11.7至11.9及MTP专题 | 19 tensor、2048、全可见域TopK；入选tail为hit |
 | A5 packed KSC | 本节11.10至11.11 | 七tensor、656B、双槽FIFO；不读query级miss |
 | 三种满块复制 | 第12.6节 | 双plane、C8 packed、通用bytes的参数/平台/任务空间不同 |
 | Native Quant-LI/QSFA | 第18节 | 本分支调用子集，不代替外部完整API或同名自定义adapter |
@@ -800,18 +800,17 @@ resident length 保持完整 `actual_len`，因此 dense 序列长度不受 2176
 A5 路径不消费 A3 的 `tail_info` scratch；融合算子已把有效尾部 slot 直接追加到
 2176 列 QSFA 索引行中。
 
-MTP 的 copy plan/`cache_slots` 仍为 `B` 行，`sparse_and_tail_slots` 与 `sparse_and_tail_src_ids` 均为 `int32[T,1,2304]`，`T=sum(Q_b)`，算子支持每请求 1～4 条 query 混合。SPARSE 的 `candidate_lens[B]` 是共享 durable DRAM prefix D：各 query 独立在 `[0,D)` 选 top2048，再追加自身因果可见的 `[D,V_q)`（最多 256 个 token），tail slot 为 `budget+token%256`。tail 不参与 LI、miss 判断或 union copy；两份输出逐元素配对，topK 区域保持 miss 在前、hit 在后，尾部空位为 -1，`per_query_miss_counts[T]` 只统计 durable-prefix miss。`resident_seq_lengths[B]` 为 `budget+256` 的物理可寻址 span，DENSE 为最终原始 KV 长度，PAD 为 0。
+MTP 的 copy plan/`cache_slots` 仍为 `B` 行，`topk_slots` 与 `topk_index` 均为 `int32[T,1,2048]`，`T=sum(Q_b)`，算子支持每请求 1～4 条 query 混合。各 query 独立在完整因果可见域 `[0,V_q)` 选 Top2048。SPARSE 的 `offloaded_lens[B]` 是共享 durable DRAM prefix D，仅用于分类、COPY 和淘汰，不限制 LI 搜索域。入选 tail 一律为 hit，slot=`budget+token%256`；不额外追加 tail，不为 tail 写反向表或生成 COPY。两份输出逐元素配对，保持 miss 在前、hit 在后；`per_query_miss_counts[T]` 只统计入选的 durable-prefix miss。`resident_seq_lengths[B]` 仍为 `budget+256` 的可寻址 span，DENSE 为最终原始 KV 长度，PAD 为 0。
 
-新版 MTP 不再把双尾区中新完成但尚未持久化的块加入 LI 候选域，而是将其因果可见部分全量纳入 Attention。这是明确的 Attention 语义升级；已有 durable-prefix 元数据和双 parity block 分配不变。非 MTP 仍使用 2176，不能全局替换成 2304。升级时必须同步 MTP 预分配 buffer、C++ shape 检查和 QSFA 输入检查，重新编译并重新捕获图；不支持复用旧 2176 graph。
+本轮从单算子仓 `6732a649a36e4829994aa6cbdbd7ad6616333180` 同步全可见域 TopK2048，替换旧“durable Top2048+全部因果双尾”的 2304 策略。双 parity block 分配、写入、倒手和 budget 均不变。仅升级固定 MTP3 配置的 target 链，保留运行时 R=1～4；非 MTP 仍使用原算子和 2176。官方 MTP QSFA 使用 `sparse_mode=0`，因果性由 LIM 的逻辑 token 选择保证，不对重排后的 resident slots 再施加因果裁剪。升级必须联合重编译 host/kernel/ACLNN/Torch 扩展，重新启动并捕获图。
 
-2026-09-10迁移保持同事的七输出顺序；新增 query source/miss 输出供后续融合
-使用，当前 KSC 仍只消费请求级去重 copy plan。KSC 保留错误 count/pair/table
-的设备断言，错误 `-1` 不可当作正常零IO。packed-MTP L3指纹增加
-`durable-prefix-topk-causal-dual-tail-v1`，隔离旧策略对象但不加入具体TP/DP rank。
-2304版本的验收以独立的单卡及整网回归证据为准，证据边界见工程经验；不将先前
-2176版本的验收结果自动算作2304版本数值/性能验证通过。
+七输出顺序保持不变；query source/miss 供可选 CopySFA 使用，KSC 仍只消费请求级
+去重 copy plan。KSC 保留错误 count/pair/table 的设备断言，错误 `-1` 不可当作正常
+零 IO。packed-MTP L3 指纹更新为 `full-visible-topk2048-tail-hit-v2`，隔离旧策略对象，
+不加入具体 TP/DP rank。非 MTP 指纹不变。本轮框架迁移仍需独立 A5 验收，不能把
+单算子仓通过记录或旧 2304 框架结果当成新版本的整网精度/性能结论。
 
-MTP victim扫描策略不得依赖物理metadata pool行号；快速扫描与精确补扫使用同一逻辑candidate种子，真实pool行号仅用于状态寻址。相关修复证据见[工程经验](engineering/diagnostics_and_lessons.md)。
+MTP victim扫描策略不得依赖物理metadata pool行号；快速扫描与精确补扫使用同一 `hash(final_seq_lengths_kv[b])` 种子，真实pool行号仅用于状态寻址。相关历史修复证据见[工程经验](engineering/diagnostics_and_lessons.md)。
 
 当前跨特性集成必须保持以下生命周期约束：
 
@@ -922,9 +921,9 @@ Indexer cache、layer id 和 runtime 在初始化期绑定，热路径不重复�
 
 ### 11.7 A5 输入、七输出顺序与 Caller-Owned
 
-以下按当前 `b9d12863c2` 的 MTP LIM ABI 说明。`B` 是请求行数，`T` 是本次物理
+以下按本轮 TopK2048 的 MTP LIM ABI 说明。`B` 是请求行数，`T` 是本次物理
 TND query 行数，`H_idx=32/64`为Indexer head数，`P/W` 是 pool 行数/物理行宽，`M` 是 Indexer
-block-table 列数。非 MTP 使用相同输入前缀，但 `T=B`，输出只有五项。
+block-table 列数。非 MTP 仍保留 `candidate_lens` 输入名和候选域语义，`T=B`，输出只有五项。
 
 | Torch 位置，0 起 | 输入 | dtype / shape 与语义 |
 |---|---|---|
@@ -935,7 +934,7 @@ block-table 列数。非 MTP 使用相同输入前缀，但 `T=B`，输出只有
 | 4 | `index_key_cache` | FP8 `[N_idx,128,1,128]`，仅 block 轴允许 padding |
 | 5 | `index_key_dequant_scale` | FP32 `[N_idx,128,1]`；Python 可将四维 singleton view `squeeze(2)`，不复制 |
 | 6 | `index_block_table` | INT32 `[B,M]`，完整 Indexer 的物理表 |
-| 7～10 | `candidate_lens/final_seq_lengths_kv/row_modes/req_pool_entries` | 各 INT32 `[B]`，请求级候选域、长度、模式和稳定 pool 行 |
+| 7～10 | `offloaded_lens/final_seq_lengths_kv/row_modes/req_pool_entries` | 各 INT32 `[B]`，durable 前缀 D、最终长度 L、模式和稳定 pool 行；LI 逐 query 搜索 `[0,L-(Q_b-1-r))` |
 | 11 | `cache_slots_pool` | INT32 `[P,W]`，可变持久输入，不计入七输出 |
 
 native 静态检查要求 `B>0`、`B<=T<=4B`、`P>0`、`2<=W<=262145`、
@@ -946,10 +945,10 @@ Torch adapter 的输出 shape/device/contiguous 检查与 host tiling 的输入�
 
 | Torch 位置 | 七输出，顺序不可变 | INT32 shape | 当前消费方 |
 |---|---|---|---|
-| 12 | `sparse_and_tail_slots` | `[T,1,2304]` | QSFA，resident logical slots |
-| 13 | `sparse_and_tail_src_ids` | `[T,1,2304]` | 与 slots 逐元素配对的完整序列 token ID；为后续融合保留 |
+| 12 | `topk_slots` | `[T,1,2048]` | QSFA/CopySFA，入选 token 的 resident logical slots |
+| 13 | `topk_index` | `[T,1,2048]` | 与 slots 逐元素配对的原始逻辑 token ID |
 | 14 | `per_query_miss_counts` | `[T]` | 每 query 的 durable-prefix topK miss 前缀长度；当前不传 KSC |
-| 15 | `resident_seq_lengths` | `[B]` | QSFA 可寻址 span；SPARSE 为 budget+256，不是 2304 |
+| 15 | `resident_seq_lengths` | `[B]` | QSFA 可寻址 span；SPARSE 为 budget+256，不是 2048 |
 | 16 | `copy_src_ids` | `[B,1,16384]` | 请求内去重后的 KSC 源 token |
 | 17 | `copy_dst_slots` | `[B,1,16384]` | 与 copy source 配对的目的 resident slot |
 | 18 | `copy_counts` | `[B]` | KSC 有效前缀长度 |
@@ -979,8 +978,8 @@ non-MTP 与 MTP fast 不整行清空两张 copy 表；MTP cold manager 每请求
 同一 token 可被多个 query 选择，`sum(per_query_miss_counts)` 不等于 union
 `copy_counts`；first-fill 的 copy count 还可能达到完整 budget。
 
-七张输出本身需要 `18436*T + 131080*B` 字节；旧五输出 MTP/2176 为
-`8704*T + 131080*B`，增量为 `9732*T`，不含 pool、workspace 或 allocator
+七张输出本身需要 `16388*T + 131080*B` 字节；旧七输出 MTP/2304 为
+`18436*T + 131080*B`，减少 `2048*T`，不含 pool、workspace 或 allocator
 对齐。runtime 的 query owner 按 `max_num_seqs*4` 预留，但实际 eager 按 T 切片，
 不能把每次 T 强制当成 `4B`；请求 copy owner 始终按 B 切片。
 
@@ -1176,7 +1175,7 @@ resident budget或payload身份，这些仍由producer/runtime负责。
 B/H下发为UINT32而当前没有统一的极值截窄检查；physical ID值又是非负INT32，
 因此不能把未拒绝的超大shape解释成任意UINT32 ID均可表达。
 
-KSC不接收请求query ends、query级miss、2176/2304 attention表或多层arena列表。
+KSC不接收请求query ends、query级miss、2176/2048 attention表或多层arena列表。
 框架non-MTP和MTP都传请求级copy src/dst/count，MTP的
 `per_query_miss_counts[T]`不能替代`copy_counts[B]`。
 non-MTP预算6144/10240/12288、MTP预算8192/10240/12288属于框架/producer子集，
@@ -2335,10 +2334,10 @@ condense/reorder 时必须保留该请求的 resident/DRAM 所有权。
 另需单独测量 QSFA wrapper 的 `query.contiguous()`：输入已连续时它返回原
 tensor，否则仍可能产生逐层拷贝。A5 weights 已消除临时拷贝，不代表所有 query
 路径都已证明零分配。QSFA 读取 BF16 `[T,H,576]` 的 NOPE/RoPE，输出 BF16
-`[T,H,512]`；当前参数固定 `sparse_block_size=1`、`sparse_mode=3`、
+`[T,H,512]`；当前参数固定 `sparse_block_size=1`，非 MTP `sparse_mode=3`、MTP `sparse_mode=0`，
 `attention_mode=2`、`quant_scale_repo_mode=1`、`tile_size=128`、
 `key_quant_mode=value_quant_mode=2`、`rope_head_dim=64`，布局为 TND/PA_BSND。
-wrapper 原样传完整 2176/2304 sparse indices 和请求级 resident span，不截断或重排。
+wrapper 原样传完整 2176/2048 sparse indices 和请求级 resident span，不截断或重排。
 
 ## 16. 代码索引
 
@@ -2507,7 +2506,7 @@ P6-B正常管理主闭环已通过端到端验收，异常/退出矩阵尚未完
 
 | 链路节点 | 仓库路径 | 必须同步的合同 |
 |---|---|---|
-| Python/owner | [ops.py](../../../../../vllm_ascend/dsa_offload/ops.py)、[runtime.py](../../../../../vllm_ascend/dsa_offload/runtime.py)、[contracts.py](../../../../../vllm_ascend/dsa_offload/contracts.py) | 七输出次序、T/B 切片、2176/2304 分离及固定地址 |
+| Python/owner | [ops.py](../../../../../vllm_ascend/dsa_offload/ops.py)、[runtime.py](../../../../../vllm_ascend/dsa_offload/runtime.py)、[contracts.py](../../../../../vllm_ascend/dsa_offload/contracts.py) | 七输出次序、T/B 切片、2176/2048 分离及固定地址 |
 | Torch schema/dispatch | [torch_binding.cpp](../../../../../csrc/torch_binding.cpp) | mutation 标记、参数数目、PrivateUse1 adapter，不只检查符号存在 |
 | LIM adapter | [vllm_a5_li_manage_c8_torch_adpt.h](../../../../../csrc/attention/vllm_a5_li_manage_c8/vllm_a5_li_manage_c8_torch_adpt.h) | dtype/shape/device/stride 检查，12+3 attrs+7 ACLNN 顺序 |
 | OpDef/推形/tiling | [LIM OpDef](../../../../../csrc/attention/vllm_a5_li_manage_c8/op_host/vllm_a5_li_manage_c8_def.cpp)、[InferShape](../../../../../csrc/attention/vllm_a5_li_manage_c8/op_host/vllm_a5_li_manage_c8_infershape.cpp)、[Tiling](../../../../../csrc/attention/vllm_a5_li_manage_c8/op_host/vllm_a5_li_manage_c8_tiling.cpp) | `_def.cpp` 注册输入/attrs/输出；`_infershape.cpp` 由 T/B 推导七输出；`_tiling.cpp` 检查输入并分配 workspace |
@@ -2531,11 +2530,12 @@ worker required-op set 按 A3/A5 和是否启用 MTP 选择，A5 还检查原生
 |---|---:|---:|
 | `43a533145f`、迁移前 `d77f8a383c` | 17 / 5 | 2176 |
 | 候选 `d44387d3a9` | 19 / 7 | 2176 |
-| 候选 `3f644e34ec`、`3b5d0ecdc0` 及已增量接入的当前合同 | 19 / 7 | 2304 |
+| 候选 `3f644e34ec`、`3b5d0ecdc0` 及迁移前的合同 | 19 / 7 | 2304 |
+| 当前同步单算子仓 `6732a649a3`，全可见域 TopK | 19 / 7；输入改名 offloaded_lens，输出 topk_slots/topk_index | 2048 |
 
-当前初始化已检查 19 参数及七输出名称顺序，不能继续说它“只查名字”。但 schema
-不含列宽，也不认证已加载 kernel 的构建哈希，仍无法仅凭这一检查区分同签名的
-七输出/2176 旧包。完整升级需同时生成/构建/部署 ACLNN API、host、kernel、
+当前初始化检查 19 参数、新输入名及七输出名称顺序，可拒绝旧命名的 MTP schema。
+但 schema 不含列宽，也不认证已加载 kernel 的构建哈希，不能据此接受新 binding
+搭配旧 CANN 二进制。完整升级需同时生成/构建/部署 ACLNN API、host、kernel、
 Torch extension 和 Python owner，重启 worker、重新捕获图，不支持只换一个 so。
 
 KSC 同样存在内部 tiling ABI：`43a533145f/d77f8a383c` 以及候选
@@ -2550,7 +2550,7 @@ offset 从 32 变为 40。
 
 ## 17. 内容对应的验证合同
 
-本节LIM/KSC/QSFA、2176/2304、跨batch FIFO及A5 runner门禁主要属于A5。
+本节LIM/KSC/QSFA、2176/2048、跨batch FIFO及A5 runner门禁主要属于A5。
 A3三算子的完整合同见第19至23节；不能把A5通过记录自动计入A3验收，本轮A3
 静态源码核验也不新增设备执行证据。
 
@@ -2573,8 +2573,8 @@ A3三算子的完整合同见第19至23节；不能把A5通过记录自动计入
 存在的其他 steady 行计作 fast 覆盖。late-group cold、cold 短 Q、全 first-fill
 大 batch 和 production-owner padding 链仍需分别确认执行证据。
 
-独立 oracle 应从各 query 的 shared D 或 DENSE visible length 生成原生 R1 LI
-topK，检查完整 pool、source/slot 配对、union count、causal tail 和无效区；不能
+独立 oracle 应从各 query 的完整 visible length 生成原生 R1 LI TopK，
+检查完整 pool、source/slot 配对、prefix union count、入选 tail 和无效区；不能
 只把被测 slots 再交给同一算子当唯一 golden。KSC 的 6708 组历史 CPU ownership/
 FIFO 枚举仅验证算术模型，不替代 MTE、真实 swapped、邻行 guard 硬件验证。
 同理，chunked prefill `max_tokens=1` 只证明首采样，不能证明 ENTER/steady decode。
@@ -2586,7 +2586,7 @@ FIFO 枚举仅验证算术模型，不替代 MTE、真实 swapped、邻行 guard
 设超时。正常 framework/native 阶段没有整体超时，也不核验全部同签名二进制哈希。
 该入口不涵盖所有 worker/spec_decode/examples UT，不能把一次 PASSED 当成全仓认证。
 
-旧 MTP 2176 与当前 2304 的 attention 策略不同，验收应分开；同一新策略下的
+旧 MTP 2176/2304 与当前全可见 TopK2048 的 attention 策略不同，验收应分开；同一新策略下的
 Local/External、eager/graph、pool 行置换才能作为相应等价关系的对照。单机 DP
 正常功能已适配，但不据客户端 COMPLETED 外推每轮 graph replay、逐 rank 真实
 L3 get、完整 logits、长稳或干净退出均通过。变更交付需保留有效配置、版本、
@@ -2642,19 +2642,19 @@ TopK结果再写入模型已有共享Indexer输出buffer供follower读取。此�
 |---|---|
 | `query` | 模型MLA query，NOPE+RoPE共576维；调用前`.contiguous()`，输入已连续时不复制 |
 | `key` / `value` | 同一个packed-C8 cache对象；内容按656B record解释，不建立独立V副本 |
-| `sparse_indices` | LIM/LIDU原样产出的INT32 `[T,1,2304]`或`[B,1,2176]`；无效槽为-1，不在wrapper重排或裁剪 |
+| `sparse_indices` | LIM/LIDU原样产出的INT32 `[T,1,2048]`或`[B,1,2176]`；无效槽为-1，不在wrapper重排或裁剪 |
 | `block_table` | 本层MLA物理块表，与sparse slot共同寻址 |
 | `actual_seq_lengths_query` | B行累计query end，不能用T行长度替代 |
 | `actual_seq_lengths_kv` | B行`resident_seq_lengths`，是可寻址span，不是每query实际有效key数 |
 | `scale_value` | 模型提供的attention scale，转为Python float属性 |
-| 布局与稀疏属性 | TND/PA_BSND，`sparse_block_size=1`、`sparse_mode=3`、`attention_mode=2` |
+| 布局与稀疏属性 | TND/PA_BSND，`sparse_block_size=1`、`attention_mode=2`；MTP `sparse_mode=0`，非 MTP `sparse_mode=3` |
 | packed量化属性 | `quant_scale_repo_mode=1`、`tile_size=128`、`key_quant_mode=value_quant_mode=2`、`rope_head_dim=64` |
 | 返回处理 | 若返回tuple取第0项，否则直接返回Tensor；输出由native算子创建，通常为`[T,H,512]`的模型计算dtype |
 
-Wrapper只显式检查最后一维是2176或2304，并不据此检查全部shape、dtype或source
+Wrapper只显式检查最后一维是2176或2048，并不据此检查全部shape、dtype或source
 identity。完整约束还依赖LIM输出、runtime固定owner及native接口。对MTP而言，
-`budget+256`的KV span不意味着所有256个tail槽都参与计算；LIM按每query因果可见
-位置填槽，其余为-1。当前不要求把普通attention激活输出改为caller-owned out，
+`budget+256`的KV span不意味着所有256个tail槽都参与计算；只有入选TopK的tail
+参与计算，LIM在逻辑域排除未来token。短DENSE/PAD的无效后缀仍为-1。当前不要求把普通attention激活输出改为caller-owned out，
 固定owner约束主要作用于metadata、持久映射和跨层复用scratch。
 
 ## 19. A3 非 MTP 算子边界
@@ -2716,7 +2716,7 @@ LIDU 写 caller-owned 四输出和 `cache_slots`；KSC 写 caller-owned 两个 H
 | Indexer query/key | BF16 `[B,H_idx,128]` / `[P_idx,128,1,128]` | FP8 E4M3FN `[T,H_idx,128]` / `[P_idx,128,1,128]`，另有 FP32 query/key scales；非 MTP T=B |
 | weights | BF16 `[B,H_idx]`；wrapper 压紧行 stride，不转换 dtype | BF16 `[T,H_idx]`；保留行 stride、内层 stride=1，adapter 向 ACLNN 传 weight_stride，不做 A3 的 `.contiguous()` |
 | Indexer scale/cache view | 无独立 scale 输入，所有 LIDU 输入连续 | key scale 可从 `[P_idx,128,1,1]` squeeze 成 `[P_idx,128,1]`；底层 adapter 允许 key/scale block 轴 padding，但当前 worker 绑定检查仍要求连续 cache |
-| MLA 与 attention metadata | 两张 BF16 NOPE/RoPE plane；16384 列 slots 加独立 tail_info；SFA 传原始 L | packed cache `[P_h,128,1,656]`；non-MTP 2176、MTP 2304 列 attention owner，与请求级 copy plan 分离；QSFA 传 resident span |
+| MLA 与 attention metadata | 两张 BF16 NOPE/RoPE plane；16384 列 slots 加独立 tail_info；SFA 传原始 L | packed cache `[P_h,128,1,656]`；non-MTP 2176、MTP 2048 列 attention owner，与请求级 copy plan 分离；QSFA 传 resident span |
 
 A5 query 的 Hadamard/动态量化发生在 `sfa_v1.py` 的 C8 分支；不能把“量化 query/key”理解成“weights 也转 FP8”。A5 key scale 的 squeeze 与 KSC packed byte view 也不是数值重算。上述区别由 `sfa_v1.py:1681-1730`、`ops.py:117-177,203-371`、两份 A5 Torch adapter 及 `model_runner_v1.py:5063-5087` 交叉核定。
 
@@ -2746,7 +2746,7 @@ tail resident slot = [C_b,C_b+tail_b)
 
 `C_b<=D_b`，因此合法 tail slot 同时小于 `C_b+128` 且小于 `L_b`。序列对齐边界仍保留一整块：例如 `L=6400` 时 `D=6272,tail=128`，`L=6401` 才变为 `D=6400,tail=1`。不能把所有 tail 都称为“不满块”，也不能把 tail 改成零。
 
-DENSE 不追加尾块，SFA key 集合为完整序列的 TopK；SPARSE 使用历史 Top2048 与整个有效 tail 的并集，二者不承诺与原生不卸载 DSA 逐 token 等价。A5 MTP 的共同 durable D、双 parity tail 和 2304 列合同另见第 11 节及 MTP 专题，不用本节单尾公式代替。
+DENSE 不追加尾块，SFA key 集合为完整序列的 TopK；SPARSE 使用历史 Top2048 与整个有效 tail 的并集，二者不承诺与原生不卸载 DSA 逐 token 等价。A5 MTP 则使用完整可见域 Top2048，其 durable D、双 parity tail 存储和输出合同另见第 11 节及 MTP 专题，不用本节单尾公式代替。
 
 源码：`dsa_offload/request_cache_layout.py:129-141,149-240`，`dsa_offload/runtime.py:726-792`，LIDU `op_kernel/lightning_indexer_decode_update_kernel.h:197-264`。
 

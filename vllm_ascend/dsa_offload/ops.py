@@ -115,19 +115,31 @@ def require_dsa_offload_ops(
     if packed_c8 and mtp:
         schema = torch.ops._C_ascend.npu_dsa_a5_li_manage_c8_out.default._schema
         expected_outputs = (
-            "sparse_and_tail_slots",
-            "sparse_and_tail_src_ids",
+            "topk_slots",
+            "topk_index",
             "per_query_miss_counts",
             "resident_seq_lengths",
             "copy_src_ids",
             "copy_dst_slots",
             "copy_counts",
         )
-        if len(schema.arguments) != 19 or tuple(arg.name for arg in schema.arguments[12:]) != expected_outputs:
+        if (
+            len(schema.arguments) != 19
+            or schema.arguments[7].name != "offloaded_lens"
+            or tuple(arg.name for arg in schema.arguments[12:]) != expected_outputs
+        ):
             raise RuntimeError(
-                "DSA A5 MTP requires the seven-output LIM ABI with 2304-column attention rows; "
+                "DSA A5 MTP requires the full-visible TopK2048 LIM ABI "
+                "(offloaded_lens, topk_slots, topk_index); "
                 "rebuild and reinstall both the CANN custom operators and vllm_ascend_C, then restart the worker"
             )
+    if fused_copy_sfa:
+        schema = torch.ops._C_ascend.npu_dsa_a5_fused_copy_sfa_c8_out.default._schema
+        if len(schema.arguments) != 15 or tuple(arg.name for arg in schema.arguments[5:7]) != (
+            "topk_slots",
+            "topk_index",
+        ):
+            raise RuntimeError("DSA A5 CopySFA requires the TopK2048 ABI; rebuild the CANN operators and vllm_ascend_C")
 
 
 def _packed_byte_view(cache: torch.Tensor, *, name: str) -> torch.Tensor:
@@ -265,23 +277,22 @@ def a5_lightning_indexer_decode_update_mtp_c8(
     index_key_cache: torch.Tensor,
     index_key_dequant_scale: torch.Tensor,
     index_block_table: torch.Tensor,
-    candidate_lens: torch.Tensor,
+    offloaded_lens: torch.Tensor,
     final_seq_lengths_kv: torch.Tensor,
     row_modes: torch.Tensor,
     req_pool_entries: torch.Tensor,
     cache_slots: torch.Tensor,
-    attention_slots: torch.Tensor,
-    attention_src_ids: torch.Tensor,
+    topk_slots: torch.Tensor,
+    topk_index: torch.Tensor,
     per_query_miss_counts: torch.Tensor,
     resident_seq_lengths: torch.Tensor,
     outputs: DSALightningIndexerOutputs,
 ) -> None:
     """调用 A5 多 query LIM；copy plan 保持请求轴，attention 保持 TND 轴。
 
-    SPARSE 的每条 query 独立在共享 durable prefix 上选 topK，再追加
-    因果可见的双尾；配对 attention 输出为 [T,1,2304]，resident span=C+256。
-    tail 不参与 LI 或 union copy。七输出依次为 slots、src_ids、query miss、
-    resident span、copy src/dst/count，均保持 caller-owned；旧五输出需升级。
+    每条 query 在完整因果可见 KV 上选 TopK2048，不再追加 tail。入选 tail
+    为 hit，slot=C+token%256；仅 durable prefix 参与 union copy 和淘汰。
+    配对输出为 [T,1,2048]，SPARSE resident span 仍为 C+256，均 caller-owned。
     """
 
     index_key_dequant_scale = _normalize_a5_indexer_key_scale(index_key_dequant_scale)
@@ -293,13 +304,13 @@ def a5_lightning_indexer_decode_update_mtp_c8(
         index_key_cache,
         index_key_dequant_scale,
         index_block_table,
-        candidate_lens,
+        offloaded_lens,
         final_seq_lengths_kv,
         row_modes,
         req_pool_entries,
         cache_slots,
-        attention_slots,
-        attention_src_ids,
+        topk_slots,
+        topk_index,
         per_query_miss_counts,
         resident_seq_lengths,
         outputs.topk_index,
@@ -381,7 +392,7 @@ def sparse_flash_attention_for_offload_c8(
     actual_seq_lengths_query: torch.Tensor,
     resident_seq_lengths: torch.Tensor,
 ) -> torch.Tensor:
-    """直接消费 LIM 输出：非 MTP 2176 列、MTP 2304 列，不裁剪或重排。"""
+    """直送 LIM 输出：非 MTP 2176 列保持 mode=3，MTP 2048 列使用 mode=0。"""
 
     if sparse_indices.shape[-1] not in (
         DSA_A5_NOMTP_ATTENTION_CAPACITY,
@@ -405,7 +416,8 @@ def sparse_flash_attention_for_offload_c8(
         actual_seq_lengths_kv=resident_seq_lengths,
         layout_query="TND",
         layout_kv="PA_BSND",
-        sparse_mode=3,
+        # MTP 已由 LIM 按逻辑 token 排除未来项，resident slot 不是因果位置。
+        sparse_mode=0 if sparse_indices.shape[-1] == DSA_A5_MTP_ATTENTION_CAPACITY else 3,
         attention_mode=2,
         quant_scale_repo_mode=1,
         tile_size=128,

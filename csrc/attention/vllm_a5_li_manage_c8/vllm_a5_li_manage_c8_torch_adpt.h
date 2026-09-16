@@ -16,13 +16,13 @@ inline void npu_dsa_a5_li_manage_c8_out(
     const at::Tensor& index_key_cache,
     const at::Tensor& index_key_dequant_scale,
     const at::Tensor& index_block_table,
-    const at::Tensor& candidate_lens,
+    const at::Tensor& offloaded_lens,
     const at::Tensor& final_seq_lengths_kv,
     const at::Tensor& row_modes,
     const at::Tensor& req_pool_entries,
     at::Tensor cache_slots_pool,
-    at::Tensor sparse_and_tail_slots,
-    at::Tensor sparse_and_tail_src_ids,
+    at::Tensor topk_slots,
+    at::Tensor topk_index,
     at::Tensor per_query_miss_counts,
     at::Tensor resident_seq_lengths,
     at::Tensor copy_src_ids,
@@ -31,7 +31,7 @@ inline void npu_dsa_a5_li_manage_c8_out(
 {
     constexpr int64_t block_size = 128;
     constexpr int64_t head_dim = 128;
-    constexpr int64_t attention_capacity = 2304;
+    constexpr int64_t attention_capacity = 2048;
     constexpr int64_t copy_capacity = 16384;
     constexpr int64_t max_source_capacity = 1 << 18;
     constexpr int64_t max_queries_per_request = 4;
@@ -82,10 +82,10 @@ inline void npu_dsa_a5_li_manage_c8_out(
                 "cache block axis.");
 
     const at::Tensor* int_tensors[] = {
-        &actual_seq_lengths_query, &index_block_table, &candidate_lens,
+        &actual_seq_lengths_query, &index_block_table, &offloaded_lens,
         &final_seq_lengths_kv, &row_modes, &req_pool_entries,
-        &cache_slots_pool, &sparse_and_tail_slots, &resident_seq_lengths,
-        &sparse_and_tail_src_ids, &per_query_miss_counts,
+        &cache_slots_pool, &topk_slots, &resident_seq_lengths,
+        &topk_index, &per_query_miss_counts,
         &copy_src_ids, &copy_dst_slots, &copy_counts};
     for (const at::Tensor* tensor : int_tensors) {
         TORCH_CHECK(tensor->scalar_type() == at::kInt,
@@ -103,8 +103,8 @@ inline void npu_dsa_a5_li_manage_c8_out(
                     index_block_table.size(1) > 0 &&
                     index_block_table.size(1) * block_size <=
                         max_source_capacity &&
-                    candidate_lens.dim() == 1 &&
-                    candidate_lens.size(0) == batch &&
+                    offloaded_lens.dim() == 1 &&
+                    offloaded_lens.size(0) == batch &&
                     final_seq_lengths_kv.dim() == 1 &&
                     final_seq_lengths_kv.size(0) == batch &&
                     row_modes.dim() == 1 && row_modes.size(0) == batch &&
@@ -115,12 +115,12 @@ inline void npu_dsa_a5_li_manage_c8_out(
                     cache_slots_pool.size(1) >= 2 &&
                     cache_slots_pool.size(1) <= max_source_capacity + 1,
                 "DSA A5 MTP LIM request metadata shapes are invalid.");
-    TORCH_CHECK(sparse_and_tail_slots.dim() == 3 &&
-                    sparse_and_tail_slots.size(0) == total_query_rows &&
-                    sparse_and_tail_slots.size(1) == 1 &&
-                    sparse_and_tail_slots.size(2) == attention_capacity &&
-                    sparse_and_tail_src_ids.sizes() ==
-                        sparse_and_tail_slots.sizes() &&
+    TORCH_CHECK(topk_slots.dim() == 3 &&
+                    topk_slots.size(0) == total_query_rows &&
+                    topk_slots.size(1) == 1 &&
+                    topk_slots.size(2) == attention_capacity &&
+                    topk_index.sizes() ==
+                        topk_slots.sizes() &&
                     per_query_miss_counts.dim() == 1 &&
                     per_query_miss_counts.size(0) == total_query_rows &&
                     resident_seq_lengths.dim() == 1 &&
@@ -132,16 +132,16 @@ inline void npu_dsa_a5_li_manage_c8_out(
                     copy_dst_slots.sizes() == copy_src_ids.sizes() &&
                     copy_counts.dim() == 1 && copy_counts.size(0) == batch,
                 "DSA A5 MTP LIM caller-owned output shapes are invalid; "
-                "paired attention outputs must be [T,1,2304].");
+                "paired attention outputs must be [T,1,2048].");
 
     const auto device = query.device();
     const at::Tensor* tensors[] = {
         &index_weights, &query, &query_dequant_scale,
         &actual_seq_lengths_query, &index_key_cache,
-        &index_key_dequant_scale, &index_block_table, &candidate_lens,
+        &index_key_dequant_scale, &index_block_table, &offloaded_lens,
         &final_seq_lengths_kv, &row_modes, &req_pool_entries,
-        &cache_slots_pool, &sparse_and_tail_slots, &resident_seq_lengths,
-        &sparse_and_tail_src_ids, &per_query_miss_counts,
+        &cache_slots_pool, &topk_slots, &resident_seq_lengths,
+        &topk_index, &per_query_miss_counts,
         &copy_src_ids, &copy_dst_slots, &copy_counts};
     for (const at::Tensor* tensor : tensors) {
         TORCH_CHECK(tensor->device() == device,
@@ -149,9 +149,9 @@ inline void npu_dsa_a5_li_manage_c8_out(
     }
     const at::Tensor* contiguous_tensors[] = {
         &query, &query_dequant_scale, &actual_seq_lengths_query,
-        &index_block_table, &candidate_lens, &final_seq_lengths_kv,
+        &index_block_table, &offloaded_lens, &final_seq_lengths_kv,
         &row_modes, &req_pool_entries, &cache_slots_pool,
-        &sparse_and_tail_slots, &sparse_and_tail_src_ids,
+        &topk_slots, &topk_index,
         &per_query_miss_counts, &resident_seq_lengths,
         &copy_src_ids, &copy_dst_slots, &copy_counts};
     for (const at::Tensor* tensor : contiguous_tensors) {
@@ -170,7 +170,7 @@ inline void npu_dsa_a5_li_manage_c8_out(
                  index_key_cache,
                  index_key_dequant_scale,
                  index_block_table,
-                 candidate_lens,
+                 offloaded_lens,
                  final_seq_lengths_kv,
                  row_modes,
                  req_pool_entries,
@@ -178,8 +178,8 @@ inline void npu_dsa_a5_li_manage_c8_out(
                  key_stride,
                  scale_stride,
                  weight_stride,
-                 sparse_and_tail_slots,
-                 sparse_and_tail_src_ids,
+                 topk_slots,
+                 topk_index,
                  per_query_miss_counts,
                  resident_seq_lengths,
                  copy_src_ids,

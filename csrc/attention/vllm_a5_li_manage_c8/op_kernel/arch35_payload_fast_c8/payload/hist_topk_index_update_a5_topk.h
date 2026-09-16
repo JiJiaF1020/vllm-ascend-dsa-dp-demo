@@ -432,13 +432,21 @@ public:
         uint32_t loopIndex,
         uint32_t s2LoopNum,
         bool allowSlotPrefetch,
-        uint32_t slotPrefetchCap)
+        uint32_t slotPrefetchCap,
+        uint32_t offloadedLen,
+        uint32_t cacheBudget)
     {
-        uint32_t prefetchLen = currentValidLen;
+        // Only the durable prefix has reverse-map entries. Tail keys take
+        // part in exactly the same score TopK, but their slots are resident
+        // in the two parity blocks, never misses or eviction candidates.
+        const uint32_t prefixLen = tokenBase >= offloadedLen ? 0U :
+            VllmFastHistTopkIndexUpdateA5Common::Min(currentValidLen, offloadedLen - tokenBase);
+        uint32_t prefetchLen = prefixLen;
         if (prefetchLen > slotPrefetchCap) {
             prefetchLen = slotPrefetchCap;
         }
-        if (allowSlotPrefetch) {
+        const bool prefetch = allowSlotPrefetch && prefetchLen != 0U;
+        if (prefetch) {
             // Final requests may prefetch the full 16K trunk through resMm1;
             // earlier requests prefetch a 2K prefix through slotStage scratch.
             StartCurrentSlotsPrefetch(
@@ -454,19 +462,32 @@ public:
 
         // inputValueLocal is no longer consumed after LiTopKVF, so compact
         // the slot prefetch into it before gathering survivor payloads.
-        if (allowSlotPrefetch) {
+        if (prefetch) {
             FinishCurrentSlotsPrefetch(
                 inputValueLocal, slotPrefetchLocal, prefetchLen);
-            if (prefetchLen < currentValidLen) {
+            if (prefetchLen < prefixLen) {
                 LoadCurrentSlotsCompactRange(
                     inputValueLocal, slotStageLocal, cachedSlotsGm,
                     slotOffset + tokenBase, prefetchLen,
-                    currentValidLen, slotStageLen);
+                    prefixLen, slotStageLen);
             }
         } else {
             LoadCurrentSlotsCompact(
                 inputValueLocal, slotStageLocal, cachedSlotsGm,
-                slotOffset + tokenBase, currentValidLen, slotStageLen);
+                slotOffset + tokenBase, prefixLen, slotStageLen);
+        }
+
+        if (prefixLen < currentValidLen) {
+            // At most 256 tail entries. Order scalar sidecar stores after
+            // the histogram/slot casts and before payload vector gather.
+            SetFlag<HardEvent::V_S>(EVENT_ID6);
+            WaitFlag<HardEvent::V_S>(EVENT_ID6);
+            for (uint32_t i = prefixLen; i < currentValidLen; ++i) {
+                inputValueLocal.SetValue(i, static_cast<uint16_t>(
+                    cacheBudget + (tokenBase + i) % 256U));
+            }
+            SetFlag<HardEvent::S_V>(EVENT_ID6);
+            WaitFlag<HardEvent::S_V>(EVENT_ID6);
         }
 
         uint32_t previousLen = loopIndex == 0
@@ -584,7 +605,9 @@ public:
         uint32_t loopIndex,
         uint32_t s2LoopNum,
         bool allowSlotPrefetch,
-        uint32_t slotPrefetchCap)
+        uint32_t slotPrefetchCap,
+        uint32_t offloadedLen,
+        uint32_t cacheBudget)
     {
 #if LI_UPDATE_ABLATION_MODE >= 2
         RunSidecarPayload(
@@ -592,7 +615,7 @@ public:
             slotPrefetchLocal, slotStageLocal,
             cachedSlotsGm, slotOffset, tokenBase,
             slotStageLen, validLen, currentValidLen, loopIndex, s2LoopNum,
-            allowSlotPrefetch, slotPrefetchCap);
+            allowSlotPrefetch, slotPrefetchCap, offloadedLen, cacheBudget);
 #else
         RunTokenPayloadOnly(
             inputValueLocal, payloadOutLocal, scoreOutLocal,

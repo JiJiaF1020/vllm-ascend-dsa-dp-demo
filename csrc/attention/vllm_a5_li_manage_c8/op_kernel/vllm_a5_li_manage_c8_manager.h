@@ -3,8 +3,8 @@
  *
  * One AIV processes one request and its 1..4 TND query rows.  It builds the
  * unique union of those rows, updates the persistent source-token -> HBM-slot
- * mapping once, publishes one copy list per request, and publishes the full
- * top-2048 + causal-tail sparse index row consumed by the native A5 C8 SFA.
+ * mapping once, publishes one prefix copy list per request, and publishes the
+ * full-visible-domain top-2048 index row consumed by the native A5 C8 SFA.
  */
 
 #include "kernel_operator.h"
@@ -23,7 +23,7 @@ constexpr uint32_t TAIL_CAPACITY = 2 * BLOCK_SIZE;
 constexpr uint32_t TAIL_BLOCK_COUNT = 2;
 constexpr uint32_t TAIL_STORAGE_CAPACITY =
     TAIL_BLOCK_COUNT * BLOCK_SIZE;
-constexpr uint32_t ATTENTION_CAPACITY = TOPK + TAIL_CAPACITY;
+constexpr uint32_t ATTENTION_CAPACITY = TOPK;
 constexpr uint32_t OUTPUT_CAPACITY = 16384;
 constexpr uint32_t MAX_QUERIES_PER_REQUEST = 4;
 constexpr uint32_t CACHE_CHUNK = 2048;
@@ -61,10 +61,10 @@ public:
 
     __aicore__ inline void Init(
         GM_ADDR topkIndices, GM_ADDR actualSeqLengthsQuery,
-        GM_ADDR candidateLens, GM_ADDR finalSeqLengthsKv,
+        GM_ADDR offloadedLens, GM_ADDR finalSeqLengthsKv,
         GM_ADDR rowModes, GM_ADDR reqPoolEntries,
-        GM_ADDR cacheSlotsPool, GM_ADDR sparseAndTailSlots,
-        GM_ADDR sparseAndTailSrcIds, GM_ADDR perQueryMissCounts,
+        GM_ADDR cacheSlotsPool, GM_ADDR topkSlots,
+        GM_ADDR topkIndex, GM_ADDR perQueryMissCounts,
         GM_ADDR residentSeqLengths, GM_ADDR copySrcIds,
         GM_ADDR copyDstSlots, GM_ADDR copyCounts,
         uint32_t coreIdx, uint32_t topkRowStride)
@@ -74,16 +74,16 @@ public:
         topkIndicesGm_.SetGlobalBuffer((__gm__ int32_t *)topkIndices);
         actualSeqLengthsQueryGm_.SetGlobalBuffer(
             (__gm__ int32_t *)actualSeqLengthsQuery);
-        candidateLensGm_.SetGlobalBuffer((__gm__ int32_t *)candidateLens);
+        offloadedLensGm_.SetGlobalBuffer((__gm__ int32_t *)offloadedLens);
         finalSeqLengthsKvGm_.SetGlobalBuffer(
             (__gm__ int32_t *)finalSeqLengthsKv);
         rowModesGm_.SetGlobalBuffer((__gm__ int32_t *)rowModes);
         reqPoolEntriesGm_.SetGlobalBuffer((__gm__ int32_t *)reqPoolEntries);
         cacheSlotsPoolGm_.SetGlobalBuffer((__gm__ int32_t *)cacheSlotsPool);
-        sparseAndTailSlotsGm_.SetGlobalBuffer(
-            (__gm__ int32_t *)sparseAndTailSlots);
-        sparseAndTailSrcIdsGm_.SetGlobalBuffer(
-            (__gm__ int32_t *)sparseAndTailSrcIds);
+        topkSlotsGm_.SetGlobalBuffer(
+            (__gm__ int32_t *)topkSlots);
+        topkIndexGm_.SetGlobalBuffer(
+            (__gm__ int32_t *)topkIndex);
         perQueryMissCountsGm_.SetGlobalBuffer(
             (__gm__ int32_t *)perQueryMissCounts);
         residentSeqLengthsGm_.SetGlobalBuffer(
@@ -252,9 +252,9 @@ private:
     {
         const uint64_t offset =
             static_cast<uint64_t>(queryRow) * ATTENTION_CAPACITY;
-        StoreRange(sparseAndTailSlotsGm_[offset], slots, ATTENTION_CAPACITY);
+        StoreRange(topkSlotsGm_[offset], slots, ATTENTION_CAPACITY);
         StoreRange(
-            sparseAndTailSrcIdsGm_[offset], sources, ATTENTION_CAPACITY);
+            topkIndexGm_[offset], sources, ATTENTION_CAPACITY);
     }
 
     __aicore__ inline void ClearAttentionRows(
@@ -267,37 +267,6 @@ private:
         WriteOutputScalar(perQueryMissCountsGm_[queryRow], missCount);
     }
 
-    __aicore__ inline bool AppendCausalTail(
-        uint32_t queryRow, uint32_t queryEnd,
-        uint32_t sourceLen, uint32_t finalLen, uint32_t budget,
-        LocalTensor<int32_t> slots, LocalTensor<int32_t> sources)
-    {
-        const uint32_t laterQueries = queryEnd - 1U - queryRow;
-        if (finalLen <= laterQueries) {
-            return false;
-        }
-        const uint32_t visibleLen = finalLen - laterQueries;
-        const uint32_t tailTokenStart = sourceLen;
-        if (visibleLen < tailTokenStart) {
-            return false;
-        }
-        const uint32_t tailCount = visibleLen - tailTokenStart;
-        if (tailCount > TAIL_CAPACITY) {
-            return false;
-        }
-        for (uint32_t index = 0; index < tailCount; ++index) {
-            const uint32_t token = tailTokenStart + index;
-            slots.SetValue(
-                TOPK + index,
-                static_cast<int32_t>(
-                    budget + token % TAIL_STORAGE_CAPACITY));
-            sources.SetValue(TOPK + index, static_cast<int32_t>(token));
-        }
-        PipeBarrier<PIPE_V>();
-        StoreAttentionRows(queryRow, slots, sources);
-        return true;
-    }
-
     __aicore__ inline bool PublishSparseSelection(
         uint32_t queryRow, uint32_t queryEnd, uint32_t sourceLen,
         uint32_t finalLen, uint32_t budget, bool firstFill,
@@ -306,21 +275,26 @@ private:
         LocalTensor<uint32_t> hash)
     {
         LoadTopk(queryRow, topk);
+        const uint32_t visibleLen = finalLen - (queryEnd - 1U - queryRow);
         uint32_t missCount = 0U;
         for (uint32_t index = 0U; index < TOPK; ++index) {
             const int32_t token = topk.GetValue(index);
-            uint32_t hashPosition = 0U;
+            if (token < 0 || static_cast<uint32_t>(token) >= visibleLen) {
+                return false;
+            }
+            if (static_cast<uint32_t>(token) >= sourceLen) {
+                continue; // Selected tail is already resident, even during first-fill.
+            }
+            uint32_t position = 0U;
             bool found = false;
-            if (!FindHashPosition(hash, token, hashPosition, found) || !found) {
+            if (!FindHashPosition(hash, token, position, found) || !found) {
                 return false;
             }
-            const uint32_t slot = hash.GetValue(hashPosition) >> SLOT_SHIFT;
-            if (token < 0 || static_cast<uint32_t>(token) >= sourceLen ||
-                slot >= budget) {
+            const uint32_t slot = hash.GetValue(position) >> SLOT_SHIFT;
+            if (slot >= budget) {
                 return false;
             }
-            const bool isMiss = firstFill || protectedSlots.GetValue(slot) == 2U;
-            missCount += isMiss ? 1U : 0U;
+            missCount += firstFill || protectedSlots.GetValue(slot) == 2U ? 1U : 0U;
         }
 
         InitAttentionRows(slots, sources);
@@ -328,23 +302,24 @@ private:
         uint32_t hitCursor = missCount;
         for (uint32_t index = 0U; index < TOPK; ++index) {
             const int32_t token = topk.GetValue(index);
-            uint32_t hashPosition = 0U;
-            bool found = false;
-            if (!FindHashPosition(hash, token, hashPosition, found) || !found) {
-                return false;
+            uint32_t slot = budget + static_cast<uint32_t>(token) % TAIL_STORAGE_CAPACITY;
+            bool isMiss = false;
+            if (static_cast<uint32_t>(token) < sourceLen) {
+                uint32_t position = 0U;
+                bool found = false;
+                if (!FindHashPosition(hash, token, position, found) || !found) {
+                    return false;
+                }
+                slot = hash.GetValue(position) >> SLOT_SHIFT;
+                isMiss = firstFill || protectedSlots.GetValue(slot) == 2U;
             }
-            const uint32_t slot = hash.GetValue(hashPosition) >> SLOT_SHIFT;
-            const bool isMiss = firstFill || protectedSlots.GetValue(slot) == 2U;
             const uint32_t output = isMiss ? missCursor++ : hitCursor++;
             sources.SetValue(output, token);
             slots.SetValue(output, static_cast<int32_t>(slot));
         }
-        PipeBarrier<PIPE_V>();
-        WriteOutputScalar(
-            perQueryMissCountsGm_[queryRow],
-            static_cast<int32_t>(missCount));
-        return AppendCausalTail(
-            queryRow, queryEnd, sourceLen, finalLen, budget, slots, sources);
+        WriteOutputScalar(perQueryMissCountsGm_[queryRow], static_cast<int32_t>(missCount));
+        StoreAttentionRows(queryRow, slots, sources);
+        return true;
     }
 
     __aicore__ inline void ClearCopyRow(uint32_t batch)
@@ -505,7 +480,7 @@ private:
         const uint32_t earliestVisible =
             static_cast<uint32_t>(finalLen) - (queryCount - 1U);
         return sourceLen <= earliestVisible &&
-            sourceLen <= tiling_->maxCandidateLen &&
+            finalLen <= static_cast<int32_t>(tiling_->maxCandidateLen) &&
             finalLen <= static_cast<int32_t>(tiling_->tokenCapacity);
     }
 
@@ -527,9 +502,12 @@ private:
             LoadTopk(queryRow, topk);
             for (uint32_t index = 0; index < TOPK; ++index) {
                 const int32_t token = topk.GetValue(index);
-                if (token < 0 ||
-                    token >= static_cast<int32_t>(sourceLen)) {
+                const uint32_t visibleLen = finalLen - (queryEnd - 1U - queryRow);
+                if (token < 0 || static_cast<uint32_t>(token) >= visibleLen) {
                     return false;
+                }
+                if (static_cast<uint32_t>(token) >= sourceLen) {
+                    continue; // Tail never enters the prefix union or reverse table.
                 }
                 uint32_t hashPosition = 0;
                 bool found = false;
@@ -561,6 +539,9 @@ private:
             LoadTopk(queryRow, topk);
             for (uint32_t index = 0; index < TOPK; ++index) {
                 const int32_t token = topk.GetValue(index);
+                if (static_cast<uint32_t>(token) >= sourceLen) {
+                    continue;
+                }
                 uint32_t hashPosition = 0;
                 bool found = false;
                 if (!FindHashPosition(
@@ -647,9 +628,12 @@ private:
             LoadTopk(queryRow, topk);
             for (uint32_t index = 0; index < TOPK; ++index) {
                 const int32_t token = topk.GetValue(index);
-                if (token < 0 ||
-                    token >= static_cast<int32_t>(sourceLen)) {
+                const uint32_t visibleLen = finalLen - (queryEnd - 1U - queryRow);
+                if (token < 0 || static_cast<uint32_t>(token) >= visibleLen) {
                     return false;
+                }
+                if (static_cast<uint32_t>(token) >= sourceLen) {
+                    continue; // Tail never enters the prefix union or reverse table.
                 }
                 uint32_t hashPosition = 0;
                 bool found = false;
@@ -807,7 +791,7 @@ private:
             (static_cast<uint64_t>(tiling_->tokenCapacity) + 1U);
         const int32_t metadata = cacheSlotsPoolGm_.GetValue(
             poolBase + tiling_->tokenCapacity);
-        const int32_t candidateLen = candidateLensGm_.GetValue(batch);
+        const int32_t candidateLen = offloadedLensGm_.GetValue(batch);
         const int32_t finalLen = finalSeqLengthsKvGm_.GetValue(batch);
         const uint32_t queryCount = queryEnd - queryStart;
         uint32_t sourceLen = 0;
@@ -848,13 +832,13 @@ private:
     uint32_t topkRowStride_ = TOPK;
     GlobalTensor<int32_t> topkIndicesGm_;
     GlobalTensor<int32_t> actualSeqLengthsQueryGm_;
-    GlobalTensor<int32_t> candidateLensGm_;
+    GlobalTensor<int32_t> offloadedLensGm_;
     GlobalTensor<int32_t> finalSeqLengthsKvGm_;
     GlobalTensor<int32_t> reqPoolEntriesGm_;
     GlobalTensor<int32_t> cacheSlotsPoolGm_;
     GlobalTensor<int32_t> rowModesGm_;
-    GlobalTensor<int32_t> sparseAndTailSlotsGm_;
-    GlobalTensor<int32_t> sparseAndTailSrcIdsGm_;
+    GlobalTensor<int32_t> topkSlotsGm_;
+    GlobalTensor<int32_t> topkIndexGm_;
     GlobalTensor<int32_t> perQueryMissCountsGm_;
     GlobalTensor<int32_t> residentSeqLengthsGm_;
     GlobalTensor<int32_t> copySrcIdsGm_;

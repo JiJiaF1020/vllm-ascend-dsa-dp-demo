@@ -39,12 +39,11 @@ public:
     __aicore__ inline void Init(
         GM_ADDR routePairs, GM_ADDR routeThresholds, GM_ADDR routeCounts,
         GM_ADDR scoreWorkspace, GM_ADDR actualSeqLengthsQuery,
-        GM_ADDR candidateLens,
+        GM_ADDR offloadedLens,
         GM_ADDR finalSeqLengthsKv, GM_ADDR rowModes,
         GM_ADDR reqPoolEntries, GM_ADDR cacheSlots,
         GM_ADDR unionSources, GM_ADDR unionDestinations,
-        GM_ADDR unionCounts, GM_ADDR topkSlots,
-        GM_ADDR sparseAndTailSlots, GM_ADDR sparseAndTailSrcIds,
+        GM_ADDR unionCounts, GM_ADDR topkSlots, GM_ADDR topkIndex,
         GM_ADDR perQueryMissCounts, GM_ADDR residentSeqLengths,
         uint32_t tokenCapacity, uint32_t outputCapacity,
         uint32_t scoreRowStride, uint32_t batchSize,
@@ -58,7 +57,7 @@ public:
         scoreWorkspaceGm_.SetGlobalBuffer((__gm__ uint16_t *)scoreWorkspace);
         actualSeqLengthsQueryGm_.SetGlobalBuffer(
             (__gm__ int32_t *)actualSeqLengthsQuery);
-        candidateLensGm_.SetGlobalBuffer((__gm__ int32_t *)candidateLens);
+        offloadedLensGm_.SetGlobalBuffer((__gm__ int32_t *)offloadedLens);
         finalSeqLengthsKvGm_.SetGlobalBuffer(
             (__gm__ int32_t *)finalSeqLengthsKv);
         rowModesGm_.SetGlobalBuffer((__gm__ int32_t *)rowModes);
@@ -68,11 +67,10 @@ public:
         unionDestinationsGm_.SetGlobalBuffer(
             (__gm__ int32_t *)unionDestinations);
         unionCountsGm_.SetGlobalBuffer((__gm__ int32_t *)unionCounts);
-        topkSlotsGm_.SetGlobalBuffer((__gm__ int32_t *)topkSlots);
-        sparseAndTailSlotsGm_.SetGlobalBuffer(
-            (__gm__ int32_t *)sparseAndTailSlots);
-        sparseAndTailSrcIdsGm_.SetGlobalBuffer(
-            (__gm__ int32_t *)sparseAndTailSrcIds);
+        topkSlotsGm_.SetGlobalBuffer(
+            (__gm__ int32_t *)topkSlots);
+        topkIndexGm_.SetGlobalBuffer(
+            (__gm__ int32_t *)topkIndex);
         perQueryMissCountsGm_.SetGlobalBuffer(
             (__gm__ int32_t *)perQueryMissCounts);
         residentSeqLengthsGm_.SetGlobalBuffer(
@@ -368,9 +366,8 @@ private:
                 protectedSlots.SetValue(static_cast<uint32_t>(slot), 1);
             }
         }
-        // Stage 1 writes directly to the public [T, 2304] rows. Only the
-        // first 2048 entries participate in sparse TopK protection; the tail
-        // suffix is filled after cache management completes.
+        // Stage 1 writes the selected prefix/tail union to [T,2048].
+        // Only prefix slots (< budget) belong to the eviction domain.
         for (uint32_t route = 0U; route < routeCount; ++route) {
             const uint64_t topkBase =
                 (static_cast<uint64_t>(queryStart) + route) *
@@ -442,7 +439,7 @@ private:
         const uint32_t budget = metadata.budget;
 #else
         const uint32_t candidate = static_cast<uint32_t>(
-            candidateLensGm_.GetValue(batch));
+            offloadedLensGm_.GetValue(batch));
         const uint32_t poolRow = static_cast<uint32_t>(
             reqPoolEntriesGm_.GetValue(batch));
         const uint32_t budget = ReadBudget(batch, poolRow);
@@ -474,7 +471,7 @@ private:
         const uint32_t budget = metadata.budget;
 #else
         const uint32_t candidate = static_cast<uint32_t>(
-            candidateLensGm_.GetValue(batch));
+            offloadedLensGm_.GetValue(batch));
         const uint32_t poolRow = static_cast<uint32_t>(
             reqPoolEntriesGm_.GetValue(batch));
         const uint32_t budget = ReadBudget(batch, poolRow);
@@ -557,8 +554,8 @@ private:
             (__ubuf__ int32_t *)unionDestinations.GetPhyAddr(),
             (__ubuf__ int32_t *)allDestinations.GetPhyAddr(),
             lengths[0], lengths[1], lengths[2], lengths[3], unionCount);
-        // Complete all pair reads before PublishFinalOutputs reuses their
-        // UB for causal tails. Keep the existing final V_MTE3 publication.
+        // Complete pair reads before publication and the next request can
+        // reuse their UB. Keep the existing final V_MTE3 ordering.
         UnionSync<HardEvent::V_MTE2>(HardEvent::V_MTE2);
 #else
         // pairInputBuf_ has 16384 int32 words. One 4096-word interleaved
@@ -629,34 +626,13 @@ private:
         LocalTensor<int32_t> topkMissDestinations)
     {
         constexpr uint32_t TAIL = VllmA5LiManageC8FastUnionVF::TAIL_CAPACITY;
-        static_assert(TAIL + UNION_TOPK ==
-            vllm_a5_li_manage_c8_fast_workspace::ATTENTION_CAPACITY,
-            "tail rows must match the public attention capacity");
-        static_assert(2U * UNION_ROUTES * TAIL <= UNION_PAIR_WORDS,
-            "tail scratch must not overlap live miss destinations");
-        // PrepareTopkMissPrefixes has finished reading route pairs. Reuse
-        // only [0,4096): legacy repair keeps live slots in [4096,12288),
-        // batched repair keeps them in pairOutput's former victim half.
-        LocalTensor<int32_t> tailSlots = pairInputBuf_.Get<int32_t>();
-        LocalTensor<int32_t> tailSources = tailSlots[UNION_ROUTES * TAIL];
 #if LIM_SIMT_REQUEST_META_CACHE
         const uint32_t budget = metadata.budget;
-        const uint32_t finalLen = metadata.finalLen;
-        const uint32_t candidate = metadata.candidate;
 #else
         const uint32_t poolRow = static_cast<uint32_t>(
             reqPoolEntriesGm_.GetValue(batch));
         const uint32_t budget = ReadBudget(batch, poolRow);
-        const uint32_t finalLen = static_cast<uint32_t>(
-            finalSeqLengthsKvGm_.GetValue(batch));
-        const uint32_t candidate = static_cast<uint32_t>(
-            candidateLensGm_.GetValue(batch));
 #endif
-        VllmA5LiManageC8FastUnionVF::BuildCausalTailRows(
-            (__ubuf__ uint32_t *)tailSlots.GetPhyAddr(),
-            (__ubuf__ uint32_t *)tailSources.GetPhyAddr(),
-            candidate, budget, finalLen, routeCount);
-
         // Independent 32-byte scalar rows: no DMA source is overwritten
         // until the single completion wait at the end of this request.
         LocalTensor<int32_t> unionCountLocal = countLocal[8U];
@@ -701,12 +677,6 @@ private:
                     {1, static_cast<uint16_t>(lengths[route] * sizeof(int32_t)),
                      0, 0});
             }
-            DataCopy(
-                sparseAndTailSlotsGm_[publicRow + UNION_TOPK],
-                tailSlots[route * TAIL], TAIL);
-            DataCopy(
-                sparseAndTailSrcIdsGm_[publicRow + UNION_TOPK],
-                tailSources[route * TAIL], TAIL);
         }
         UnionSync<HardEvent::MTE3_S>(HardEvent::MTE3_S);
     }
@@ -724,10 +694,10 @@ private:
                 (static_cast<uint64_t>(queryStart) + route) *
                 vllm_a5_li_manage_c8_fast_workspace::ATTENTION_CAPACITY;
             DataCopy(
-                sparseAndTailSlotsGm_[publicRow], row,
+                topkSlotsGm_[publicRow], row,
                 vllm_a5_li_manage_c8_fast_workspace::ATTENTION_CAPACITY);
             DataCopy(
-                sparseAndTailSrcIdsGm_[publicRow], row,
+                topkIndexGm_[publicRow], row,
                 vllm_a5_li_manage_c8_fast_workspace::ATTENTION_CAPACITY);
         }
         UnionSync<HardEvent::MTE3_S>(HardEvent::MTE3_S);
@@ -811,24 +781,10 @@ private:
                     PipeBarrier<PIPE_V>();
                 }
                 UnionSync<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-                DataCopy(sparseAndTailSlotsGm_[publicRow], row, capacity);
-                DataCopy(sparseAndTailSrcIdsGm_[publicRow], row, capacity);
+                DataCopy(topkSlotsGm_[publicRow], row, capacity);
+                DataCopy(topkIndexGm_[publicRow], row, capacity);
                 UnionSync<HardEvent::MTE3_V>(HardEvent::MTE3_V);
-            } else {
-                // Stage A has published the official C8 LI top-2048 prefix.
-                // DENSE has no tail/cache-management suffix, so only clear
-                // the expanded two-block public suffix here.
-                const uint32_t suffix = capacity - UNION_TOPK;
-                Duplicate(row, static_cast<int32_t>(-1), suffix);
-                UnionSync<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-                DataCopy(
-                    sparseAndTailSlotsGm_[publicRow + UNION_TOPK],
-                    row, suffix);
-                DataCopy(
-                    sparseAndTailSrcIdsGm_[publicRow + UNION_TOPK],
-                    row, suffix);
-                UnionSync<HardEvent::MTE3_V>(HardEvent::MTE3_V);
-            }
+            } // Long DENSE rows were already published by Stage A.
         }
         UnionSync<HardEvent::MTE3_S>(HardEvent::MTE3_S);
         PublishRequestMetadata(
@@ -840,14 +796,14 @@ private:
         uint32_t &candidate, uint32_t &finalLen,
         uint32_t &poolRow, uint32_t &budget)
     {
-        const int32_t candidateRaw = candidateLensGm_.GetValue(batch);
+        const int32_t candidateRaw = offloadedLensGm_.GetValue(batch);
         const int32_t finalRaw = finalSeqLengthsKvGm_.GetValue(batch);
         const int32_t poolRowRaw = reqPoolEntriesGm_.GetValue(batch);
         if (poolRowRaw < 0 ||
             poolRowRaw >= static_cast<int32_t>(poolSize_) ||
             candidateRaw < static_cast<int32_t>(UNION_TOPK) ||
             candidateRaw > static_cast<int32_t>(sourceCapacity_) ||
-            candidateRaw > static_cast<int32_t>(maxCandidateLen_) ||
+            finalRaw > static_cast<int32_t>(maxCandidateLen_) ||
             candidateRaw % 128 != 0 ||
             finalRaw < static_cast<int32_t>(routeCount) ||
             finalRaw > static_cast<int32_t>(sourceCapacity_)) {
@@ -858,8 +814,7 @@ private:
         poolRow = static_cast<uint32_t>(poolRowRaw);
         const uint32_t earliestVisible = finalLen - (routeCount - 1U);
         const uint32_t tailCapacity = static_cast<uint32_t>(
-            vllm_a5_li_manage_c8_fast_workspace::ATTENTION_CAPACITY -
-            UNION_TOPK);
+            VllmA5LiManageC8FastUnionVF::TAIL_CAPACITY);
         if (candidate > earliestVisible ||
             finalLen - candidate > tailCapacity) {
             return false;
@@ -1067,7 +1022,7 @@ private:
     GlobalTensor<int32_t> routeCountsGm_;
     GlobalTensor<uint16_t> scoreWorkspaceGm_;
     GlobalTensor<int32_t> actualSeqLengthsQueryGm_;
-    GlobalTensor<int32_t> candidateLensGm_;
+    GlobalTensor<int32_t> offloadedLensGm_;
     GlobalTensor<int32_t> finalSeqLengthsKvGm_;
     GlobalTensor<int32_t> rowModesGm_;
     GlobalTensor<int32_t> reqPoolEntriesGm_;
@@ -1076,8 +1031,7 @@ private:
     GlobalTensor<int32_t> unionDestinationsGm_;
     GlobalTensor<int32_t> unionCountsGm_;
     GlobalTensor<int32_t> topkSlotsGm_;
-    GlobalTensor<int32_t> sparseAndTailSlotsGm_;
-    GlobalTensor<int32_t> sparseAndTailSrcIdsGm_;
+    GlobalTensor<int32_t> topkIndexGm_;
     GlobalTensor<int32_t> perQueryMissCountsGm_;
     GlobalTensor<int32_t> residentSeqLengthsGm_;
     TBuf<TPosition::VECCALC> pairInputBuf_;

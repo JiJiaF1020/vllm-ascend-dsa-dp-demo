@@ -42,7 +42,7 @@ custom 的 MTP durable dump step（prefix/L3）继续走 eager，任何 DP rank
 `"enable_fused_copy_sfa": True` 开启融合；省略或设为 `False` 时保持
 copy + SFA 分离路径。不要用此字段覆盖其它 DSA 配置。
 
-目前仅支持 A5 packed-C8 + DSA offload + MTP 的 2304-slot 接口，
+目前仅支持 A5 packed-C8 + DSA offload + MTP 的 TopK2048 接口，
 不满足条件时显式报错。只改变 target 稀疏 attention 的 copy/SFA 调用，
 不改变 LIM、prefix/L3 或 MTP durable cache 生命周期。
 算子内部保留大 copy-count 回退路径；开启不代表每种形状都获得加速。
@@ -61,7 +61,7 @@ pytest -sv tests/e2e/nightly/single_node/ops/singlecard_ops/test_dsa_a5_c8_ops.p
 |---|---|
 | `simple_prompt_test.py` | 基线隔离、cache-init、eager 和 graph 冒烟 |
 | `simple_dp_prompt_test.py` | 同事入门用的单机DP离线脚本，顶部按特性分组配置，输出完整文本/token IDs及自动精度证据摘要 |
-| `run_a5_mtp_operator_tests.py` | MTP七输出/2304升级门禁，默认框架UT＋单卡算子，不加载模型或启动Mooncake |
+| `run_a5_mtp_operator_tests.py` | MTP全可见域TopK2048升级门禁，默认框架UT＋单卡算子，不加载模型或启动Mooncake |
 | `qa_dataset_test.py` | LongBench 风格数据集精度回归，可切 disabled/eager/graph |
 | `eval_dataset_acc_score.py` | 对 QA 脚本生成的 JSONL 计算 LongBench 指标 |
 | `serve_dsa.sh` | 以 OpenAI 兼容在线服务拉起 DSA eager/graph |
@@ -120,10 +120,14 @@ python -m pytest tests/e2e/nightly/single_node/ops/singlecard_ops/test_dsa_a5_c8
 差值为0不等于完整top-k集合相同，也不等于全量logits一致。
 仅整理已有结果不需要NPU、vLLM或重启服务；差异仅作为诊断证据，不自动判精度通过/失败。
 
-2026-09-10迁移同事 `d44387d3a9 / 3f644e34ec / 3b5d0ecdc0` 的有用增量，
-不复制测试机数据和旧框架。MTP采用共同durable前缀TopK＋因果可见双尾，
-保留同事七输出接口；非MTP仍2176。KSC保留原有错误断言，不静默吞掉坏plan。
-迁移及随后LIM修复已有上述限定场景的A5验证，不等于全量数值或性能认证。
+MTP路径同步单算子仓 `6732a649a36e4829994aa6cbdbd7ad6616333180`：
+逐query在全部因果可见KV上选Top2048，入选tail为hit，不再追加dense tail。
+LIM输入 `offloaded_lens` 仍传已卸载的durable前缀长度；输出
+`topk_slots/topk_index` 均为 `[T,1,2048]`，官方QSFA使用 `sparse_mode=0`。
+双parity tail、缓存预算、块分配/倒手及KSC不改，resident长度仍为C+256。
+仅升级MTP3配置的target路径，保留其运行时R=1～4、PAD/DENSE/first-fill/steady；
+非MTP继续使用原算子、2176输出及QSFA mode=3。MTP Attention语义标识已更新，
+旧L3对象隔离；不会改变非MTP的语义标识。本轮框架集成仍需以下A5验收。
 
 这是CANN算子、生成ACLNN API、Torch binding、Python owner的联合升级，
 **只同步Python、复用旧so或只编译kernel都不够**。沿用现有成功的A5/CANN环境，
@@ -136,8 +140,9 @@ python examples/dsa_demo/run_a5_mtp_operator_tests.py
 
 `SOC_VERSION`沿用测试机真实A5型号；自动识别失败再填写以`ascend950`开头的值。
 不要求先全量删除build/output，但必须确认本轮host/kernel/扩展均实际更新。
-本次LIM符号名不变，启动检查会拒绝旧五输出schema；七输出旧2176版本不能只靠
-Torch schema识别，仍需配套重建，native shape测试会检查2304。
+LIM/CopySFA符号名不变，启动检查通过新参数名拒绝旧schema，native测试拒绝旧
+2176/2304的MTP输出。新Torch binding搭配旧CANN so仍不合法，必须配套重建并重启，
+重新capture graph。短DENSE/PAD仍可能有无效索引，不宣称所有官方QSFA精度问题已解决。
 
 脚本开关直接在顶部修改。默认顺序：
 

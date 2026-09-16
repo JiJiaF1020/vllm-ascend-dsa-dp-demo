@@ -740,8 +740,8 @@ class DSAOffloadRuntime:
         普通 Q=1 的 DENSE 行候选区是当前完整序列，SPARSE 行只覆盖最后
         一个物理 tail 之前的完整逻辑块。MTP target Q=4 验算时，DENSE 写
         完整可见长度；SPARSE 的该列专门表示已经持久化到 DRAM 的 durable
-        prefix D。同一请求的所有 query 共享 [0,D) 的 LI 候选域；LIM 根据
-        final length 逐 query 追加因果可见的双尾 [D,V)，不让 tail 参与 LI。
+        prefix D。该共享元数据列传给 MTP LIM 时命名为 offloaded_lens，
+        仅限制 COPY/淘汰，不限制 LI：LIM 在完整可见 KV（含 tail）上选 TopK。
         """
 
         num_reqs = self.active_num_reqs
@@ -1589,13 +1589,13 @@ class DSALayerOffloadContext:
                     index_key_cache=indexer_key,
                     index_key_dequant_scale=indexer_scale,
                     index_block_table=indexer_block_table,
-                    candidate_lens=candidate_lens,
+                    offloaded_lens=candidate_lens,
                     final_seq_lengths_kv=actual_seq_lengths_key,
                     row_modes=row_modes,
                     req_pool_entries=resident_pool_indices,
                     cache_slots=cache_slots,
-                    attention_slots=attention_slots,
-                    attention_src_ids=attention_src_ids_buffer[:num_query_rows],
+                    topk_slots=attention_slots,
+                    topk_index=attention_src_ids_buffer[:num_query_rows],
                     per_query_miss_counts=per_query_miss_counts_buffer[:num_query_rows],
                     resident_seq_lengths=resident_seq_lengths,
                     outputs=outputs,

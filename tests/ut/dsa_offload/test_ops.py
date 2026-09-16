@@ -23,10 +23,11 @@ def test_copysfa_is_required_only_when_enabled(monkeypatch) -> None:
     monkeypatch.setattr(dsa_ops, "_REQUIRED_A5_NATIVE_OPS", ())
     monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace())
     outputs = (
-        "sparse_and_tail_slots", "sparse_and_tail_src_ids", "per_query_miss_counts",
+        "topk_slots", "topk_index", "per_query_miss_counts",
         "resident_seq_lengths", "copy_src_ids", "copy_dst_slots", "copy_counts",
     )
     arguments = [f"Tensor input{i}" for i in range(12)] + [f"Tensor {name}" for name in outputs]
+    arguments[7] = "Tensor offloaded_lens"
     schema = torch._C.parse_schema(f"npu_dsa_a5_li_manage_c8_out({', '.join(arguments)}) -> ()")
     monkeypatch.setattr(
         torch.ops, "_C_ascend",
@@ -37,6 +38,20 @@ def test_copysfa_is_required_only_when_enabled(monkeypatch) -> None:
         dsa_ops.require_dsa_offload_ops(packed_c8=True, mtp=True, fused_copy_sfa=True)
     with pytest.raises(ValueError, match="MTP"):
         dsa_ops.require_dsa_offload_ops(packed_c8=True, fused_copy_sfa=True)
+
+    fused_args = [f"Tensor input{i}" for i in range(15)]
+    fused_args[5:7] = ["Tensor topk_slots", "Tensor topk_index"]
+    fused_op = SimpleNamespace(default=SimpleNamespace())
+    monkeypatch.setattr(torch.ops._C_ascend, "npu_dsa_a5_fused_copy_sfa_c8_out", fused_op, raising=False)
+    for legacy in (False, True):
+        if legacy:
+            fused_args[5:7] = ["Tensor sparse_and_tail_slots", "Tensor sparse_and_tail_src_ids"]
+        fused_op.default._schema = torch._C.parse_schema(f"copysfa({', '.join(fused_args)}) -> ()")
+        if legacy:
+            with pytest.raises(RuntimeError, match="CopySFA requires the TopK2048 ABI"):
+                dsa_ops.require_dsa_offload_ops(packed_c8=True, mtp=True, fused_copy_sfa=True)
+        else:
+            dsa_ops.require_dsa_offload_ops(packed_c8=True, mtp=True, fused_copy_sfa=True)
 
 
 def test_copysfa_wrapper_preserves_metadata_and_caller_owned_outputs(monkeypatch) -> None:
@@ -52,7 +67,7 @@ def test_copysfa_wrapper_preserves_metadata_and_caller_owned_outputs(monkeypatch
     query = torch.empty(t, h, 576, dtype=torch.bfloat16)
     hbm = torch.empty(4, 128, 1, 656, dtype=torch.float8_e4m3fn)
     dram = torch.empty_like(hbm)
-    slots = torch.empty(t, 1, 2304, dtype=torch.int32)
+    slots = torch.empty(t, 1, 2048, dtype=torch.int32)
     source = torch.empty_like(slots)
     misses = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32)
     ends = torch.tensor([1, 5], dtype=torch.int32)
@@ -140,11 +155,11 @@ def test_packed_c8_op_check_reports_missing_native_ops(monkeypatch) -> None:
         dsa_ops.require_dsa_offload_ops(packed_c8=True)
 
 
-@pytest.mark.parametrize("abi", ["seven", "five", "reordered"])
+@pytest.mark.parametrize("abi", ["seven", "five", "reordered", "old2304", "old_input"])
 def test_mtp_op_check_rejects_stale_native_schema(monkeypatch, abi) -> None:
     outputs = [
-        "sparse_and_tail_slots",
-        "sparse_and_tail_src_ids",
+        "topk_slots",
+        "topk_index",
         "per_query_miss_counts",
         "resident_seq_lengths",
         "copy_src_ids",
@@ -156,6 +171,11 @@ def test_mtp_op_check_rejects_stale_native_schema(monkeypatch, abi) -> None:
     elif abi == "reordered":
         outputs[1], outputs[2] = outputs[2], outputs[1]
     arguments = [f"Tensor input{i}" for i in range(12)] + [f"Tensor {name}" for name in outputs]
+    arguments[7] = "Tensor offloaded_lens"
+    if abi == "old2304":
+        arguments[12:14] = ["Tensor sparse_and_tail_slots", "Tensor sparse_and_tail_src_ids"]
+    elif abi == "old_input":
+        arguments[7] = "Tensor candidate_lens"
     schema = torch._C.parse_schema(f"npu_dsa_a5_li_manage_c8_out({', '.join(arguments)}) -> ()")
     monkeypatch.setattr(dsa_ops, "load_custom_op_library", lambda: True)
     monkeypatch.setattr(dsa_ops, "_REQUIRED_A5_C8_OPS", ())
@@ -170,7 +190,7 @@ def test_mtp_op_check_rejects_stale_native_schema(monkeypatch, abi) -> None:
     if abi == "seven":
         dsa_ops.require_dsa_offload_ops(packed_c8=True, mtp=True)
     else:
-        with pytest.raises(RuntimeError, match="seven-output LIM ABI"):
+        with pytest.raises(RuntimeError, match="TopK2048 LIM ABI"):
             dsa_ops.require_dsa_offload_ops(packed_c8=True, mtp=True)
         # An installed old MTP op must not block non-MTP execution.
         dsa_ops.require_dsa_offload_ops(packed_c8=True, mtp=False)
@@ -338,7 +358,7 @@ def test_a5_mtp_lim_keeps_request_and_query_axes_separate(
         tail_info=torch.empty((batch, 2), dtype=torch.int32),
     )
     attention_slots = torch.empty(
-        (total_query_rows, 1, 2304),
+        (total_query_rows, 1, 2048),
         dtype=torch.int32,
     )
     attention_src_ids = torch.empty_like(attention_slots)
@@ -368,13 +388,13 @@ def test_a5_mtp_lim_keeps_request_and_query_axes_separate(
             dtype=torch.float32,
         ),
         index_block_table=torch.zeros((batch, 64), dtype=torch.int32),
-        candidate_lens=torch.tensor([8192, 8192], dtype=torch.int32),
+        offloaded_lens=torch.tensor([8192, 8192], dtype=torch.int32),
         final_seq_lengths_kv=torch.tensor([8196, 8196], dtype=torch.int32),
         row_modes=torch.tensor([2, 2], dtype=torch.int32),
         req_pool_entries=torch.tensor([0, 1], dtype=torch.int32),
         cache_slots=torch.empty((2, 65537), dtype=torch.int32),
-        attention_slots=attention_slots,
-        attention_src_ids=attention_src_ids,
+        topk_slots=attention_slots,
+        topk_index=attention_src_ids,
         per_query_miss_counts=per_query_miss_counts,
         resident_seq_lengths=resident_seq_lengths,
         outputs=outputs,
@@ -384,7 +404,7 @@ def test_a5_mtp_lim_keeps_request_and_query_axes_separate(
     assert args[0] is weights
     assert args[0].stride() == (160, 1)
     assert args[12] is attention_slots
-    assert args[12].shape == (total_query_rows, 1, 2304)
+    assert args[12].shape == (total_query_rows, 1, 2048)
     assert args[13] is attention_src_ids
     assert args[13].shape == attention_slots.shape
     assert args[14] is per_query_miss_counts
@@ -398,7 +418,7 @@ def test_a5_mtp_lim_keeps_request_and_query_axes_separate(
     assert args[18].shape[0] == batch
 
 
-@pytest.mark.parametrize("capacity", [2176, 2304])
+@pytest.mark.parametrize("capacity", [2176, 2048])
 def test_a5_qsfa_preserves_lim_slots_and_resident_span(monkeypatch, capacity) -> None:
     captured = {}
     expected_output = torch.empty((4, 8, 512), dtype=torch.bfloat16)
@@ -409,7 +429,7 @@ def test_a5_qsfa_preserves_lim_slots_and_resident_span(monkeypatch, capacity) ->
 
     monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(npu_kv_quant_sparse_flash_attention=native_sfa))
     indices = torch.full((4, 1, capacity), -1, dtype=torch.int32)
-    indices[:, -1, -1] = 8447  # Include the last column: no truncation to 2176.
+    indices[:, -1, -1] = 8447  # A high resident slot is valid: no extra causal masking.
     packed_kv = torch.empty((66, 128, 1, 656), dtype=torch.int8)
     lengths = torch.tensor([8448], dtype=torch.int32)
     query_ends = torch.tensor([4], dtype=torch.int32)
@@ -431,11 +451,12 @@ def test_a5_qsfa_preserves_lim_slots_and_resident_span(monkeypatch, capacity) ->
     assert captured["key"] is packed_kv and captured["value"] is packed_kv
     assert captured["layout_query"] == "TND"
     assert captured["sparse_block_size"] == 1
+    assert captured["sparse_mode"] == (0 if capacity == 2048 else 3)
 
 
-@pytest.mark.parametrize("capacity", [2048, 2175, 2303, 2305])
+@pytest.mark.parametrize("capacity", [2047, 2049, 2175, 2304])
 def test_a5_qsfa_rejects_invalid_attention_width(capacity) -> None:
-    with pytest.raises(ValueError, match="2176.*2304"):
+    with pytest.raises(ValueError, match="2176.*2048"):
         dsa_ops.sparse_flash_attention_for_offload_c8(
             query=torch.empty((1, 8, 576), dtype=torch.bfloat16),
             packed_kv=torch.empty((1, 128, 1, 656), dtype=torch.int8),

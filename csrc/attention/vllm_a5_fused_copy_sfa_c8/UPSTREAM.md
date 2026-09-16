@@ -10,4 +10,4 @@
 
 框架集成来源：`ops_lidu_scattercopy_sfa_a5` 提交 `19e5615`。`op_host` 的 C++ 与全部 `op_kernel` 文件保持源码一致；新增 framework CMake、`_C_ascend` caller-owned 适配及局部 workspace cache。保留预取默认开启、512 fallback 阈值、miss pair 合并写回。eager workspace 按 device/stream 复用；capture 使用独立图池，不复用 eager cache。
 
-本次从单算子仓 `2f80de6fb5df1d941164ad5cec7f144f5025e4ce` 核对同步；CopySFA 源码与上述版本一致。框架 CMake、Torch 适配和 workspace cache 复用 DP 分支提交 `64cc79c08a559090b3dc4aa815a2844f69c2e4e5`，集成叠加于 `vllm-ascend-v0.23.0-custom`，不替换其 SIMT LIM，不改变 prefix/L3 生命周期。`enable_fused_copy_sfa` 默认关闭。单算子测试记录不等于本框架编译和整网验收；目标 A5 验证入口见 `examples/dsa_demo/README.md`。
+本次同步单算子仓 `6732a649a36e4829994aa6cbdbd7ad6616333180` 的全可见域 TopK2048 版本：host C++ 和 kernel 与源仓一致；配对输入改为 `topk_slots/topk_index[T,1,2048]`，不再追加 tail，等价于 COPY + 官方 QSFA `sparse_mode=0`。保留 >512 内部回退与现有流水。框架 CMake、Torch 适配和 workspace cache 保留，仍在 `_C_ascend` 注册；默认不开启融合。MTP 的 L3 Attention 语义指纹同步升级，但不改块分配和缓存生命周期。必须连同新版 LIM、CANN so、Torch binding 和 Python 一起部署，重新 capture graph。目标 A5 验证入口见 `examples/dsa_demo/README.md`，单算子通过不等于框架编译和整网验收。

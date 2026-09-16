@@ -41,7 +41,7 @@ static ge::graphStatus Tiling(gert::TilingContext *c)
         const bool matrix = i == 5 || i == 6 || i == 10 || i == 11;
         const auto rows = i <= 7 ? t : b;
         if (s.GetDimNum() != (matrix ? 3 : 1) || s.GetDim(0) != rows ||
-            (matrix && (s.GetDim(1) != 1 || s.GetDim(2) != (i < 7 ? 2304 : 16384))))
+            (matrix && (s.GetDim(1) != 1 || s.GetDim(2) != (i < 7 ? 2048 : 16384))))
             return ge::GRAPH_FAILED;
     }
     const float *scale = c->GetAttrs()->GetAttrPointer<float>(0);
@@ -54,8 +54,9 @@ static ge::graphStatus Tiling(gert::TilingContext *c)
     *td = {};
     auto &p = td->baseParams;
     p.batchSize = b; p.qSeqSize = t; p.seqSize = ht.GetDim(1) * 128;
-    p.nNumOfQInOneGroup = q.GetDim(1); p.sparseBlockCount = 2304;
-    p.sparseMode = 3; p.outputLayout = 1; p.blockSize = 128;
+    p.nNumOfQInOneGroup = q.GetDim(1); p.sparseBlockCount = 2048;
+    // LIM already enforced logical causality before mapping resident slots.
+    p.sparseMode = 0; p.outputLayout = 1; p.blockSize = 128;
     p.maxBlockNumPerBatch = ht.GetDim(1); p.dSizeVInput = 656; p.scaleValue = *scale;
     td->singleCoreParams.usedCoreNum = cores;
     td->dramMaxBlocks = dt.GetDim(1);

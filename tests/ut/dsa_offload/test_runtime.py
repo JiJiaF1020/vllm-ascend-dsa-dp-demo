@@ -530,9 +530,9 @@ def test_a5_selection_scratch_is_allocated_only_for_packed_c8() -> None:
     assert c8_runtime._a5_resident_seq_lengths is not None
     assert c8_runtime._a5_resident_seq_lengths.shape == (1,)
     assert mtp_runtime._a5_attention_slots is not None
-    assert mtp_runtime._a5_attention_slots.shape == (4, 1, 2304)
+    assert mtp_runtime._a5_attention_slots.shape == (4, 1, 2048)
     assert mtp_runtime._a5_attention_src_ids is not None
-    assert mtp_runtime._a5_attention_src_ids.shape == (4, 1, 2304)
+    assert mtp_runtime._a5_attention_src_ids.shape == (4, 1, 2048)
     assert mtp_runtime._a5_per_query_miss_counts is not None
     assert mtp_runtime._a5_per_query_miss_counts.shape == (4,)
 
@@ -694,8 +694,8 @@ def test_a5_mtp_selection_chain_reuses_per_query_outputs(monkeypatch, query_coun
     def _fake_mtp_lidu(
         *,
         outputs,
-        attention_slots,
-        attention_src_ids,
+        topk_slots,
+        topk_index,
         per_query_miss_counts,
         resident_seq_lengths,
         **kwargs,
@@ -703,12 +703,13 @@ def test_a5_mtp_selection_chain_reuses_per_query_outputs(monkeypatch, query_coun
         outputs.topk_index.fill_(7)
         outputs.topk_slots.fill_(9)
         outputs.miss_count.copy_(torch.tensor([3, 5], dtype=torch.int32))
-        attention_slots.fill_(11)
-        attention_src_ids.fill_(13)
+        topk_slots.fill_(11)
+        topk_index.fill_(13)
         per_query_miss_counts.copy_(torch.arange(total_query_rows, dtype=torch.int32))
         resident_seq_lengths.fill_(4096)
-        captured["attention_slots"] = attention_slots
-        captured["attention_src_ids"] = attention_src_ids
+        captured["attention_slots"] = topk_slots
+        captured["attention_src_ids"] = topk_index
+        captured["offloaded_lens"] = kwargs["offloaded_lens"]
         captured["per_query_miss_counts"] = per_query_miss_counts
         captured["cache_slots"] = kwargs["cache_slots"]
 
@@ -758,7 +759,8 @@ def test_a5_mtp_selection_chain_reuses_per_query_outputs(monkeypatch, query_coun
     assert captured["attention_src_ids"].data_ptr() == (runtime._a5_attention_src_ids.data_ptr())
     assert captured["per_query_miss_counts"].data_ptr() == (runtime._a5_per_query_miss_counts.data_ptr())
     assert captured["cache_slots"].data_ptr() == (resident_pool.get_cache_slots(0).data_ptr())
-    assert selection.sparse_indices.shape == (total_query_rows, 1, 2304)
+    assert selection.sparse_indices.shape == (total_query_rows, 1, 2048)
+    assert captured["offloaded_lens"].tolist() == [4096, 4096]
     outputs = runtime.get_lidu_outputs(num_reqs=2)
     assert captured["copy_counts"] is outputs.miss_count
     assert captured["copy_sources"] is outputs.topk_index
@@ -794,13 +796,13 @@ def test_a5_shared_layer_reuses_full_lidu_and_own_packed_arena(
     scatter_calls: list[dict] = []
     attention_calls: list[dict] = []
 
-    def _fake_fused_lidu(*, outputs, attention_slots, resident_seq_lengths, **kwargs) -> None:
+    def _fake_fused_lidu(*, outputs, resident_seq_lengths, **kwargs) -> None:
         nonlocal fused_lidu_calls
         fused_lidu_calls += 1
         outputs.topk_index.fill_(7)
         outputs.topk_slots.fill_(9)
         outputs.miss_count.zero_()
-        attention_slots.fill_(11)
+        kwargs["topk_slots" if routes > 1 else "attention_slots"].fill_(11)
         resident_seq_lengths.fill_(4096)
 
     def _fake_scatter(**kwargs) -> None:
@@ -912,7 +914,7 @@ def test_a5_shared_layer_reuses_full_lidu_and_own_packed_arena(
     assert scatter_calls[1]["source_token_ids"] is outputs.topk_index
     assert runtime._a5_attention_slots is not None
     assert selection.sparse_indices.data_ptr() == (runtime._a5_attention_slots.data_ptr())
-    capacity = 2304 if routes > 1 else 2176
+    capacity = 2048 if routes > 1 else 2176
     assert selection.sparse_indices.tolist() == [[[11] * capacity]] * routes
     assert selection.resident_seq_lengths is not None
     assert selection.resident_seq_lengths.tolist() == [4096]

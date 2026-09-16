@@ -12,7 +12,7 @@
 // guards, so it can coexist with the stock QuantLI cold path.
 using VllmFastLIC8TilingData = VllmA5LiManageC8TilingData;
 #define A5_MTP_CLASSIFY_ONLY 1
-#define A5_MTP_SLOT_OUTPUT_STRIDE 2304U
+#define A5_MTP_SLOT_OUTPUT_STRIDE 2048U
 #include "arch35_payload_fast_c8/lightning_indexer_common.h"
 #include "arch35_payload_fast_c8/lightning_indexer_service_cube.h"
 #include "arch35_payload_fast_c8/lightning_indexer_service_vector.h"
@@ -47,7 +47,7 @@ using C8MtpQliType = VllmFastQLICommon::QLIType<
  * Stage A.
  */
 __aicore__ inline bool RequiresColdPath(
-    GM_ADDR actualSeqLengthsQuery, GM_ADDR candidateLens,
+    GM_ADDR actualSeqLengthsQuery, GM_ADDR offloadedLens,
     GM_ADDR finalSeqLengthsKv, GM_ADDR rowModes, GM_ADDR reqPoolEntries,
     GM_ADDR cacheSlotsPool, const VllmA5LiManageC8TilingData *tiling)
 {
@@ -62,7 +62,7 @@ __aicore__ inline bool RequiresColdPath(
     GlobalTensor<int32_t> entries;
     GlobalTensor<int32_t> pool;
     queryEnds.SetGlobalBuffer((__gm__ int32_t *)actualSeqLengthsQuery);
-    candidates.SetGlobalBuffer((__gm__ int32_t *)candidateLens);
+    candidates.SetGlobalBuffer((__gm__ int32_t *)offloadedLens);
     finalLengths.SetGlobalBuffer((__gm__ int32_t *)finalSeqLengthsKv);
     modes.SetGlobalBuffer((__gm__ int32_t *)rowModes);
     entries.SetGlobalBuffer((__gm__ int32_t *)reqPoolEntries);
@@ -104,7 +104,7 @@ __aicore__ inline bool RequiresColdPath(
             poolRow >= static_cast<int32_t>(tiling->poolSize) ||
             candidate < static_cast<int32_t>(TOPK) ||
             candidate > static_cast<int32_t>(tiling->tokenCapacity) ||
-            candidate > static_cast<int32_t>(tiling->maxCandidateLen) ||
+            finalLen > static_cast<int32_t>(tiling->maxCandidateLen) ||
             candidate % static_cast<int32_t>(BLOCK_SIZE) != 0 ||
             candidate > finalLen - (routeCount - 1) ||
             finalLen - candidate > 256) {
@@ -139,7 +139,7 @@ public:
         GM_ADDR indexKeyCache, GM_ADDR indexKeyDequantScale,
         GM_ADDR finalSeqLengthsKv,
         GM_ADDR reqPoolEntries, GM_ADDR cacheSlotsPool,
-        GM_ADDR candidateLens, GM_ADDR rowModes, GM_ADDR indexBlockTable,
+        GM_ADDR offloadedLens, GM_ADDR rowModes, GM_ADDR indexBlockTable,
         GM_ADDR routePairRows, GM_ADDR topkSlots,
         GM_ADDR topkSourceIds,
         GM_ADDR routeThresholds, GM_ADDR routeMissCounts,
@@ -156,7 +156,7 @@ public:
             (__gm__ int32_t *)actualSeqLengthsQuery);
         finalLengthsGm_.SetGlobalBuffer(
             (__gm__ int32_t *)finalSeqLengthsKv);
-        candidateLensGm_.SetGlobalBuffer((__gm__ int32_t *)candidateLens);
+        offloadedLensGm_.SetGlobalBuffer((__gm__ int32_t *)offloadedLens);
         rowModesGm_.SetGlobalBuffer((__gm__ int32_t *)rowModes);
         reqPoolEntriesGm_.SetGlobalBuffer((__gm__ int32_t *)reqPoolEntries);
         cacheSlotsGm_.SetGlobalBuffer((__gm__ int32_t *)cacheSlotsPool);
@@ -174,8 +174,7 @@ public:
         constInfo_.kCacheBlockSize = BLOCK_SIZE;
         constInfo_.maxBlockNumPerBatch = tiling_->maxBlockNumPerBatch;
         constInfo_.outputLayout = VllmFastQLICommon::LI_LAYOUT::TND;
-        // SPARSE uses a shared durable prefix and DENSE selects per-route
-        // causal lengths explicitly in RunInfo.
+        // Both modes scan L and select per-route causal lengths in RunInfo.
         constInfo_.attenMaskFlag = false;
         constInfo_.isAccumSeqS1 = true;
         constInfo_.s1BaseSize = tiling_->fastQueryTileSize;
@@ -213,8 +212,8 @@ public:
                 routePairRowsGm_, blockTableGm_, cacheSlotsGm_,
                 topkSlotsGm_, routeMissCountsGm_);
             // Stage 1 publishes the complete miss-prefix/hit-suffix source
-            // row and the hit-slot suffix. Stage 2 repairs only miss slots and
-            // appends the paired causal tail.
+            // row and hit slots (including selected tail). Stage 2 repairs
+            // only prefix miss slots.
             vectorService_.InitMtpTopkSourceTensor(topkSourceIdsGm_);
             vectorService_.InitMtpThresholdTensor(routeThresholdsGm_);
             vectorService_.InitBuffers(pipe_);
@@ -267,9 +266,8 @@ public:
             const int32_t mode = rowModesGm_.GetValue(batch);
             const bool dense =
                 mode == static_cast<int32_t>(ROW_MODE_DENSE);
-            const uint32_t scanLen = dense
-                ? static_cast<uint32_t>(finalLengthsGm_.GetValue(batch))
-                : static_cast<uint32_t>(candidateLensGm_.GetValue(batch));
+            const uint32_t scanLen =
+                static_cast<uint32_t>(finalLengthsGm_.GetValue(batch));
             uint32_t poolRow = 0U;
             uint32_t budget = 0U;
             if (!dense) {
@@ -311,6 +309,8 @@ public:
                 run.kScaleLoop = s2 / 16U + 1U;
                 run.cacheRowIdx = poolRow;
                 run.cacheTokenCount = budget;
+                run.offloadedLen = dense ? 0U : static_cast<uint32_t>(
+                    offloadedLensGm_.GetValue(batch));
                 run.actS1Size = routeCount;
                 run.actS2Size = scanLen;
                 run.actS2SizeOrig = scanLen;
@@ -339,7 +339,7 @@ public:
                 run.indiceOutOffset =
                     static_cast<uint64_t>(queryStart) * TOPK;
                 run.workspaceRow = batch * ROUTES;
-                run.causalClip = dense;
+                run.causalClip = true;
                 run.denseDirectPublish = dense;
                 run.isFirstS2InnerLoop = s2 == 0U;
                 run.isLastS2InnerLoop = s2 + 1U == loopCount;
@@ -450,7 +450,7 @@ private:
     GlobalTensor<int32_t> blockTableGm_;
     GlobalTensor<int32_t> queryEndsGm_;
     GlobalTensor<int32_t> finalLengthsGm_;
-    GlobalTensor<int32_t> candidateLensGm_;
+    GlobalTensor<int32_t> offloadedLensGm_;
     GlobalTensor<int32_t> rowModesGm_;
     GlobalTensor<int32_t> reqPoolEntriesGm_;
     GlobalTensor<int32_t> cacheSlotsGm_;

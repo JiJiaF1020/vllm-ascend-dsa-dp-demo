@@ -14,8 +14,8 @@ using KvQuantSparseFlashAttentionTilingDataMla = VllmA5FusedCopySfaC8TilingData;
 template<bool SPLIT_HEADS>
 __global__ __aicore__ void vllm_a5_fused_copy_sfa_c8(
     GM_ADDR query, GM_ADDR hbmKvBytes, GM_ADDR dramKvBytes,
-    GM_ADDR hbmBlockTable, GM_ADDR dramBlockTable, GM_ADDR sparseAndTailSlots,
-    GM_ADDR sparseAndTailSrcIds, GM_ADDR perQueryMissCounts,
+    GM_ADDR hbmBlockTable, GM_ADDR dramBlockTable, GM_ADDR topkSlots,
+    GM_ADDR topkIndex, GM_ADDR perQueryMissCounts,
     GM_ADDR actualSeqLengthsQuery, GM_ADDR residentSeqLengths,
     GM_ADDR copySrcIds, GM_ADDR copyDstSlots, GM_ADDR copyCounts,
     GM_ADDR hbmKvAlias, GM_ADDR attentionOut, GM_ADDR workspace, GM_ADDR tiling)
@@ -44,11 +44,11 @@ __global__ __aicore__ void vllm_a5_fused_copy_sfa_c8(
         BaseApi::QSFAVectorService<Q, fp8_e4m3fn_t, float, Q, false, true,
             QSFA_LAYOUT::TND, QSFA_LAYOUT::PA_BSND, QSFATemplateMode::SCFA_TEMPLATE_MODE, SPLIT_HEADS>>::type;
     BaseApi::KvQuantSparseFlashAttentionMla<Cube, Vec> op;
-    op.Init(query, hbmKvBytes, hbmKvBytes, sparseAndTailSlots, nullptr, nullptr,
+    op.Init(query, hbmKvBytes, hbmKvBytes, topkSlots, nullptr, nullptr,
         hbmBlockTable, actualSeqLengthsQuery, residentSeqLengths, attentionOut,
         userWorkspace, &tilingData, &pipe);
-    op.InitSourceAwareGather(dramKvBytes, dramBlockTable, sparseAndTailSlots,
-        sparseAndTailSrcIds, perQueryMissCounts, &tilingData, !fallback,
+    op.InitSourceAwareGather(dramKvBytes, dramBlockTable, topkSlots,
+        topkIndex, perQueryMissCounts, &tilingData, !fallback,
         userWorkspace +
             static_cast<uint64_t>(tilingData.singleCoreParams.usedCoreNum) * 3 * 128 * 576 * 2);
     op.Process();

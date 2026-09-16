@@ -162,19 +162,24 @@ token数、target KV确实存在的verified边界和L2/L3 ready边界；“已�
 dump依据。为最终被拒draft换入的**历史**token仍合法，无需把它们从resident回滚，
 而provisional token本身不能进入persistent `cache_slots`或被发布为durable块。
 
-## 3. 共同durable历史与因果双尾
+## 3. 全可见域TopK与双尾存储
 
-令D为该请求共同durable满块前缀，Vq为query q的因果可见长度。每个query独立在`[0,D)`选Top2048，再全保留`[D,Vq)`；后半段最多由两块128-token parity tail表达。
+令D为该请求共同durable满块前缀，Vq为query q的因果可见长度。每个query独立在`[0,Vq)`选Top2048。`offloaded_lens=D`仅区分prefix与tail，用于COPY/淘汰，不限制LI搜索域。两块128-token parity tail仍保存尚未卸载的KV，但只有入选部分参与Attention。
 
 ```text
-attention输出： [TopK的2048列][因果双尾，最多256列]
+attention输出： [全可见域TopK的2048列，prefix miss在前，其余hit在后]
 物理tail slot： budget + token_position % 256
 无效/未写/未来/输出空位：-1
 ```
 
-2304是固定输出容量，不能让每个query无条件计算全部256个tail位置。`resident_lengths=budget+256`表示可寻址span，不代替可见长度。
+输出固定2048列。入选tail一律是hit，不写反向表、不计miss或union COPY。
+`resident_lengths=budget+256`仍表示可寻址span，不是参与Attention的token数。
+官方MTP QSFA使用`sparse_mode=0`，只计算传入索引；因果性由LIM选取逻辑token保证。
 
-旧2176策略也有双尾存储，但每个query只追加自己的当前尾块，跨界后某块可能进入该query的TopK候选。新策略将共同durable历史与双尾明确分离。例如D=8192、Vq跨过8320，8192..8319在新策略中仍以dense tail保留。因而这是选择语义升级，不是单纯修正数组长度，也不要求新旧策略逐token相同。
+旧2304策略是Top2048(D)+全部可见tail，本轮改为Top2048(Vq)，不是只改数组长度。
+例如D=8192、Vq跨过8320时，8192..8319参与LI竞争，不再强制全部参与Attention。
+双尾分配、写入与倒手保持不变，非MTP路径不变。packed-MTP L3语义标识更新为
+`full-visible-topk2048-tail-hit-v2`，旧策略对象不能复用；本轮框架迁移待A5验收。
 
 ## 4. LIM七输出
 
@@ -182,15 +187,15 @@ attention输出： [TopK的2048列][因果双尾，最多256列]
 
 | 顺序 | 语义 | 形状 |
 |---|---|---|
-| 0 | sparse与因果tail的resident slots | `[T,1,2304]` |
-| 1 | 与slots逐元素对应的logical source IDs | `[T,1,2304]` |
+| 0 | `topk_slots`，入选token的resident slots | `[T,1,2048]` |
+| 1 | `topk_index`，与slots逐元素对应的logical token IDs | `[T,1,2048]` |
 | 2 | per-query durable-prefix miss count | `[T]` |
 | 3 | 请求resident可寻址span | `[B]` |
 | 4 | 请求级去重copy source IDs | `[B,1,16384]` |
 | 5 | 请求级去重copy destination slots | `[B,1,16384]` |
 | 6 | 有效copy-prefix长度 | `[B]` |
 
-TopK区域按miss-prefix/hit-suffix排列，tail不参与miss union。多个query可重复选中同一source，因此第2项求和不等于第6项。当前KSC只消费4/5/6；新增输出为后续融合保留，不代表融合copy-SFA已实现。
+TopK区域按miss-prefix/hit-suffix排列，tail正常参与LI但不参与miss union。多个query可重复选中同一source，因此第2项求和不等于第6项。KSC只消费4/5/6；可选CopySFA直接消费配对TopK与per-query miss，union copy_count>512时内部先COPY再SFA。
 
 PAD不访问真实缓存；DENSE按完整因果可见KV选择，零copy；SPARSE维护resident状态。合法PAD/DENSE/SPARSE-steady混合可走快路径，first-fill使用填充路径。各核判定first-fill/steady的时序同步属于正确性合同，不是可随意删除的探针。
 
@@ -356,7 +361,7 @@ Indexer层数。下面shape中的128分别由block size或Indexer head dim的位
 | `index_weights` | BF16 `[T,H_idx]`；列stride为1，行stride至少H_idx |
 | `index_key_cache` | FP8 `[num_indexer_blocks,128,1,128]`，只允许物理block轴padding |
 | `index_key_dequant_scale` | 归一化view后FP32 `[num_indexer_blocks,128,1]`，只允许物理block轴padding |
-| 累计query end、candidate/final长度、row mode、pool entry | int32请求轴；SPARSE的`candidate_lens`是共同durable满块前缀D，DENSE为完整`tokens_after`并按query裁出因果可见范围 |
+| 累计query end、offloaded/final长度、row mode、pool entry | int32请求轴；SPARSE的`offloaded_lens`是共同durable满块前缀D，LI按final长度逐query搜索完整可见域；共享runtime内部该列仍名为candidate_lens |
 | `index_block_table` | int32 `[B,max_blocks]`，完整Indexer寻址 |
 | `cache_slots_pool` | int32 `[pool_capacity,token_capacity+1]`，末列为带符号budget |
 | 七个输出 | 第4节所列int32连续buffer，与所有输入位于同一device |
@@ -364,9 +369,9 @@ Indexer层数。下面shape中的128分别由block size或Indexer head dim的位
 以下C表示resident budget、F表示`final_seq_lengths_kv`，与已确认token水位分开。
 下层 LIM 与框架调度子集须分开：每请求累计 ends 的差值允许 Q=1..4，最后
 end 必须覆盖物理 T；SPARSE 要求 `C<=D<=min(W-1,128*M)`、D 按 128 对齐、
-`Q<=F<=W-1`、`D<=F-(Q-1)`、`F-D<=256`，C 为 8192/10240/12288。
+`Q<=F<=min(W-1,128*M)`、`D<=F-(Q-1)`、`F-D<=256`，C 为 8192/10240/12288。
 最早 query 允许零 tail。DENSE 底层按 F 和 query span 决定 visible length，
-不使用 candidate 值；正式 runtime 仍将该列写为 tokens_after。
+不使用 offloaded 值；正式 runtime 仍将该列写为 tokens_after。
 DENSE要求`Q<=F<=min(W-1,128*M)`，其中W为pool物理行宽，M为Indexer
 block-table列数；形状检查通过不等于设备长度和地址自动合法。
 
@@ -384,13 +389,13 @@ pool 的物理 W 按 architecture 11.2 对齐并在最高容量回退 raw width�
 已接入路径：直接接受`kw[:,head_dim:]`的行stride，向ACLNN传递`weight_stride`。
 两者保留的是“不为列后缀view逐层复制”的目标，不能把旧参数塞入当前19参数schema。
 同理，从`[B,1,16384]`切出`[..., :2048]`时，B>1的行stride仍是16384，不能假称
-紧凑连续输入。当前query输出是独立的2304列owner，直接交QSFA，不从copy plan切片。
+紧凑连续输入。当前query输出是独立的2048列owner，直接交QSFA，不从copy plan切片。
 
 ### 14.2 有效行先判定，再访问载荷
 
 | 情形 | 生产/消费约束 |
 |---|---|
-| SPARSE有效query | 2048个durable历史选择，加`[D,Vq)`的因果tail；source/slot逐元素配对，无重复KV参与softmax |
+| SPARSE有效query | 在完整`[0,Vq)`独立选2048项；入选tail为hit，只有prefix miss进入COPY；source/slot逐元素配对，无重复KV参与softmax |
 | DENSE有效query | `Vq<=2048`时完整因果前缀，否则在完整可见前缀选Top2048；不拼SPARSE双尾、不修改resident映射、copy=0 |
 | PAD | 不解引用真实pool/table/cache；当前attention source/slot空位为-1，miss/copy为0，不触发真实IO |
 | 正常copy=0 | KSC无载荷读写，不因poison source/destination/table内容报虚假miss |
@@ -398,7 +403,7 @@ pool 的物理 W 按 architecture 11.2 对齐并在最高容量回退 raw width�
 | 非法count/pair/table | 明确失败，负count不是正常空转，不带着半完成状态进入下一step |
 
 KSC的16384列只表示物理容量，前缀外内容不是额外copy job。测试可在未消费suffix放入
-poison，不能依赖“每步恰好被清空”；但当前2304列attention空位必须为-1，不能套用
+poison，不能依赖“每步恰好被清空”；但当前2048列attention空位必须为-1，不能套用
 旧BF16候选ABI中“attention suffix可未定义”的说法。旧动态query的无效后缀
 零输出合同另见提案，当前七输出没有`valid_target_query_count`。
 
@@ -463,7 +468,7 @@ wrapper仍有query连续化；不能把“weights无额外打包”扩大成“�
 | 请求生命周期 | 8191/8192/8193、32767/32768/32769、65535/65536/65537；0/1/2/3 draft接受交替；仅reject跨块、accepted跨块；EOS/max_tokens/stop、在线streaming、连续批次和释放压力 |
 | 多级prefix与DP | 三组件Local/L3恢复、verified发布epoch、HBM-only gap、空DP域/dummy/PAD无IO；target FULL graph与proposer eager组合 |
 
-新2304策略应与其自己的CPU因果golden对齐，不能以旧2176策略逐token相同作为通过条件。
+新2048策略应与完整可见域官方LI及原始逻辑KV的Attention golden对齐，不能以旧2176/2304策略逐token相同作为通过条件。SPARSE的2048项全部有效，严格校验，不以padding XFAIL豁免。
 端到端greedy token差异仍须分析；需要同时保留query span/position、逐层union/miss、
 copy plan、tail parity、confirmed/dumped watermark和accepted count，才能区分语义
 升级、量化数值差异与寻址/生命周期错误。

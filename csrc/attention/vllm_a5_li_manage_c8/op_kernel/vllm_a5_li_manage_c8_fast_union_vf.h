@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// MTP union 的寄存器级去重与因果双尾生成；只操作调用者提供的 UB scratch。
+// MTP union 的寄存器级去重；只操作调用者提供的 UB scratch。
 
 #ifndef VLLM_A5_LI_MANAGE_C8_FAST_UNION_VF_H
 #define VLLM_A5_LI_MANAGE_C8_FAST_UNION_VF_H
@@ -69,44 +69,6 @@ __simd_vf__ void DeduplicateSortedPairs(
             dst, compact, alignOut);
     }
     MicroAPI::StoreUnAlignPost(dst, alignOut);
-}
-
-// Each route has its own aligned UB row: MTE3 can publish all routes without
-// waiting between them or reusing a row that is still being read by DMA.
-__simd_vf__ void BuildCausalTailRows(
-    __ubuf__ uint32_t *slots, __ubuf__ uint32_t *sources,
-    uint32_t candidate, uint32_t budget, uint32_t finalLen,
-    uint32_t routeCount)
-{
-    MicroAPI::MaskReg all =
-        MicroAPI::CreateMask<uint32_t, MicroAPI::MaskPattern::ALL>();
-    MicroAPI::RegTensor<uint32_t> invalid;
-    MicroAPI::RegTensor<uint32_t> tailMask;
-    MicroAPI::RegTensor<uint32_t> cacheBudget;
-    MicroAPI::Duplicate(invalid, 0xffffffffU);
-    MicroAPI::Duplicate(tailMask, TAIL_CAPACITY - 1U);
-    MicroAPI::Duplicate(cacheBudget, budget);
-    for (uint32_t route = 0U; route < routeCount; ++route) {
-        MicroAPI::RegTensor<uint32_t> visible;
-        MicroAPI::Duplicate(visible, finalLen - (routeCount - 1U - route));
-        for (uint32_t offset = 0U; offset < TAIL_CAPACITY; offset += LANES) {
-            MicroAPI::RegTensor<int32_t> tokens;
-            MicroAPI::Arange(tokens, static_cast<int32_t>(candidate + offset));
-            auto &token = (MicroAPI::RegTensor<uint32_t>&)tokens;
-            MicroAPI::MaskReg valid;
-            MicroAPI::Compare<uint32_t, CMPMODE::LT>(valid, token, visible, all);
-            MicroAPI::RegTensor<uint32_t> slot;
-            MicroAPI::RegTensor<uint32_t> source;
-            MicroAPI::And(slot, token, tailMask, all);
-            MicroAPI::Add(slot, slot, cacheBudget, all);
-            MicroAPI::Select(slot, slot, invalid, valid);
-            MicroAPI::Select(source, token, invalid, valid);
-            MicroAPI::StoreAlign<uint32_t, MicroAPI::StoreDist::DIST_NORM>(
-                slots + route * TAIL_CAPACITY + offset, slot, all);
-            MicroAPI::StoreAlign<uint32_t, MicroAPI::StoreDist::DIST_NORM>(
-                sources + route * TAIL_CAPACITY + offset, source, all);
-        }
-    }
 }
 
 } // namespace VllmA5LiManageC8FastUnionVF

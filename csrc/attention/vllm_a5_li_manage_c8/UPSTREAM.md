@@ -1,33 +1,32 @@
-# LIM-MTP SIMT migration
+# LIM-MTP SIMT / full-visible TopK2048 migration
 
 Source: `ops_lidu_scattercopy_sfa_a5`, commit
-`2f80de6fb5df1d941164ad5cec7f144f5025e4ce`
-(includes SIMT `0fc1c89` and victim scan rotation `eb80083`).
+`6732a649a36e4829994aa6cbdbd7ad6616333180`.
 
-Only LIM-MTP sources are migrated. Framework CMake/registration, seven-output
-2304 ABI, KSC guards, scheduler, prefix/L3 lifecycle and Python calls are retained.
-The existing SPDX header in `vllm_a5_li_manage_c8_fast_union_vf.h` is retained.
+The host C++ and kernel tree match the standalone operator, except for the
+retained SPDX header in `vllm_a5_li_manage_c8_fast_union_vf.h`. Framework CMake
+and `_C_ascend` registration remain framework-owned.
 
-Both fast union and the mixed cold/steady manager seed eviction scans from the
-current `final_seq_lengths_kv[b]`, never physical pool row. Candidate length still
-bounds the scanned durable prefix; tails do not enter that domain. A new length
-may rotate the start, but modulo collisions are allowed. This is a policy change
-from the previous candidate-only seed, not a promise of identical old/new slots
-or full-model token outputs. Request-local SIMT metadata is refreshed per call.
+The MTP ABI now uses `offloaded_lens`, `topk_slots`, `topk_index`; paired
+outputs are caller-owned `[T,1,2048]`. Each query selects TopK over its complete
+causal KV domain. Selected tail tokens are hits at `C + token % 256`, never
+union-copy sources or reverse-table entries. Only the durable prefix is managed.
+Both steady paths seed eviction from `hash(final_seq_lengths_kv[b])`.
 
-SIMT migration includes the 216 KiB user-UB reservation and cold QLI 8K chunk.
-Rebuild the CANN operators and framework extension on the target Ascend machine.
+This integration upgrades the MTP3-configured target path, retaining ragged
+R=1..4 support, PAD/DENSE and first-fill/steady. Non-MTP, KSC, two parity tail
+allocation/dump/write logic, and resident span C+256 are unchanged.
+MTP QSFA uses sparse_mode=0; the L3 attention-semantics fingerprint is versioned.
 
-Host checks:
+Rebuild **both** CANN operators and the Torch extension, restart workers and
+recapture graphs. Host-only checks do not validate A5 synchronization or
+full-model output. Hardware acceptance:
 
 ```bash
-python -m unittest discover -s tests/ut/dsa_offload -p test_li_manage_c8_simt.py -v
+python examples/dsa_demo/run_a5_mtp_operator_tests.py
 ```
 
-These cover unsigned victim unpack, update/index bounds, batched repair, UB
-arithmetic and scan rotation/coverage. They cannot validate A5 synchronization.
-Before accepting on hardware, run the existing A5 tests in
-`tests/e2e/nightly/single_node/ops/singlecard_ops/test_dsa_a5_c8_ops.py`, especially
-`test_packed_c8_mtp_pool_row_relocation_diagnostic` and
-`test_packed_c8_mtp_lim_mixed_2304_graph_replay`, plus prefix/L3 cold/warm/reentry
-inference comparisons. Do not relax assertions to accept unexplained differences.
+The native checks compare against independent full-visible LI TopK, logical KV
+attention golden, real swapped-memory copies, and fixed-address graph replay.
+Then run MTP3 inference with split/fused, eager/graph, and prefix/L3 cold/warm
+paths. Single-operator test results are not framework hardware acceptance.

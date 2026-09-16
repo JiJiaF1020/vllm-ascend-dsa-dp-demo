@@ -61,10 +61,10 @@ public:
     {
         const uint32_t t = (batch == 0 ? 0 : actualSeqQlenAddr[batch - 1]) + query;
         // The LIM contract is a valid prefix followed by -1, including DENSE and PAD.
-        uint32_t lo = 0, hi = 2304;
+        uint32_t lo = 0, hi = 2048;
         while (lo < hi) {
             const uint32_t mid = (lo + hi) / 2;
-            if (attentionSlots.GetValue(static_cast<uint64_t>(t) * 2304 + mid) >= 0) lo = mid + 1;
+            if (attentionSlots.GetValue(static_cast<uint64_t>(t) * 2048 + mid) >= 0) lo = mid + 1;
             else hi = mid;
         }
         return lo;

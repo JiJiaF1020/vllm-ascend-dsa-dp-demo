@@ -26,7 +26,7 @@ using namespace QLIKernel;
 constexpr uint32_t BLOCK_SIZE = 128;
 constexpr uint32_t HEAD_DIM = 128;
 constexpr uint32_t TOPK = 2048;
-constexpr uint32_t ATTENTION_CAPACITY = TOPK + 2U * BLOCK_SIZE;
+constexpr uint32_t ATTENTION_CAPACITY = TOPK;
 constexpr uint32_t MAX_QUERIES_PER_REQUEST = 4;
 constexpr int32_t ROW_MODE_DENSE = 1;
 constexpr int32_t ROW_MODE_SPARSE = 2;
@@ -69,9 +69,9 @@ public:
         GM_ADDR indexWeights, GM_ADDR query, GM_ADDR queryDequantScale,
         GM_ADDR actualSeqLengthsQuery, GM_ADDR indexKeyCache,
         GM_ADDR indexKeyDequantScale, GM_ADDR indexBlockTable,
-        GM_ADDR candidateLens, GM_ADDR finalSeqLengthsKv,
+        GM_ADDR offloadedLens, GM_ADDR finalSeqLengthsKv,
         GM_ADDR rowModes,
-        GM_ADDR sparseAndTailSlots, GM_ADDR userWorkspace)
+        GM_ADDR topkSlots, GM_ADDR userWorkspace)
     {
         if ASCEND_IS_AIV {
             subBlockIdx_ = GetBlockIdx();
@@ -83,7 +83,7 @@ public:
 
         actualSeqLengthsQueryGm_.SetGlobalBuffer(
             (__gm__ int32_t *)actualSeqLengthsQuery);
-        candidateLensGm_.SetGlobalBuffer((__gm__ int32_t *)candidateLens);
+        offloadedLensGm_.SetGlobalBuffer((__gm__ int32_t *)offloadedLens);
         finalSeqLengthsKvGm_.SetGlobalBuffer(
             (__gm__ int32_t *)finalSeqLengthsKv);
         rowModesGm_.SetGlobalBuffer((__gm__ int32_t *)rowModes);
@@ -124,12 +124,12 @@ public:
                 (__gm__ float *)queryDequantScale);
             keyScaleGm_.SetGlobalBuffer(
                 (__gm__ float *)indexKeyDequantScale);
-            sparseAndTailSlotsGm_.SetGlobalBuffer(
-                (__gm__ int32_t *)sparseAndTailSlots);
+            topkSlotsGm_.SetGlobalBuffer(
+                (__gm__ int32_t *)topkSlots);
             vectorService_.InitParams(constInfo_);
             vectorService_.InitVecInputTensor(
                 weightsGm_, queryScaleGm_, keyScaleGm_,
-                sparseAndTailSlotsGm_, indexBlockTableGm_);
+                topkSlotsGm_, indexBlockTableGm_);
             vectorService_.InitVecWorkspaceTensor(scoreWorkspace);
             vectorService_.InitBuffers(pipe_);
         } else {
@@ -177,15 +177,12 @@ public:
             if (!IsValidSelectionRequest(batch, queryStart, queryEnd)) {
                 continue;
             }
-            const int32_t mode = rowModesGm_.GetValue(batch);
             for (uint32_t queryRow = queryStart; queryRow < queryEnd;
                  ++queryRow) {
                 const uint32_t finalLen = static_cast<uint32_t>(
                     finalSeqLengthsKvGm_.GetValue(batch));
                 const uint32_t candidate =
-                    mode == ROW_MODE_DENSE
-                    ? QueryVisibleLen(queryRow, queryEnd, finalLen)
-                    : static_cast<uint32_t>(candidateLensGm_.GetValue(batch));
+                    QueryVisibleLen(queryRow, queryEnd, finalLen);
                 if (candidate <= TOPK) {
                     continue;
                 }
@@ -298,15 +295,15 @@ private:
         const uint32_t finalLenU32 = static_cast<uint32_t>(finalLen);
         const uint32_t candidate = mode == ROW_MODE_DENSE
             ? QueryVisibleLen(queryEnd - 1U, queryEnd, finalLenU32)
-            : static_cast<uint32_t>(candidateLensGm_.GetValue(batch));
+            : static_cast<uint32_t>(offloadedLensGm_.GetValue(batch));
         if (mode == ROW_MODE_SPARSE &&
             (candidate % BLOCK_SIZE != 0U ||
              candidate > finalLenU32 - (queryEnd - queryStart - 1U) ||
              finalLenU32 - candidate > 2U * BLOCK_SIZE)) {
             return false;
         }
-        return candidate > TOPK &&
-            candidate <= tiling_->maxCandidateLen;
+        return finalLenU32 > TOPK &&
+            finalLenU32 <= tiling_->maxCandidateLen;
     }
 
     __aicore__ inline uint32_t QueryVisibleLen(
@@ -332,10 +329,10 @@ private:
     GlobalTensor<float> keyScaleGm_;
     GlobalTensor<int32_t> actualSeqLengthsQueryGm_;
     GlobalTensor<int32_t> indexBlockTableGm_;
-    GlobalTensor<int32_t> candidateLensGm_;
+    GlobalTensor<int32_t> offloadedLensGm_;
     GlobalTensor<int32_t> finalSeqLengthsKvGm_;
     GlobalTensor<int32_t> rowModesGm_;
-    GlobalTensor<int32_t> sparseAndTailSlotsGm_;
+    GlobalTensor<int32_t> topkSlotsGm_;
 };
 } // namespace
 
@@ -343,9 +340,9 @@ extern "C" __global__ __aicore__ void vllm_a5_li_manage_c8(
     GM_ADDR indexWeights, GM_ADDR query, GM_ADDR queryDequantScale,
     GM_ADDR actualSeqLengthsQuery, GM_ADDR indexKeyCache,
     GM_ADDR indexKeyDequantScale, GM_ADDR indexBlockTable,
-    GM_ADDR candidateLens, GM_ADDR finalSeqLengthsKv, GM_ADDR rowModes,
+    GM_ADDR offloadedLens, GM_ADDR finalSeqLengthsKv, GM_ADDR rowModes,
     GM_ADDR reqPoolEntries, GM_ADDR cacheSlotsPool,
-    GM_ADDR sparseAndTailSlots, GM_ADDR sparseAndTailSrcIds,
+    GM_ADDR topkSlots, GM_ADDR topkIndex,
     GM_ADDR perQueryMissCounts, GM_ADDR residentSeqLengths,
     GM_ADDR copySrcIds, GM_ADDR copyDstSlots, GM_ADDR copyCounts,
     GM_ADDR workspace, GM_ADDR tiling)
@@ -358,7 +355,7 @@ extern "C" __global__ __aicore__ void vllm_a5_li_manage_c8(
 
     const bool requiresColdPath =
         vllm_a5_li_manage_c8_fast::RequiresColdPath(
-            actualSeqLengthsQuery, candidateLens, finalSeqLengthsKv,
+            actualSeqLengthsQuery, offloadedLens, finalSeqLengthsKv,
             rowModes, reqPoolEntries, cacheSlotsPool, &tilingData);
     SynchronizePathDecision();
     if (!requiresColdPath) {
@@ -381,10 +378,8 @@ extern "C" __global__ __aicore__ void vllm_a5_li_manage_c8(
         GM_ADDR routePairRows = userWorkspace + routePairOffset;
         GM_ADDR routeThresholds = userWorkspace + routeThresholdOffset;
         GM_ADDR routeMissCounts = userWorkspace + routeCountOffset;
-        // Stable Stage 1 writes the sparse slot prefixes directly into the
-        // caller-owned ABI output. No private full-TopK slot workspace is
-        // needed; Stage 2 repairs miss prefixes in place and appends tails.
-        GM_ADDR topkSlots = sparseAndTailSlots;
+        // Stage 1 writes prefix/tail hits directly into the caller-owned
+        // TopK output. Stage 2 only repairs prefix miss slots in place.
 
         vllm_a5_li_manage_c8_fast::QuantLiMtpPhase qli(
             &pipe, &tilingData);
@@ -392,9 +387,9 @@ extern "C" __global__ __aicore__ void vllm_a5_li_manage_c8(
             indexWeights, query, queryDequantScale,
             actualSeqLengthsQuery, indexKeyCache, indexKeyDequantScale,
             finalSeqLengthsKv,
-            reqPoolEntries, cacheSlotsPool, candidateLens, rowModes,
+            reqPoolEntries, cacheSlotsPool, offloadedLens, rowModes,
             indexBlockTable, routePairRows, topkSlots,
-            sparseAndTailSrcIds,
+            topkIndex,
             routeThresholds, routeMissCounts,
             userWorkspace);
         qli.Process();
@@ -407,10 +402,9 @@ extern "C" __global__ __aicore__ void vllm_a5_li_manage_c8(
                 unionOp.Init(
                     routePairRows, routeThresholds, routeMissCounts,
                     userWorkspace, actualSeqLengthsQuery,
-                    candidateLens, finalSeqLengthsKv,
+                    offloadedLens, finalSeqLengthsKv,
                     rowModes, reqPoolEntries, cacheSlotsPool, copySrcIds,
-                    copyDstSlots, copyCounts, topkSlots,
-                    sparseAndTailSlots, sparseAndTailSrcIds,
+                    copyDstSlots, copyCounts, topkSlots, topkIndex,
                     perQueryMissCounts, residentSeqLengths,
                     tilingData.tokenCapacity, tilingData.outputCapacity,
                     tilingData.fastScoreRowStride,
@@ -428,9 +422,9 @@ extern "C" __global__ __aicore__ void vllm_a5_li_manage_c8(
     qli.Init(
         indexWeights, query, queryDequantScale,
         actualSeqLengthsQuery, indexKeyCache,
-        indexKeyDequantScale, indexBlockTable, candidateLens,
+        indexKeyDequantScale, indexBlockTable, offloadedLens,
         finalSeqLengthsKv,
-        rowModes, sparseAndTailSlots, userWorkspace);
+        rowModes, topkSlots, userWorkspace);
     qli.Process();
 
     pipe.Reset();
@@ -439,10 +433,10 @@ extern "C" __global__ __aicore__ void vllm_a5_li_manage_c8(
             vllm_a5_mtp_manager::VllmA5LiManageC8Kernel manager(
                 &pipe, &tilingData);
             manager.Init(
-                sparseAndTailSlots, actualSeqLengthsQuery,
-                candidateLens, finalSeqLengthsKv, rowModes,
-                reqPoolEntries, cacheSlotsPool, sparseAndTailSlots,
-                sparseAndTailSrcIds, perQueryMissCounts,
+                topkSlots, actualSeqLengthsQuery,
+                offloadedLens, finalSeqLengthsKv, rowModes,
+                reqPoolEntries, cacheSlotsPool, topkSlots,
+                topkIndex, perQueryMissCounts,
                 residentSeqLengths, copySrcIds, copyDstSlots,
                 copyCounts, GetBlockIdx() / 2U, ATTENTION_CAPACITY);
             manager.Process();

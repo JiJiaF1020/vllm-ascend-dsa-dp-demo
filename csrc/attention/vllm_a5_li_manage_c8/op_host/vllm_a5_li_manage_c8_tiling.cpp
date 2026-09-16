@@ -21,7 +21,7 @@ enum InputIndex : size_t {
     INDEX_KEY_CACHE,
     INDEX_KEY_DEQUANT_SCALE,
     INDEX_BLOCK_TABLE,
-    CANDIDATE_LENS,
+    OFFLOADED_LENS,
     FINAL_SEQ_LENGTHS_KV,
     ROW_MODES,
     REQ_POOL_ENTRIES,
@@ -31,7 +31,7 @@ enum InputIndex : size_t {
 constexpr int64_t BLOCK_SIZE = 128;
 constexpr int64_t HEAD_DIM = 128;
 constexpr int64_t TOPK = 2048;
-constexpr int64_t ATTENTION_CAPACITY = TOPK + 2 * BLOCK_SIZE;
+constexpr int64_t ATTENTION_CAPACITY = TOPK;
 constexpr int64_t OUTPUT_CAPACITY = 16384;
 constexpr int64_t MAX_QUERIES_PER_REQUEST = 4;
 constexpr int64_t MAX_TOKEN_CAPACITY = 1 << 18;
@@ -81,7 +81,7 @@ static ge::graphStatus TilingVllmA5LiManageC8(
         return ge::GRAPH_FAILED;
     }
     for (size_t index : {
-             ACTUAL_SEQ_LENGTHS_QUERY, INDEX_BLOCK_TABLE, CANDIDATE_LENS,
+             ACTUAL_SEQ_LENGTHS_QUERY, INDEX_BLOCK_TABLE, OFFLOADED_LENS,
              FINAL_SEQ_LENGTHS_KV, ROW_MODES, REQ_POOL_ENTRIES,
              CACHE_SLOTS_POOL}) {
         if (dtype(index) != ge::DT_INT32) {
@@ -104,7 +104,7 @@ static ge::graphStatus TilingVllmA5LiManageC8(
     const gert::Shape blockTable =
         context->GetInputShape(INDEX_BLOCK_TABLE)->GetStorageShape();
     const gert::Shape candidate =
-        context->GetInputShape(CANDIDATE_LENS)->GetStorageShape();
+        context->GetInputShape(OFFLOADED_LENS)->GetStorageShape();
     const gert::Shape finalLengths =
         context->GetInputShape(FINAL_SEQ_LENGTHS_KV)->GetStorageShape();
     const gert::Shape modes =

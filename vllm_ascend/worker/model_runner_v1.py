@@ -409,7 +409,7 @@ class NPUModelRunner(GPUModelRunner):
         if dsa_config.enable_fused_copy_sfa and not (
             self.dsa_offload_packed_c8 and dsa_config.mtp_enabled
         ):
-            raise RuntimeError("CopySFA requires A5 packed-C8 DSA offload with MTP (2304 slots)")
+            raise RuntimeError("CopySFA requires A5 packed-C8 DSA offload with MTP (2048 slots)")
         target_resident_layer_count = self.model_config.get_num_layers(
             self.parallel_config
         )

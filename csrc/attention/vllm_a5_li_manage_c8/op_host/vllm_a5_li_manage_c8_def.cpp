@@ -28,7 +28,7 @@ public:
             .IgnoreContiguous();
         this->Input("index_block_table").ParamType(REQUIRED)
             .DataType(ints).Format(formats);
-        this->Input("candidate_lens").ParamType(REQUIRED)
+        this->Input("offloaded_lens").ParamType(REQUIRED)
             .DataType(ints).Format(formats);
         this->Input("final_seq_lengths_kv").ParamType(REQUIRED)
             .DataType(ints).Format(formats);
@@ -41,9 +41,9 @@ public:
         this->Attr("key_stride").Int();
         this->Attr("scale_stride").Int();
         this->Attr("weight_stride").Int();
-        this->Output("sparse_and_tail_slots").ParamType(REQUIRED)
+        this->Output("topk_slots").ParamType(REQUIRED)
             .DataType(ints).Format(formats);
-        this->Output("sparse_and_tail_src_ids").ParamType(REQUIRED)
+        this->Output("topk_index").ParamType(REQUIRED)
             .DataType(ints).Format(formats);
         this->Output("per_query_miss_counts").ParamType(REQUIRED)
             .DataType(ints).Format(formats);

@@ -124,8 +124,8 @@ inline void check_fused_copy_sfa_c8(const at::Tensor& query,
     const at::Tensor& dram_kv_bytes,
     const at::Tensor& hbm_block_table,
     const at::Tensor& dram_block_table,
-    const at::Tensor& sparse_and_tail_slots,
-    const at::Tensor& sparse_and_tail_src_ids,
+    const at::Tensor& topk_slots,
+    const at::Tensor& topk_index,
     const at::Tensor& per_query_miss_counts,
     const at::Tensor& actual_seq_lengths_query,
     const at::Tensor& resident_seq_lengths,
@@ -151,9 +151,9 @@ inline void check_fused_copy_sfa_c8(const at::Tensor& query,
     TORCH_CHECK(table->dim() == 2 && table->size(0) == b && table->size(1) > 0 &&
         table->size(1) <= 2048, "block tables must be [B,1..2048]");
   }
-  for (const auto* ids : {&sparse_and_tail_slots, &sparse_and_tail_src_ids}) {
+  for (const auto* ids : {&topk_slots, &topk_index}) {
     TORCH_CHECK(ids->dim() == 3 && ids->size(0) == t && ids->size(1) == 1 &&
-        ids->size(2) == 2304, "MTP attention indices must be [T,1,2304]");
+        ids->size(2) == 2048, "MTP attention indices must be [T,1,2048]");
   }
   for (const auto* ids : {&copy_src_ids, &copy_dst_slots}) {
     TORCH_CHECK(ids->dim() == 3 && ids->size(0) == b && ids->size(1) == 1 &&
@@ -163,7 +163,7 @@ inline void check_fused_copy_sfa_c8(const at::Tensor& query,
       actual_seq_lengths_query.dim() == 1 && actual_seq_lengths_query.size(0) == b &&
       resident_seq_lengths.dim() == 1 && resident_seq_lengths.size(0) == b,
       "misses [T], query ends and resident lengths [B] required");
-  for (const auto* meta : {&hbm_block_table, &dram_block_table, &sparse_and_tail_slots, &sparse_and_tail_src_ids, &per_query_miss_counts, &actual_seq_lengths_query, &resident_seq_lengths, &copy_src_ids, &copy_dst_slots, &copy_counts}) {
+  for (const auto* meta : {&hbm_block_table, &dram_block_table, &topk_slots, &topk_index, &per_query_miss_counts, &actual_seq_lengths_query, &resident_seq_lengths, &copy_src_ids, &copy_dst_slots, &copy_counts}) {
     TORCH_CHECK(meta->scalar_type() == at::kInt, "all metadata must be int32");
   }
   TORCH_CHECK(attention_out.dim() == 3 && attention_out.size(0) == t &&
@@ -171,7 +171,7 @@ inline void check_fused_copy_sfa_c8(const at::Tensor& query,
       attention_out.scalar_type() == query.scalar_type(),
       "attention_out must be caller-owned [T,H,512] with query dtype");
   TORCH_CHECK(std::isfinite(scale_value), "scale_value must be finite");
-  for (const auto* tensor : {&query, &hbm_kv_bytes, &dram_kv_bytes, &hbm_block_table, &dram_block_table, &sparse_and_tail_slots, &sparse_and_tail_src_ids, &per_query_miss_counts, &actual_seq_lengths_query, &resident_seq_lengths, &copy_src_ids, &copy_dst_slots, &copy_counts, &attention_out}) {
+  for (const auto* tensor : {&query, &hbm_kv_bytes, &dram_kv_bytes, &hbm_block_table, &dram_block_table, &topk_slots, &topk_index, &per_query_miss_counts, &actual_seq_lengths_query, &resident_seq_lengths, &copy_src_ids, &copy_dst_slots, &copy_counts, &attention_out}) {
     TORCH_CHECK(tensor->device() == query.device() && tensor->is_contiguous(),
         "fused_copy_sfa_c8 tensors must be contiguous on one device");
   }
@@ -181,8 +181,8 @@ inline void npu_dsa_a5_fused_copy_sfa_c8_out(const at::Tensor& query,
     const at::Tensor& dram_kv_bytes,
     const at::Tensor& hbm_block_table,
     const at::Tensor& dram_block_table,
-    const at::Tensor& sparse_and_tail_slots,
-    const at::Tensor& sparse_and_tail_src_ids,
+    const at::Tensor& topk_slots,
+    const at::Tensor& topk_index,
     const at::Tensor& per_query_miss_counts,
     const at::Tensor& actual_seq_lengths_query,
     const at::Tensor& resident_seq_lengths,
@@ -190,17 +190,17 @@ inline void npu_dsa_a5_fused_copy_sfa_c8_out(const at::Tensor& query,
     const at::Tensor& copy_dst_slots,
     const at::Tensor& copy_counts,
     double scale_value, const at::Tensor& attention_out) {
-  check_fused_copy_sfa_c8(query, hbm_kv_bytes, dram_kv_bytes, hbm_block_table, dram_block_table, sparse_and_tail_slots, sparse_and_tail_src_ids, per_query_miss_counts, actual_seq_lengths_query, resident_seq_lengths, copy_src_ids, copy_dst_slots, copy_counts, scale_value, attention_out);
+  check_fused_copy_sfa_c8(query, hbm_kv_bytes, dram_kv_bytes, hbm_block_table, dram_block_table, topk_slots, topk_index, per_query_miss_counts, actual_seq_lengths_query, resident_seq_lengths, copy_src_ids, copy_dst_slots, copy_counts, scale_value, attention_out);
   TORCH_CHECK(query.device().is_privateuseone(), "fused_copy_sfa_c8 requires NPU");
-  auto keepalive = std::make_tuple(query, hbm_kv_bytes, dram_kv_bytes, hbm_block_table, dram_block_table, sparse_and_tail_slots, sparse_and_tail_src_ids, per_query_miss_counts, actual_seq_lengths_query, resident_seq_lengths, copy_src_ids, copy_dst_slots, copy_counts, attention_out);
+  auto keepalive = std::make_tuple(query, hbm_kv_bytes, dram_kv_bytes, hbm_block_table, dram_block_table, topk_slots, topk_index, per_query_miss_counts, actual_seq_lengths_query, resident_seq_lengths, copy_src_ids, copy_dst_slots, copy_counts, attention_out);
   EXEC_DSA_COPYSFA_ORDERED_IMPL(aclnnVllmA5FusedCopySfaC8, keepalive, copysfa_detail::AllocateCopySfaWorkspace,
       query,
       hbm_kv_bytes,
       dram_kv_bytes,
       hbm_block_table,
       dram_block_table,
-      sparse_and_tail_slots,
-      sparse_and_tail_src_ids,
+      topk_slots,
+      topk_index,
       per_query_miss_counts,
       actual_seq_lengths_query,
       resident_seq_lengths,
