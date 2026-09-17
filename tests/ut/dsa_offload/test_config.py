@@ -582,6 +582,60 @@ def test_compromise_mtp3_contract_is_accepted() -> None:
     assert config.mtp_cache_layer_count == 1
     assert config.uniform_decode_query_len == 4
     assert config.sparse_tail_block_count == 2
+    assert config.resident_budget_tokens == (8192, 10240, 12288)
+
+
+@pytest.mark.parametrize("budget", range(8192, 16001, 128))
+def test_mtp_accepts_all_expanded_aligned_budgets(budget: int) -> None:
+    config = DSAOffloadConfig.from_dict(
+        {
+            "enabled": True,
+            "sparse_activation_tokens": 8192,
+            "resident_budget_tokens": [budget, budget, budget],
+        },
+        vllm_config=_vllm_config(speculative_config=_mtp_config()),
+    )
+    config.validate_finalized_cache_contract(_vllm_config())
+    assert config.resident_budget_tokens == (budget,) * 3
+    assert config.max_resident_budget_tokens == budget
+    assert config.sparse_tail_block_count == 2
+
+
+def test_mtp_accepts_custom_non_decreasing_budget_tiers() -> None:
+    config = DSAOffloadConfig.from_dict(
+        {
+            "enabled": True,
+            "sparse_activation_tokens": 8192,
+            "resident_budget_tokens": [8320, 12416, 16000],
+        },
+        vllm_config=_vllm_config(speculative_config=_mtp_config()),
+    )
+    assert config.resident_budget_tokens == (8320, 12416, 16000)
+    assert config.max_resident_budget_tokens == 16000
+    with pytest.raises(ValueError, match="non-decreasing"):
+        DSAOffloadConfig.from_dict({"resident_budget_tokens": [12288, 8320, 16000]})
+
+
+@pytest.mark.parametrize("budget", [8064, 8193, 16001, 16128, 16256, 16384])
+def test_mtp_rejects_out_of_range_or_unaligned_budgets(budget: int) -> None:
+    with pytest.raises(ValueError, match="not supported"):
+        DSAOffloadConfig.from_dict(
+            {
+                "enabled": True,
+                "sparse_activation_tokens": 8192,
+                "resident_budget_tokens": [budget] * 3,
+            },
+            vllm_config=_vllm_config(speculative_config=_mtp_config()),
+        )
+
+
+@pytest.mark.parametrize("budget", [8320, 12416, 16000])
+def test_non_mtp_does_not_inherit_expanded_mtp_budgets(budget: int) -> None:
+    with pytest.raises(ValueError, match="non-MTP resident budgets"):
+        DSAOffloadConfig.from_dict(
+            {"enabled": True, "resident_budget_tokens": [budget] * 3},
+            vllm_config=_vllm_config(),
+        )
 
 
 def test_mtp_cache_layer_index_range_is_explicit() -> None:
@@ -610,7 +664,7 @@ def test_mtp_cache_layer_index_range_is_explicit() -> None:
         (
             _mtp_config(),
             {},
-            "resident budgets must be one of",
+            "resident budgets must be",
         ),
         (
             _mtp_config(),

@@ -106,6 +106,31 @@ def test_enter_marks_every_layer_for_first_fill_once() -> None:
     )
 
 
+@pytest.mark.parametrize("budget", [8320, 12416, 16000])
+def test_expanded_budget_metadata_and_max_slot_survive_steady(budget: int) -> None:
+    pool = DSAResidentTokenPool(
+        max_num_reqs=2,
+        num_layers=2,
+        max_model_len=32768,
+        max_resident_budget_tokens=16000,
+        device=torch.device("cpu"),
+    )
+    row = pool.acquire("req")
+    pool.prepare_sparse_request("req", target_budget_tokens=budget)
+    for layer_id in range(pool.num_layers):
+        slots = pool.get_cache_slots(layer_id)
+        assert slots[row, -1].item() == -budget
+        slots[row, :budget] = torch.arange(budget, dtype=torch.int32)
+        slots[row, -1] = budget
+    pool.prepare_sparse_request("req", target_budget_tokens=budget)
+    for layer_id in range(pool.num_layers):
+        slots = pool.get_cache_slots(layer_id)
+        assert slots[row, -1].item() == budget
+        assert slots[row, budget - 1].item() == budget - 1
+        assert torch.all(slots[row, budget:-1] == -1)
+        assert torch.all(slots[pool.padding_pool_index, :-1] == -1)
+
+
 def test_padding_row_is_not_allocatable() -> None:
     pool = _make_pool()
 

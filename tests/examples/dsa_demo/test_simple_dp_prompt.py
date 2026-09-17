@@ -27,6 +27,8 @@ def demo(monkeypatch):
             chinese_5k=["5k"],
             chinese_70k=["70k"],
             chinese_40k=["40k"],
+            chinese_10k=["10k"],
+            chinese_64k=["64k"],
         ),
     )
     return importlib.import_module("simple_dp_prompt_test")
@@ -111,6 +113,25 @@ def test_settings_build_isolated_spmd_kwargs(demo, mode, dsa, mtp, l3, monkeypat
         assert kwargs["kv_transfer_config"]["kv_connector_extra_config"]["direct_hbm_load"] is False
     else:
         assert "kv_transfer_config" not in kwargs
+
+
+@pytest.mark.parametrize(
+    "mtp,custom_budgets,expected",
+    [
+        (True, None, [8192, 10240, 12288]),
+        (True, [8320, 12416, 16000], [8320, 12416, 16000]),
+        (True, [16000, 16000, 16000], [16000, 16000, 16000]),
+        (False, [16000, 16000, 16000], [6144, 10240, 12288]),
+    ],
+)
+def test_resident_budget_configuration_preserves_defaults(demo, mtp, custom_budgets, expected):
+    c = demo._settings()
+    c.update(ENABLE_DSA_OFFLOAD=True, ENABLE_MTP=mtp)
+    if custom_budgets is not None:
+        c["DSA_MTP_RESIDENT_BUDGET_TOKENS"] = custom_budgets
+    dsa = demo._build_kwargs(c)["additional_config"]["dsa_sparse_config"]
+    assert dsa["resident_budget_tokens"] == expected
+    assert dsa["sparse_activation_tokens"] == (8192 if mtp else 6144)
 
 
 def test_single_domain_and_native_baseline_controls(demo):

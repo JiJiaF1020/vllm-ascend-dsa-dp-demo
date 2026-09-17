@@ -9,16 +9,43 @@
 #include <vector>
 
 #define __simt_callee__
+#define __aicore__
 #define __gm__
 #define __ubuf__
 #include "lim_simt_postprocess_algorithms.h"
 #include "lim_simt_config.h"
+#include "vllm_a5_li_manage_c8_budget.h"
+
+static void CheckBudgetBounds()
+{
+    uint32_t accepted = 0U;
+    for (uint32_t budget = 0U; budget <= 32768U; ++budget) {
+        const bool expected = budget >= 8192U && budget <= 16000U && budget % 128U == 0U;
+        assert(vllm_a5_li_manage_c8_budget::IsSupported(budget) == expected);
+        if (!expected) {
+            continue;
+        }
+        ++accepted;
+        // Both prefix slot C-1 and all 256 tail slots round-trip unchanged,
+        // even with the maximum 18-bit token ID. Neither miss marker aliases.
+        for (uint32_t slot = budget - 1U; slot < budget + 256U; ++slot) {
+            const uint32_t payload = (slot << 18U) | 262143U;
+            int32_t decodedSlot = -1, decodedToken = -1;
+            lim_simt::UnpackVictim(payload, &decodedSlot, &decodedToken, 0U);
+            assert(decodedSlot == static_cast<int32_t>(slot));
+            assert(decodedToken == 262143);
+            assert(slot < 0x3ffeU && payload != 0xffffffffU);
+        }
+    }
+    assert(accepted == 62U);
+    assert(!vllm_a5_li_manage_c8_budget::IsSupported(0xffffffffU));
+}
 
 static void CheckVictimUnpack(uint32_t required)
 {
     constexpr uint32_t guard = 7U; // deliberately not a 32B-aligned prefix
     constexpr int32_t sentinel = -777;
-    for (const uint32_t budget : {8192U, 10240U, 12288U}) {
+    for (uint32_t budget = 8192U; budget <= 16000U; budget += 128U) {
         std::vector<int32_t> destinations(required + 2U * guard, sentinel);
         std::vector<int32_t> victims(destinations);
         auto expectedDestinations = destinations;
@@ -61,10 +88,9 @@ static void CheckVictimUnpack(uint32_t required)
     assert(destination == 16383 && victim == 262143);
 }
 
-static void CheckUpdates(uint32_t count, uint32_t firstInvalid)
+static void CheckUpdates(uint32_t count, uint32_t firstInvalid, uint32_t budget)
 {
     constexpr uint32_t capacity = 1U << 18U;
-    constexpr uint32_t budget = 12288U;
     constexpr uint64_t stride = capacity + 1U;
     constexpr uint64_t rowBase = 2U * stride;
     std::vector<int32_t> pool(4U * stride, -1);
@@ -75,8 +101,8 @@ static void CheckUpdates(uint32_t count, uint32_t firstInvalid)
     }
     for (uint32_t i = 0; i < count; ++i) {
         source[i] = static_cast<int32_t>(capacity - count + i);
-        victim[i] = static_cast<int32_t>(i);
-        destination[i] = static_cast<int32_t>(i);
+        victim[i] = static_cast<int32_t>(budget - count + i);
+        destination[i] = static_cast<int32_t>(budget - count + i);
     }
     if (firstInvalid < count) {
         destination[firstInvalid] = budget;
@@ -258,9 +284,12 @@ static_assert(FastUb(64, 2) <= LIM_SIMT_USER_UB_BYTES);
 static_assert(ColdUb(32) <= LIM_SIMT_USER_UB_BYTES);
 static_assert(ColdUb(64) <= LIM_SIMT_USER_UB_BYTES);
 static_assert(2U*65536U + 32768U + 96U + 128U <= LIM_SIMT_USER_UB_BYTES);
+static_assert(4U*2048U*4U + vllm_a5_li_manage_c8_budget::MAX_CACHE_TOKENS +
+              16384U*4U + 32U <= LIM_SIMT_USER_UB_BYTES); // Cold manager buffers.
 
 int main()
 {
+    CheckBudgetBounds();
     assert(!lim_simt::ValidPair(-1, 0, 0, 262144, 12288));
     assert(!lim_simt::ValidPair(0, -1, 0, 262144, 12288));
     assert(!lim_simt::ValidPair(0, 0, -1, 262144, 12288));
@@ -268,14 +297,16 @@ int main()
     for (const uint32_t count : {0U, 1U, 31U, 32U, 33U, 255U, 256U, 257U,
                                 300U, 500U, 511U, 512U, 513U, 2048U, 2049U, 8192U}) {
         CheckVictimUnpack(count);
-        CheckUpdates(count, count);
-        if (count) {
-            CheckUpdates(count, 0);
-            CheckUpdates(count, count/2);
-            CheckUpdates(count, count-1);
+        for (const uint32_t budget : {8192U, 12288U, 16000U}) {
+            CheckUpdates(count, count, budget);
+            if (count) {
+                CheckUpdates(count, 0, budget);
+                CheckUpdates(count, count/2, budget);
+                CheckUpdates(count, count-1, budget);
+            }
         }
         CheckRepair(count);
     }
     CheckBatchedRepairs();
-    std::cout << "SIMT_POSTPROCESS_HOST_OK victim_unpack=1 batched_repair=1 indexing=1 bounds=1 update_order=1 ub_plan=1\n";
+    std::cout << "SIMT_POSTPROCESS_HOST_OK victim_unpack=1 batched_repair=1 indexing=1 bounds=1 update_order=1 ub_plan=1 budgets=62\n";
 }

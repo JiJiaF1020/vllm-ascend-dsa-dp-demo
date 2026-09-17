@@ -220,6 +220,40 @@ def test_mtp_lookahead_expands_the_shared_split_block_table() -> None:
     assert plan.tail_tokens == 9
 
 
+@pytest.mark.parametrize("budget", [8320, 12416, 16000])
+def test_expanded_mtp_budget_preserves_enter_and_steady_layout(budget: int) -> None:
+    planner = DSARequestCachePlanner(
+        block_size=128,
+        sparse_activation_tokens=8192,
+        prompt_budget_thresholds=(32768, 65536),
+        resident_budget_tokens=(budget,) * 3,
+        sparse_tail_block_count=2,
+    )
+    request = _Request("req", budget - 128, budget - 128, 1, budget - 127)
+    dense = planner.plan(request, num_new_tokens=4, max_model_len=32768)
+    assert dense.stage == DSARequestCacheStage.DENSE_DECODE
+    planner.commit(dense)
+
+    request.num_computed_tokens = budget + 128
+    request.num_output_tokens = 257
+    request.num_tokens = budget + 129
+    enter = planner.plan(request, num_new_tokens=4, num_lookahead_tokens=3, max_model_len=32768)
+    assert enter.stage == DSARequestCacheStage.ENTER_SPARSE_DECODE
+    assert enter.sparse_budget_tokens == budget
+    assert enter.resident_tail_block_count == 2
+    assert enter.tail_tokens == 1
+    planner.commit(enter)
+
+    request.num_computed_tokens += 4
+    request.num_output_tokens += 4
+    request.num_tokens += 4
+    steady = planner.plan(request, num_new_tokens=4, num_lookahead_tokens=3, max_model_len=32768)
+    assert steady.stage == DSARequestCacheStage.SPARSE_DECODE
+    assert steady.sparse_budget_tokens == budget
+    assert steady.resident_tail_block_count == 2
+    assert not steady.replace_resident_blocks
+
+
 def test_commit_reuses_the_slotted_state_object_across_decode_steps() -> None:
     planner = _make_planner()
     request = _Request("req", 3000, 0, 0, 3000)

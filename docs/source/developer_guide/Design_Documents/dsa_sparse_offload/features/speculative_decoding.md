@@ -17,7 +17,7 @@
 
 Proposer全HBM源于当前BF16算子/布局合同，不是为了让MTP永远绕过多级缓存。**Active decode是否做token-wise swap**和**verified prefix是否下沉**是独立决策。
 
-配置限定`method=mtp`、3个draft、greedy、`async_scheduling=False`。Target resident预算为8192/10240/12288，proposer full-cache容量由其spec和Indexer/MLA比例共同决定，不把target budget套给proposer。
+配置限定`method=mtp`、3个draft、greedy、`async_scheduling=False`。Target resident预算默认8192/10240/12288，可配置为8192..16000内128的倍数；proposer full-cache容量由其spec和Indexer/MLA比例共同决定，不把target budget套给proposer。
 
 ### 1.1 权重精度不等于Cache格式
 
@@ -136,7 +136,8 @@ Scheduler/request级metadata仍为B行，TND query输出为T行。算子支持�
 和pool row按请求行寻址；不能因`T!=B`把所有请求metadata一起扩为T行。
 
 固定MTP3的空间保证为`|union(TopK_q)| <= Q_b*2048 <= 8192`，故不必把容量决定交给
-sampler。8192/10240/12288保持按prompt分档，默认阈值32768/65536；边界准入还要满足
+sampler。预算按prompt分档，默认8192/10240/12288、阈值32768/65536；配置项
+`resident_budget_tokens`允许8192..16000内128的倍数，要求非递减；边界准入还要满足
 durable满块候选足够覆盖budget，不能用“本轮乐观长度刚到8192”直接触发first-fill。
 
 ### 2.1 Frontier、Bonus与真正可持久化的KV
@@ -369,7 +370,7 @@ Indexer层数。下面shape中的128分别由block size或Indexer head dim的位
 以下C表示resident budget、F表示`final_seq_lengths_kv`，与已确认token水位分开。
 下层 LIM 与框架调度子集须分开：每请求累计 ends 的差值允许 Q=1..4，最后
 end 必须覆盖物理 T；SPARSE 要求 `C<=D<=min(W-1,128*M)`、D 按 128 对齐、
-`Q<=F<=min(W-1,128*M)`、`D<=F-(Q-1)`、`F-D<=256`，C 为 8192/10240/12288。
+`Q<=F<=min(W-1,128*M)`、`D<=F-(Q-1)`、`F-D<=256`，C 为8192..16000内128的倍数。
 最早 query 允许零 tail。DENSE 底层按 F 和 query span 决定 visible length，
 不使用 offloaded 值；正式 runtime 仍将该列写为 tokens_after。
 DENSE要求`Q<=F<=min(W-1,128*M)`，其中W为pool物理行宽，M为Indexer

@@ -216,8 +216,8 @@ KV-cache metrics/events 等未建立完整合同的组合。
 
 - `block_size=128`；
 - `max_model_len <= 262144`；
-- non-MTP resident budget 只能取 `6144/10240/12288`；MTP3 只能取
-  `8192/10240/12288`，且都与 block size 对齐；
+- non-MTP resident budget 只能取 `6144/10240/12288`；MTP3 支持
+  `8192..16000` 内128的倍数，默认分档仍为 `8192/10240/12288`；
 - LIDU caller-owned 输出列宽固定为 `16384`；
 - Indexer head dim 为 128，MLA latent/rope 维度为 512/64；
 - 当前 Indexer heads 支持 32 或 64。
@@ -802,7 +802,7 @@ A5 路径不消费 A3 的 `tail_info` scratch；融合算子已把有效尾部 s
 
 MTP 的 copy plan/`cache_slots` 仍为 `B` 行，`topk_slots` 与 `topk_index` 均为 `int32[T,1,2048]`，`T=sum(Q_b)`，算子支持每请求 1～4 条 query 混合。各 query 独立在完整因果可见域 `[0,V_q)` 选 Top2048。SPARSE 的 `offloaded_lens[B]` 是共享 durable DRAM prefix D，仅用于分类、COPY 和淘汰，不限制 LI 搜索域。入选 tail 一律为 hit，slot=`budget+token%256`；不额外追加 tail，不为 tail 写反向表或生成 COPY。两份输出逐元素配对，保持 miss 在前、hit 在后；`per_query_miss_counts[T]` 只统计入选的 durable-prefix miss。`resident_seq_lengths[B]` 仍为 `budget+256` 的可寻址 span，DENSE 为最终原始 KV 长度，PAD 为 0。
 
-本轮从单算子仓 `6732a649a36e4829994aa6cbdbd7ad6616333180` 同步全可见域 TopK2048，替换旧“durable Top2048+全部因果双尾”的 2304 策略。双 parity block 分配、写入、倒手和 budget 均不变。仅升级固定 MTP3 配置的 target 链，保留运行时 R=1～4；非 MTP 仍使用原算子和 2176。官方 MTP QSFA 使用 `sparse_mode=0`，因果性由 LIM 的逻辑 token 选择保证，不对重排后的 resident slots 再施加因果裁剪。升级必须联合重编译 host/kernel/ACLNN/Torch 扩展，重新启动并捕获图。
+当前从单算子仓 `1bc07a54edb8b7db98d439584a76092aa7800ea5` 同步全可见域 TopK2048，替换旧“durable Top2048+全部因果双尾”的 2304 策略。双 parity block 分配、写入、倒手和默认 budget 均不变；MTP预算范围放宽到8192..16000内128的倍数，slot14/token18编码不变。仅升级固定 MTP3 配置的 target 链，保留运行时 R=1～4；非 MTP 仍使用原算子和 2176。官方 MTP QSFA 使用 `sparse_mode=0`，因果性由 LIM 的逻辑 token 选择保证，不对重排后的 resident slots 再施加因果裁剪。升级必须联合重编译 host/kernel/ACLNN/Torch 扩展，重新启动并捕获图。
 
 七输出顺序保持不变；query source/miss 供可选 CopySFA 使用，KSC 仍只消费请求级
 去重 copy plan。KSC 保留错误 count/pair/table 的设备断言，错误 `-1` 不可当作正常
@@ -1178,7 +1178,7 @@ B/H下发为UINT32而当前没有统一的极值截窄检查；physical ID值又
 KSC不接收请求query ends、query级miss、2176/2048 attention表或多层arena列表。
 框架non-MTP和MTP都传请求级copy src/dst/count，MTP的
 `per_query_miss_counts[T]`不能替代`copy_counts[B]`。
-non-MTP预算6144/10240/12288、MTP预算8192/10240/12288属于框架/producer子集，
+non-MTP预算6144/10240/12288、MTP预算8192..16000（128对齐）属于框架/producer子集，
 不是KSC仅允许这些count；底层count的整个0..16384范围均有copy-prefix语义。
 
 OpDef仅注册ascend950，HBM以同名Input/Output声明ref；InferShape复制HBM输入shape，
@@ -2531,7 +2531,7 @@ worker required-op set 按 A3/A5 和是否启用 MTP 选择，A5 还检查原生
 | `43a533145f`、迁移前 `d77f8a383c` | 17 / 5 | 2176 |
 | 候选 `d44387d3a9` | 19 / 7 | 2176 |
 | 候选 `3f644e34ec`、`3b5d0ecdc0` 及迁移前的合同 | 19 / 7 | 2304 |
-| 当前同步单算子仓 `6732a649a3`，全可见域 TopK | 19 / 7；输入改名 offloaded_lens，输出 topk_slots/topk_index | 2048 |
+| 当前同步单算子仓 `1bc07a54ed`，全可见域 TopK、预算放宽 | 19 / 7；offloaded_lens、topk_slots/topk_index；MTP C=8192..16000、128对齐 | 2048 |
 
 当前初始化检查 19 参数、新输入名及七输出名称顺序，可拒绝旧命名的 MTP schema。
 但 schema 不含列宽，也不认证已加载 kernel 的构建哈希，不能据此接受新 binding
@@ -2600,7 +2600,7 @@ non-MTP 对应源码链为 `vllm_a5_li_manage_nomtp_c8_torch_adpt.h`、该目录
 独立 non-MTP 门禁应覆盖：三档 6144/10240/12288，DENSE 2048/2049，SPARSE
 `F%128=0/1/127`、first-fill C 个 copy 到 steady 0/部分/2048 miss、合法 weights
 行 stride、PAD→active、B 跨 mixed-group 数及最高模型容量 W 回退。
-MTP 三档另为 8192/10240/12288；应分别确认 tile2/tile4、partial tile、cold
+MTP 默认三档为 8192/10240/12288，新范围8192..16000按128对齐；应分别确认 tile2/tile4、partial tile、cold
 整 batch、最早 query 零 tail、正式 runtime 最多 131 tail 与下层 256 tail 容量。
 以上是验证要求，不代表本次文档核验重新执行了设备测试。
 

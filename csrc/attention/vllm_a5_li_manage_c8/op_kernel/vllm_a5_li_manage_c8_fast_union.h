@@ -4,6 +4,7 @@
 #define VLLM_A5_LI_MANAGE_C8_FAST_UNION_H
 
 #include "kernel_operator.h"
+#include "vllm_a5_li_manage_c8_budget.h"
 #include "vllm_a5_li_manage_c8_fast_union_vf.h"
 #include "vllm_a5_li_manage_c8_fast_victim_vf.h"
 #include "vllm_a5_li_manage_c8_fast_workspace.h"
@@ -19,6 +20,7 @@ constexpr int32_t UNION_ROW_MODE_PAD = 0;
 constexpr int32_t UNION_ROW_MODE_DENSE = 1;
 constexpr int32_t UNION_ROW_MODE_SPARSE = 2;
 constexpr uint32_t UNION_CAPACITY = UNION_ROUTES * UNION_TOPK;
+static_assert(vllm_a5_li_manage_c8_budget::MAX_CACHE_TOKENS <= 2U * UNION_CAPACITY);
 constexpr uint32_t UNION_PAIR_WORDS = UNION_TOPK * 2U;
 constexpr uint32_t UNION_SOURCE_MASK = (1U << 18U) - 1U;
 constexpr uint32_t B32_VECTOR_ELEMENTS = 64U;
@@ -354,7 +356,7 @@ private:
             return written;
         }
         // One int32 marker per physical cache slot fits in pairInputBuf_
-        // because the MTP cache budget is capped at 12288.
+        // (16384 int32 words), including the maximum MTP budget of 16000.
         LocalTensor<int32_t> protectedSlots =
             pairInputBuf_.Get<int32_t>();
         Duplicate(protectedSlots, static_cast<int32_t>(0), budget);
@@ -828,7 +830,7 @@ private:
             return false;
         }
         budget = static_cast<uint32_t>(metadata);
-        return (budget == 8192U || budget == 10240U || budget == 12288U) &&
+        return vllm_a5_li_manage_c8_budget::IsSupported(budget) &&
             budget <= candidate;
     }
 

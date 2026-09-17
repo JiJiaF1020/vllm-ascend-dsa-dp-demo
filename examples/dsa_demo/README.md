@@ -120,11 +120,12 @@ python -m pytest tests/e2e/nightly/single_node/ops/singlecard_ops/test_dsa_a5_c8
 差值为0不等于完整top-k集合相同，也不等于全量logits一致。
 仅整理已有结果不需要NPU、vLLM或重启服务；差异仅作为诊断证据，不自动判精度通过/失败。
 
-MTP路径同步单算子仓 `6732a649a36e4829994aa6cbdbd7ad6616333180`：
+MTP路径同步单算子仓 `1bc07a54edb8b7db98d439584a76092aa7800ea5`：
 逐query在全部因果可见KV上选Top2048，入选tail为hit，不再追加dense tail。
 LIM输入 `offloaded_lens` 仍传已卸载的durable前缀长度；输出
 `topk_slots/topk_index` 均为 `[T,1,2048]`，官方QSFA使用 `sparse_mode=0`。
-双parity tail、缓存预算、块分配/倒手及KSC不改，resident长度仍为C+256。
+双parity tail、默认预算、块分配/倒手及KSC不改，resident长度仍为C+256。
+MTP预算现支持 `8192..16000` 内任意128的倍数，slot14/token18编码及算子ABI不变。
 仅升级MTP3配置的target路径，保留其运行时R=1～4、PAD/DENSE/first-fill/steady；
 非MTP继续使用原算子、2176输出及QSFA mode=3。MTP Attention语义标识已更新，
 旧L3对象隔离；不会改变非MTP的语义标识。本轮框架集成仍需以下A5验收。
@@ -1434,7 +1435,7 @@ SAFETENSORS_LOAD_STRATEGY="prefetch"
 ENABLE_MTP="true"
 ```
 
-启动脚本会同时改用 `sparse_activation_tokens=8192`、resident 档位
+启动脚本默认使用 `sparse_activation_tokens=8192`、resident 档位
 `8192/10240/12288`，并传入
 `{"method":"mtp","num_speculative_tokens":3,"enforce_eager":true}`。MTP3 只接受
 `temperature=0.0`；target 可复用 uniform FULL graph，GLM proposer 按社区
@@ -1447,6 +1448,24 @@ complete block bytes 中增加 MTP BF16 page。
 DRAM plane，也不增加 steady proposer copy。
 若修改了 `SERVED_MODEL_NAME`，同步把 `stream_chat_client.py` 顶部的
 `MODEL_NAME` 改成相同值。
+
+MTP预算通过现有 `additional_config["dsa_sparse_config"]["resident_budget_tokens"]`
+配置，每档取值为 `8192..16000` 内128的倍数，按prompt档位非递减，档数等于
+`prompt_budget_thresholds` 数量加一。默认阈值 `[32768,65536]` 和默认三档
+`[8192,10240,12288]` 均不变；非MTP仍只支持原三档 `[6144,10240,12288]`。
+
+在 `simple_prompt_test.py`、`simple_dp_prompt_test.py`、`qa_dataset_test.py`
+顶部修改 `DSA_MTP_RESIDENT_BUDGET_TOKENS` 即可，例如统一使用最大预算：
+
+```python
+DSA_MTP_RESIDENT_BUDGET_TOKENS = [16000, 16000, 16000]
+```
+
+`serve_dsa.sh` 同名配置写成JSON字符串 `'[16000,16000,16000]'`。
+预算只在启动前配置；HBM预算区和两个tail block随配置自动分配，无需改块管理逻辑。
+增大预算会增加每请求HBM占用，并推迟到durable prefix足够长时才first-fill；
+不影响proposer full-cache预算。更新算子后重编译安装、重启并重新捕获图，
+用上方 `run_a5_mtp_operator_tests.py` 验证新预算后再做整网测试。
 
 DSA L3 P1-W/P1-R 都需要先启动 Mooncake Master。仅验证 write-behind 时设置：
 

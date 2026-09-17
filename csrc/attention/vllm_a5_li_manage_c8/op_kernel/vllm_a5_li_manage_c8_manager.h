@@ -9,6 +9,7 @@
 
 #include "kernel_operator.h"
 #include "vllm_a5_li_manage_c8_tiling.h"
+#include "vllm_a5_li_manage_c8_budget.h"
 #include "vllm_a5_li_manage_c8_victim_scan.h"
 
 #ifndef VLLM_A5_LI_MANAGE_C8_MANAGER_H
@@ -27,15 +28,16 @@ constexpr uint32_t ATTENTION_CAPACITY = TOPK;
 constexpr uint32_t OUTPUT_CAPACITY = 16384;
 constexpr uint32_t MAX_QUERIES_PER_REQUEST = 4;
 constexpr uint32_t CACHE_CHUNK = 2048;
-constexpr uint32_t MAX_CACHE_TOKENS = 12288;
+using vllm_a5_li_manage_c8_budget::MAX_CACHE_TOKENS;
 constexpr uint32_t HASH_CAPACITY = 16384;
 constexpr uint32_t HASH_MASK = HASH_CAPACITY - 1;
+static_assert(MAX_CACHE_TOKENS < HASH_CAPACITY);
+static_assert(MAX_CACHE_TOKENS <= OUTPUT_CAPACITY);
 // One 32-bit hash payload packs {slot14, token18}; MISS_SLOT is outside every
 // supported C, and HASH_EMPTY stays distinct even for token 2^18-1.
 constexpr uint32_t TOKEN_MASK = (1U << 18) - 1U;
 constexpr uint32_t SLOT_SHIFT = 18;
-// 14 slot bits can encode [0, 16383]. 12288 is a legal first slot in the
-// largest budget's parity-0 tail, so it cannot also serve as the miss marker.
+// Keep the original 14-bit miss marker outside every supported prefix/tail.
 constexpr uint32_t MISS_SLOT = 0x3ffeU;
 constexpr uint32_t HASH_EMPTY = 0xffffffffU;
 constexpr int32_t INVALID = -1;
@@ -471,9 +473,7 @@ private:
         budget = static_cast<uint32_t>(firstFill ? -metadata : metadata);
         // MTP3 最坏情况下四路 top-2048 完全不重合，因此最低档必须
         // 能容纳 8192 个 token。6144 只属于非 MTP 路径。
-        const bool supportedBudget =
-            budget == 8192U || budget == 10240U || budget == 12288U;
-        if (!supportedBudget || budget > MAX_CACHE_TOKENS ||
+        if (!vllm_a5_li_manage_c8_budget::IsSupported(budget) ||
             budget > sourceLen) {
             return false;
         }

@@ -6,6 +6,7 @@
 #include "kernel_operator.h"
 #include "lib/matmul_intf.h"
 #include "vllm_a5_li_manage_c8_tiling.h"
+#include "vllm_a5_li_manage_c8_budget.h"
 #include "vllm_a5_li_manage_c8_fast_workspace.h"
 
 // The vendored payload implementation has private namespaces and include
@@ -117,7 +118,8 @@ __aicore__ inline bool RequiresColdPath(
             return true;
         }
         const int32_t budget = metadata;
-        if ((budget != 8192 && budget != 10240 && budget != 12288) ||
+        if (!vllm_a5_li_manage_c8_budget::IsSupported(
+                static_cast<uint32_t>(budget)) ||
             budget > candidate) {
             return true;
         }

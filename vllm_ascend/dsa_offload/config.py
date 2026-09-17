@@ -19,7 +19,9 @@ from vllm_ascend.dsa_offload.contracts import (
     DSA_KV_LORA_RANK,
     DSA_LIDU_OUTPUT_CAPACITY,
     DSA_LIDU_SUPPORTED_RESIDENT_BUDGETS,
+    DSA_MTP_MAX_RESIDENT_BUDGET,
     DSA_MTP_MAX_SPECULATIVE_TOKENS,
+    DSA_MTP_MIN_RESIDENT_BUDGET,
     DSA_MTP_SUPPORTED_RESIDENT_BUDGETS,
     DSA_NOMTP_SUPPORTED_RESIDENT_BUDGETS,
     DSA_QK_ROPE_HEAD_DIM,
@@ -337,8 +339,10 @@ class DSAOffloadConfig:
         if unsupported:
             raise ValueError(
                 "Resident budgets are not supported by the current LIDU "
-                f"kernel: unsupported={unsupported}, supported="
-                f"{DSA_LIDU_SUPPORTED_RESIDENT_BUDGETS}"
+                f"kernel: unsupported={unsupported}; non-MTP supports "
+                f"{DSA_NOMTP_SUPPORTED_RESIDENT_BUDGETS}, MTP supports "
+                f"{DSA_MTP_MIN_RESIDENT_BUDGET}..{DSA_MTP_MAX_RESIDENT_BUDGET} "
+                f"aligned to {DSA_REQUIRED_CACHE_BLOCK_SIZE}"
             )
         if self.sparse_activation_tokens > budgets[0]:
             raise ValueError("sparse_activation_tokens cannot exceed the smallest resident budget")
@@ -505,8 +509,9 @@ class DSAOffloadConfig:
             )
             if unsupported_mtp_budgets:
                 raise ValueError(
-                    "DSA compromise MTP resident budgets must be one of "
-                    f"{DSA_MTP_SUPPORTED_RESIDENT_BUDGETS}; unsupported="
+                    "DSA compromise MTP resident budgets must be "
+                    f"{DSA_MTP_MIN_RESIDENT_BUDGET}..{DSA_MTP_MAX_RESIDENT_BUDGET} "
+                    f"aligned to {DSA_REQUIRED_CACHE_BLOCK_SIZE}; unsupported="
                     f"{unsupported_mtp_budgets}"
                 )
             mtp_min_activation_tokens = DSA_MTP_SUPPORTED_RESIDENT_BUDGETS[0]

@@ -81,6 +81,7 @@ RESULT_JSON: str | None = None
 DSA_SPARSE_ACTIVATION_TOKENS = 6144
 DSA_PROMPT_BUDGET_THRESHOLDS = [32768, 65536]
 DSA_RESIDENT_BUDGET_TOKENS = [6144, 10240, 12288]
+DSA_MTP_RESIDENT_BUDGET_TOKENS = [8192, 10240, 12288]  # MTP: 8192..16000，128 对齐、非递减
 DSA_INDEXER_MLA_BLOCK_RATIO = 2
 DSA_MAX_ACTIVE_REQS = 128
 DSA_HOT_CPU_BLOCK_MULTIPLE = 1.0
@@ -131,7 +132,7 @@ from vllm.config import KVTransferConfig, ProfilerConfig  # noqa: E402
 
 def build_dsa_config(enable_graph: bool) -> dict[str, Any]:
     sparse_activation_tokens = 8192 if ENABLE_MTP else DSA_SPARSE_ACTIVATION_TOKENS
-    resident_budget_tokens = [8192, 10240, 12288] if ENABLE_MTP else DSA_RESIDENT_BUDGET_TOKENS
+    resident_budget_tokens = DSA_MTP_RESIDENT_BUDGET_TOKENS if ENABLE_MTP else DSA_RESIDENT_BUDGET_TOKENS
     return {
         "enabled": True,
         "split_indexer_cache": True,

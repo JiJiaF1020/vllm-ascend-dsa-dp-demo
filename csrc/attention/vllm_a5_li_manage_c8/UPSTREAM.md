@@ -1,7 +1,7 @@
 # LIM-MTP SIMT / full-visible TopK2048 migration
 
 Source: `ops_lidu_scattercopy_sfa_a5`, commit
-`6732a649a36e4829994aa6cbdbd7ad6616333180`.
+`1bc07a54edb8b7db98d439584a76092aa7800ea5`.
 
 The host C++ and kernel tree match the standalone operator, except for the
 retained SPDX header in `vllm_a5_li_manage_c8_fast_union_vf.h`. Framework CMake
@@ -18,6 +18,12 @@ R=1..4 support, PAD/DENSE and first-fill/steady. Non-MTP, KSC, two parity tail
 allocation/dump/write logic, and resident span C+256 are unchanged.
 MTP QSFA uses sparse_mode=0; the L3 attention-semantics fingerprint is versioned.
 
+MTP resident budgets now accept every multiple of 128 in [8192, 16000].
+Slot14/token18 encoding and the ABI are unchanged. The cold manager's protected
+slot buffer covers the new upper bound. Framework `resident_budget_tokens`
+validation matches the kernel; default MTP tiers remain [8192, 10240, 12288],
+non-MTP tiers remain [6144, 10240, 12288]. Tail allocation remains C+256.
+
 Rebuild **both** CANN operators and the Torch extension, restart workers and
 recapture graphs. Host-only checks do not validate A5 synchronization or
 full-model output. Hardware acceptance:
@@ -28,5 +34,7 @@ python examples/dsa_demo/run_a5_mtp_operator_tests.py
 
 The native checks compare against independent full-visible LI TopK, logical KV
 attention golden, real swapped-memory copies, and fixed-address graph replay.
+They include C=8192/8320/12416/16000 first-fill, steady and split-chain graphs.
+The fused-chain lifecycle replay also covers C=16000.
 Then run MTP3 inference with split/fused, eager/graph, and prefix/L3 cold/warm
 paths. Single-operator test results are not framework hardware acceptance.

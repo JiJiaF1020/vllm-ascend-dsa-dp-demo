@@ -930,9 +930,10 @@ def test_packed_c8_mtp_pool_row_relocation_diagnostic() -> None:
     print("[mtp-pool-row] POOL_ROW_INVARIANCE_PASSED; synthetic LIM/QSFA, not full-model validation", flush=True)
 
 
-def test_packed_c8_mtp_2048_copy_qsfa_chain_eager_and_graph() -> None:
+@pytest.mark.parametrize("budget", [8192, 8320, 12416, 16000])
+def test_packed_c8_mtp_2048_copy_qsfa_chain_eager_and_graph(budget: int) -> None:
     """Strict TopK2048, real H2D and independent logical attention golden."""
-    candidate, budget, routes, tail_capacity = 8320, 8192, 4, 256
+    candidate, routes, tail_capacity = budget + _BLOCK_SIZE, 4, 256
     final_len = candidate + tail_capacity
     inputs = _make_fused_lidu_inputs(candidate_len=candidate, final_len=final_len, row_mode=2, batch=routes, seed=83)
     for name in ("block_table", "candidate_lens", "final_lens", "row_modes", "req_entries"):
@@ -1260,8 +1261,9 @@ def test_packed_c8_mtp_lim_full_visible_topk_tail_boundaries(source_len, visible
 
 
 @pytest.mark.parametrize("heads", [32, 64])
-def test_packed_c8_mtp_lim_steady_fast_path_updates_prefix_union_and_tail_hits(heads: int) -> None:
-    budget, candidate, routes = 8192, 8320, 4
+@pytest.mark.parametrize("budget", [8192, 8320, 12416, 16000])
+def test_packed_c8_mtp_lim_steady_fast_path_updates_prefix_union_and_tail_hits(heads: int, budget: int) -> None:
+    candidate, routes = budget + _BLOCK_SIZE, 4
 
     def make_request(seed):
         inputs = _make_disjoint_mtp_lidu_inputs(
@@ -1935,9 +1937,9 @@ def test_packed_c8_ksc_copies_one_opaque_row() -> None:
     assert torch.equal(hbm[0, 3, 0].cpu(), expected)
 
 
-def _make_copysfa_chain_case(query_counts, modes, *, miss_count=300, first_fill=False, tail=64):
+def _make_copysfa_chain_case(query_counts, modes, *, miss_count=300, first_fill=False, tail=64, budget=8192):
     """Real SIMT LIM inputs; attention golden uses original logical KV + native LI."""
-    candidate, budget = 12288, 8192
+    candidate = budget + 4096  # Leave room for misses without under-filling the resident cache.
     batch, total = len(query_counts), sum(query_counts)
     inputs = _make_disjoint_mtp_lidu_inputs(
         query_counts=query_counts,
@@ -2128,19 +2130,20 @@ def _copysfa_reset(state, reference):
     d["out"].fill_(float("nan"))
 
 
-def test_packed_c8_copysfa_simt_chain_eager_and_dynamic_graph():
+@pytest.mark.parametrize("budget", [8192, 16000])
+def test_packed_c8_copysfa_simt_chain_eager_and_dynamic_graph(budget: int):
     require_dsa_offload_ops(packed_c8=True, mtp=True, fused_copy_sfa=True)
     # Every state has identical allocation shapes but a different device-side
     # lifecycle/query distribution. Independent physical blocks for each request.
     states = [
-        _make_copysfa_chain_case([1, 2, 3, 4], [2, 2, 2, 2], miss_count=0),
-        _make_copysfa_chain_case([1, 2, 3, 4], [2, 2, 2, 2], miss_count=300),
-        _make_copysfa_chain_case([4, 1, 2, 3], [0, 1, 2, 2], miss_count=512, tail=129),
-        _make_copysfa_chain_case([1, 2, 3, 4], [2, 2, 2, 2], miss_count=513),
-        _make_copysfa_chain_case([4, 1, 2, 3], [0, 1, 2, 2], first_fill=True, tail=256),
+        _make_copysfa_chain_case([1, 2, 3, 4], [2, 2, 2, 2], miss_count=0, budget=budget),
+        _make_copysfa_chain_case([1, 2, 3, 4], [2, 2, 2, 2], miss_count=300, budget=budget),
+        _make_copysfa_chain_case([4, 1, 2, 3], [0, 1, 2, 2], miss_count=512, tail=129, budget=budget),
+        _make_copysfa_chain_case([1, 2, 3, 4], [2, 2, 2, 2], miss_count=513, budget=budget),
+        _make_copysfa_chain_case([4, 1, 2, 3], [0, 1, 2, 2], first_fill=True, tail=256, budget=budget),
     ]
     # Keep references immutable while overwriting the captured input buffers.
-    active = _make_copysfa_chain_case([1, 2, 3, 4], [2, 2, 2, 2], miss_count=0)
+    active = _make_copysfa_chain_case([1, 2, 3, 4], [2, 2, 2, 2], miss_count=0, budget=budget)
     for reference in states:
         _copysfa_reset(active, reference)
         _launch_copysfa_chain(active)

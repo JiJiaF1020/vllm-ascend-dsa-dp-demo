@@ -89,7 +89,8 @@ ENABLE_FUSED_COPYSFA = False
 DSA_SPARSE_ACTIVATION_TOKENS = 6144  # 非MTP下超过该长度才进入稀疏路径
 DSA_PROMPT_BUDGET_THRESHOLDS = [32768, 65536]
 DSA_RESIDENT_BUDGET_TOKENS = [6144, 10240, 12288]  # 非MTP三个长度档的HBM驻留预算
-# 当前妥协版MTP3固定使用activation=8192、驻留预算[8192,10240,12288]。
+DSA_MTP_RESIDENT_BUDGET_TOKENS = [8192, 10240, 12288]  # MTP: 8192..16000，128 对齐、非递减
+# MTP3 activation 仍为 8192；驻留预算可独立修改，默认三档不变。
 DSA_INDEXER_MLA_BLOCK_RATIO = 4  # Indexer/MLA块容量比例，不是DP之间的比例
 DSA_HOT_CPU_BLOCK_MULTIPLE = 1.0  # 每域L2相对本域Indexer块数的倍数，仍受节点预算限制
 DSA_MAX_ACTIVE_REQS = 256  # resident元数据行容量，必须>=MAX_NUM_SEQS
@@ -235,7 +236,9 @@ def _validate(c):
             "NATIVE_RUNTIME_ENV must not override device identity, DP identity, spawn or serialization settings"
         )
     if c["ENABLE_DSA_OFFLOAD"]:
-        thresholds, budgets = c["DSA_PROMPT_BUDGET_THRESHOLDS"], c["DSA_RESIDENT_BUDGET_TOKENS"]
+        thresholds = c["DSA_PROMPT_BUDGET_THRESHOLDS"]
+        budget_key = "DSA_MTP_RESIDENT_BUDGET_TOKENS" if c["ENABLE_MTP"] else "DSA_RESIDENT_BUDGET_TOKENS"
+        budgets = c[budget_key]
         if (
             not isinstance(thresholds, (list, tuple))
             or len(thresholds) != 2
@@ -243,14 +246,16 @@ def _validate(c):
             or list(thresholds) != sorted(set(thresholds))
         ):
             raise ValueError("DSA_PROMPT_BUDGET_THRESHOLDS requires two increasing positive integers")
-        if not c["ENABLE_MTP"] and (
-            type(c["DSA_SPARSE_ACTIVATION_TOKENS"]) is not int
-            or c["DSA_SPARSE_ACTIVATION_TOKENS"] <= 0
-            or not isinstance(budgets, (list, tuple))
+        if (
+            not isinstance(budgets, (list, tuple))
             or len(budgets) != 3
             or any(type(x) is not int or x <= 0 for x in budgets)
         ):
-            raise ValueError("invalid non-MTP DSA activation or three resident budgets")
+            raise ValueError(f"{budget_key} requires three positive resident budgets")
+        if not c["ENABLE_MTP"] and (
+            type(c["DSA_SPARSE_ACTIVATION_TOKENS"]) is not int or c["DSA_SPARSE_ACTIVATION_TOKENS"] <= 0
+        ):
+            raise ValueError("invalid non-MTP DSA activation")
     if c["ENABLE_DSA_OFFLOAD"] and (not c["ENABLE_EXPERT_PARALLEL"] or c["DSA_MAX_ACTIVE_REQS"] < c["MAX_NUM_SEQS"]):
         raise ValueError("DSA DP requires expert parallel and enough DSA request rows")
     if c["ENABLE_MTP"] and (
@@ -315,7 +320,9 @@ def _build_kwargs(c):
             "hot_cpu_block_multiple": c["DSA_HOT_CPU_BLOCK_MULTIPLE"],
             "sparse_activation_tokens": 8192 if c["ENABLE_MTP"] else c["DSA_SPARSE_ACTIVATION_TOKENS"],
             "prompt_budget_thresholds": c["DSA_PROMPT_BUDGET_THRESHOLDS"],
-            "resident_budget_tokens": [8192, 10240, 12288] if c["ENABLE_MTP"] else c["DSA_RESIDENT_BUDGET_TOKENS"],
+            "resident_budget_tokens": (
+                c["DSA_MTP_RESIDENT_BUDGET_TOKENS"] if c["ENABLE_MTP"] else c["DSA_RESIDENT_BUDGET_TOKENS"]
+            ),
             "max_active_reqs": c["DSA_MAX_ACTIVE_REQS"],
             "enable_row_mode_decode_graph": graph,
         }
