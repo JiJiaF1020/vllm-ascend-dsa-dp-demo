@@ -66,6 +66,10 @@ pytest -sv tests/e2e/nightly/single_node/ops/singlecard_ops/test_dsa_a5_c8_ops.p
 | `eval_dataset_acc_score.py` | 对 QA 脚本生成的 JSONL 计算 LongBench 指标 |
 | `serve_dsa.sh` | 以 OpenAI 兼容在线服务拉起 DSA eager/graph |
 | `serve_dp_mtp_l3.sh` | P6-A单机DP2/TP4/EP8、MTP3与共享Mooncake的阶段启动配置 |
+| `demo_start.sh` | A5 双机部署用的 docker 容器拉起（host 网络、HCCL 配置挂载），两机各执行一次 |
+| `check_two_node_dp16_ep16.sh` | 双机 HCCL all_reduce/all_to_all 与 MC2 dispatch/combine 预检，两机以相同参数执行 |
+| `simple_prompt_test_dp16.py` | 跨机离线 SPMD 冒烟：`--node-size 2` 双机 DP16TP1EP16，disabled/cache-init/eager/graph 四档 |
+| `simple_prompt_test_2p_dp4tp2.py` | 双机各 4 卡 DP4TP2EP8 变体，复用 dp16 的启动与 DSA 配置 |
 | `stream_chat_client.py` | 交互式多轮流式客户端 |
 | `online_l2_l3_closeout_test.py` | 5k/8k/40k/70k 在线 L2/L3 生命周期收口 |
 | `online_dp_foundation_test.py` | 单机 DP2 基础阶段的混合并发与 real/idle graph smoke |

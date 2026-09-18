@@ -414,19 +414,17 @@ class DSAOffloadConfig:
                 getattr(parallel_config, "enable_expert_parallel", False)
             ):
                 raise ValueError(
-                    "DSA single-node DP initially requires "
-                    "enable_expert_parallel=True"
+                    "DSA DP requires enable_expert_parallel=True"
                 )
             if str(
                 getattr(parallel_config, "data_parallel_backend", "mp")
             ) == "ray":
                 raise ValueError(
-                    "DSA single-node DP initially supports the mp backend, "
-                    "not Ray"
+                    "DSA DP supports the mp backend, not Ray"
                 )
             if bool(getattr(parallel_config, "enable_elastic_ep", False)):
                 raise ValueError(
-                    "DSA single-node DP does not yet support elastic EP"
+                    "DSA DP does not yet support elastic EP"
                 )
             if bool(
                 getattr(parallel_config, "data_parallel_external_lb", False)
@@ -434,8 +432,8 @@ class DSAOffloadConfig:
                 getattr(parallel_config, "data_parallel_hybrid_lb", False)
             ):
                 raise ValueError(
-                    "DSA single-node DP initially supports online internal "
-                    "load balancing or offline SPMD only"
+                    "DSA DP supports online internal load balancing or "
+                    "offline SPMD only"
                 )
 
         max_num_seqs = int(scheduler_config.max_num_seqs or 0)

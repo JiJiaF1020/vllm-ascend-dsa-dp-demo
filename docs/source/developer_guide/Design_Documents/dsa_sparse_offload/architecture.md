@@ -7,9 +7,9 @@
 
 DSA稀疏卸载保留完整Indexer上下文，把target MLA的HBM开销限制为resident budget和固定尾区，并用本地DRAM保存可随时换入的完整durable数据。多级prefix在此之上复用L1/L2/L3，DP在不改变请求所有权的前提下扩展吞吐。
 
-已适配的主要组合是A5 packed-C8、GLM-5.1/GLM-5.2、同步调度、chunked prefill、Eager/FULL decode Graph、固定MTP3和单机DP2/TP4/EP8。A3/BF16早期路径与DeepSeek兼容目标不等于所有组合都已回归。各专题分别限定组合，不能将“每项单独支持”视为任意笛卡尔积都已验证。
+已适配的主要组合是A5 packed-C8、GLM-5.1/GLM-5.2、同步调度、chunked prefill、Eager/FULL decode Graph、固定MTP3和DP2/TP4/EP8（单机）；跨机DP已按双机离线SPMD的DP16TP1EP16与DP4TP2EP8适配，L2预算按host节点分组各自协调。A3/BF16早期路径与DeepSeek兼容目标不等于所有组合都已回归。各专题分别限定组合，不能将“每项单独支持”视为任意笛卡尔积都已验证。
 
-当前不开放async scheduling、请求抢占恢复、PD、跨机DP/节点内存规划、PP/PCP/DCP、动态MTP、proposer Graph和任意外部connector组合。已有L3是DSAL3Connector/Mooncake Store-owned TCP，不是通用KV transfer能力全开放。
+当前不开放async scheduling、请求抢占恢复、PD、PP/PCP/DCP、动态MTP、proposer Graph和任意外部connector组合。已有L3是DSAL3Connector/Mooncake Store-owned TCP，不是通用KV transfer能力全开放；跨机共享L3的内容key语义不在本轮范围。
 
 PD首版范围已讨论，详细合同见[P/D分离设计草案](proposals/prefill_decode_disaggregation.md)。
 该草案尚待评审、编码和设备验证，不改变本页现有支持矩阵；PD不以前置完成自动抢占恢复为条件。
@@ -1290,9 +1290,10 @@ EngineCore 在基线 HBM `KVCacheConfig` 已完成各 rank 收敛后，只观测
 当前单机可用内存（同时考虑常见 cgroup 上限），生成
 `DSADRAMCapacityPlan`：
 
-该规划支持约定单机TP与单机DP：DP先汇总同host的保守可用量并形成等额字节配额，
-扣除本域L3 client pool预留，再把结果作为下面公式的`host_available`。多机TP/DP
-需要按节点划分预算域，尚未开放；PP仍由配置合同拒绝。
+该规划支持约定单机TP与单机/跨机DP：DP先按host节点分组汇总保守可用量并形成
+各节点等额字节配额，扣除本域L3 client pool预留，再把结果作为下面公式的
+`host_available`。跨机时各节点独立预算、全域共同校验最小配额；PP仍由配置合同
+拒绝。
 
 ```text
 minimum = HBM Indexer blocks per rank

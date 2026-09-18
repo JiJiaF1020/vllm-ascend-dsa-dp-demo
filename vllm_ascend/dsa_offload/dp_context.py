@@ -7,9 +7,10 @@ group。平台 patch 将该 group 与 rank 信息保存在本进程，稍后的 
 容量规划通过本模块读取；这里不创建或销毁第二套通信组。
 
 在各域 L1 配置已确定、L2 arena 尚未分配时，收集节点身份、可用内存观测、
-L1 Indexer 容量、bundle 大小和兼容性指纹。取各观测的最小值作为共同节点
-预算，再等分为每 DP 的字节上限；各域实际 L2 块数仍由自己的 L1 比例决定。
-当前用宿主内核 boot ID 判断共享节点范围，不以可重复的 hostname 作为身份。
+L1 Indexer 容量、bundle 大小和兼容性指纹。按宿主内核 boot ID 把各 DP 域
+分组为共享 host DRAM 的节点范围；每个节点范围内取各观测的最小值作为该
+节点的共同预算，再等分为该节点每 DP 的字节上限。跨节点时各节点独立预算，
+各域实际 L2 块数仍由自己的 L1 比例决定。不以可重复的 hostname 作为身份。
 探测失败也先参与同一次汇总，再让各域一致拒绝，不能只让一域提前退出。
 同时校验共享 L3 的确定性哈希 seed 前置条件，避免相同签名却产生不同内容 key。
 
@@ -89,6 +90,14 @@ class DSAEngineDPContext:
 
 @dataclass(frozen=True, slots=True)
 class DSANodeMemoryBudget:
+    """本 rank 所在 host 节点的 DRAM 预算快照。
+
+    多节点 DP 时 ``observed_available_bytes_by_dp`` 与
+    ``l1_indexer_blocks_by_dp`` 只覆盖与本 rank 共享 host 的 DP 域
+    （按全局 rank 升序），``data_parallel_rank``/``data_parallel_size``
+    仍描述全局 DP 拓扑。
+    """
+
     node_scope_id: str
     snapshot_id: str
     compatibility_signature: str
@@ -177,10 +186,12 @@ def coordinate_dsa_node_memory_budget(
     tensor_parallel_size: int,
     compatibility_signature: str,
 ) -> DSANodeMemoryBudget:
-    """汇总单机各 DP 的内存观测，返回共同快照和等额字节预算上限。
+    """汇总各 DP 的内存观测，按 host 节点分组返回本节点的等额字节预算上限。
 
-    全部 EngineCore 必须在任何 L2 arena 分配前参与。等额只约束字节上限，
-    不要求各 DP 的实际 L2 块数一致；本函数不分配或格式化 payload 内存。
+    全部 EngineCore 必须在任何 L2 arena 分配前参与。共享同一 host（boot ID
+    一致）的 DP 域组成一个节点范围，取范围内观测最小值再等分给范围内各 DP；
+    跨节点时各节点独立预算。等额只约束字节上限，不要求各 DP 的实际 L2 块数
+    一致；本函数不分配或格式化 payload 内存。
     """
 
     dp_size = int(data_parallel_size)
@@ -279,26 +290,10 @@ def coordinate_dsa_node_memory_budget(
             "is readable and exposes the host kernel boot identity in every EngineCore; "
             "hostname fallback is not allowed"
         )
-    node_identities = {sample.boot_id for sample in samples}
-    if len(node_identities) != 1:
-        raise NotImplementedError(
-            "DSA DP L2 budgeting currently supports one shared host scope; "
-            f"observed_boot_ids={sorted(node_identities)} "
-            f"hostnames={tuple(sample.hostname for sample in samples)}"
-        )
-    shared_node_identity = node_identities.pop()
-    assert shared_node_identity is not None
     observations = tuple(sample.available_bytes for sample in samples)
     if any(value <= 0 for value in observations):
         raise RuntimeError(
             f"DSA DP host-memory gather returned a non-positive observation: observations={observations}"
-        )
-    node_available = min(observations)
-    per_dp_quota = node_available // dp_size
-    if per_dp_quota <= 0:
-        raise RuntimeError(
-            "DSA DP host-memory quota is empty after equal partitioning: "
-            f"node_available={node_available}, dp_size={dp_size}"
         )
     bundle_sizes = {sample.bundle_bytes for sample in samples}
     tp_sizes = {sample.tp_size for sample in samples}
@@ -321,18 +316,49 @@ def coordinate_dsa_node_memory_budget(
         raise RuntimeError(
             f"DSA DP gathered signature does not match the local rank: local={signature}, gathered={shared_signature}"
         )
-    minimum_quota = (max(l1_blocks_by_dp) + 1) * shared_bundle_bytes * shared_tp_size
-    if per_dp_quota < minimum_quota:
-        raise RuntimeError(
-            "DSA equal per-DP DRAM quota cannot hold one complete mirror of "
-            "the largest local L1 Indexer capacity: "
-            f"per_dp_quota={per_dp_quota}, "
-            f"minimum_per_dp_quota={minimum_quota}, "
-            f"l1_indexer_blocks_by_dp={l1_blocks_by_dp}"
-        )
+
+    # Ranks sharing one host boot ID draw from the same host DRAM; every
+    # node scope budgets itself independently of the other nodes. All ranks
+    # validate every node and reject together, so a node that cannot meet
+    # its minimum quota never starts while its peers continue.
+    local_boot_id = samples[dp_rank].boot_id
+    assert local_boot_id is not None
+    node_samples_by_scope: dict[str, tuple[_NodeMemoryObservation, ...]] = {}
+    for sample in samples:
+        assert sample.boot_id is not None
+        scope_samples = node_samples_by_scope.setdefault(sample.boot_id, ())
+        node_samples_by_scope[sample.boot_id] = (*scope_samples, sample)
+    quota_failures: dict[str, str] = {}
+    for scope_boot_id, scope_samples in node_samples_by_scope.items():
+        scope_observations = tuple(sample.available_bytes for sample in scope_samples)
+        scope_l1_blocks = tuple(sample.l1_indexer_blocks for sample in scope_samples)
+        scope_hostnames = tuple(sample.hostname for sample in scope_samples)
+        scope_available = min(scope_observations)
+        scope_quota = scope_available // len(scope_samples)
+        scope_minimum = (max(scope_l1_blocks) + 1) * shared_bundle_bytes * shared_tp_size
+        if scope_quota <= 0:
+            quota_failures[scope_boot_id] = (
+                f"empty quota after equal partitioning: node_available={scope_available}, "
+                f"node_dp_size={len(scope_samples)}, node_hostnames={scope_hostnames}"
+            )
+        elif scope_quota < scope_minimum:
+            quota_failures[scope_boot_id] = (
+                "quota cannot hold one complete mirror of the largest local L1 Indexer capacity: "
+                f"per_dp_quota={scope_quota}, minimum_per_dp_quota={scope_minimum}, "
+                f"l1_indexer_blocks={scope_l1_blocks}, node_hostnames={scope_hostnames}"
+            )
+    if quota_failures:
+        raise RuntimeError(f"DSA DP host-memory budgeting failed: {quota_failures}")
+
+    node_samples = node_samples_by_scope[local_boot_id]
+    node_observations = tuple(sample.available_bytes for sample in node_samples)
+    node_l1_blocks = tuple(sample.l1_indexer_blocks for sample in node_samples)
+    node_available = min(node_observations)
+    per_dp_quota = node_available // len(node_samples)
+    minimum_quota = (max(node_l1_blocks) + 1) * shared_bundle_bytes * shared_tp_size
     node_scope_id, snapshot_id = _snapshot_id(
-        shared_node_identity,
-        observations,
+        local_boot_id,
+        node_observations,
     )
     return DSANodeMemoryBudget(
         node_scope_id=node_scope_id,
@@ -340,8 +366,8 @@ def coordinate_dsa_node_memory_budget(
         compatibility_signature=shared_signature,
         data_parallel_rank=dp_rank,
         data_parallel_size=dp_size,
-        observed_available_bytes_by_dp=observations,
-        l1_indexer_blocks_by_dp=l1_blocks_by_dp,
+        observed_available_bytes_by_dp=node_observations,
+        l1_indexer_blocks_by_dp=node_l1_blocks,
         node_available_bytes=node_available,
         per_dp_quota_bytes=per_dp_quota,
         minimum_per_dp_quota_bytes=minimum_quota,

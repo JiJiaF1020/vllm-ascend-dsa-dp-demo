@@ -93,36 +93,94 @@ def test_single_node_dp_uses_min_snapshot_and_equal_byte_quota(
     assert budget.minimum_per_dp_quota_bytes == 88
 
 
-def test_dp_budget_rejects_multiple_host_scopes(monkeypatch) -> None:
+def _run_multi_node_rank(monkeypatch, rank, world_spec):
+    """Run one rank's budgeting against a fixed multi-node DP world."""
+    reset_dsa_engine_dp_context()
     install_dsa_engine_dp_context(
         process_group=object(),
-        rank=0,
-        world_size=2,
-        local_rank=0,
+        rank=rank,
+        world_size=len(world_spec),
+        local_rank=rank,
     )
+    local = world_spec[rank]
+    monkeypatch.setattr(dp_context, "_read_host_boot_id", lambda: local["boot_id"])
+    monkeypatch.setattr(dp_context.socket, "gethostname", lambda: local["hostname"])
 
-    def fake_all_gather_object(output, _sample, *, group) -> None:
+    def gather(output, sample, *, group):
         output[:] = [
-            _sample,
-            replace(_sample, rank=1, boot_id=BOOT_B),
+            sample if r == rank else replace(sample, rank=r, **world_spec[r])
+            for r in range(len(world_spec))
         ]
 
-    monkeypatch.setattr(
-        dp_context.dist,
-        "all_gather_object",
-        fake_all_gather_object,
+    monkeypatch.setattr(dp_context.dist, "all_gather_object", gather)
+    return coordinate_dsa_node_memory_budget(
+        data_parallel_size=len(world_spec),
+        data_parallel_rank=rank,
+        observed_available_bytes=local["available_bytes"],
+        l1_indexer_blocks=local["l1_indexer_blocks"],
+        complete_bundle_bytes=4,
+        tensor_parallel_size=2,
+        compatibility_signature=local.get("signature", "sig-a"),
     )
 
-    with pytest.raises(NotImplementedError, match="one shared host scope"):
-        coordinate_dsa_node_memory_budget(
-            data_parallel_size=2,
-            data_parallel_rank=0,
-            observed_available_bytes=1000,
-            l1_indexer_blocks=8,
-            complete_bundle_bytes=4,
-            tensor_parallel_size=2,
-            compatibility_signature="sig-a",
-        )
+
+def test_multi_node_dp_budgets_each_host_scope_independently(monkeypatch) -> None:
+    world = [
+        dict(hostname="node-a", boot_id=BOOT_A, available_bytes=1000, l1_indexer_blocks=8),
+        dict(hostname="node-a", boot_id=BOOT_A, available_bytes=900, l1_indexer_blocks=10),
+        dict(hostname="node-b", boot_id=BOOT_B, available_bytes=1600, l1_indexer_blocks=8),
+        dict(hostname="node-b", boot_id=BOOT_B, available_bytes=1400, l1_indexer_blocks=12),
+    ]
+    budgets = [_run_multi_node_rank(monkeypatch, rank, world) for rank in range(4)]
+
+    # node A: min(1000, 900) // 2; node B: min(1600, 1400) // 2
+    assert budgets[0].per_dp_quota_bytes == budgets[1].per_dp_quota_bytes == 450
+    assert budgets[2].per_dp_quota_bytes == budgets[3].per_dp_quota_bytes == 700
+    assert budgets[0].node_scope_id == budgets[1].node_scope_id
+    assert budgets[2].node_scope_id == budgets[3].node_scope_id
+    assert budgets[0].node_scope_id != budgets[2].node_scope_id
+    assert budgets[0].snapshot_id == budgets[1].snapshot_id
+    assert budgets[0].observed_available_bytes_by_dp == (1000, 900)
+    assert budgets[2].observed_available_bytes_by_dp == (1600, 1400)
+    assert budgets[0].l1_indexer_blocks_by_dp == (8, 10)
+    assert budgets[2].l1_indexer_blocks_by_dp == (8, 12)
+    assert budgets[2].minimum_per_dp_quota_bytes == (12 + 1) * 4 * 2
+    assert budgets[3].data_parallel_rank == 3
+    assert budgets[3].data_parallel_size == 4
+
+
+def test_multi_node_dp_allows_asymmetric_node_sizes(monkeypatch) -> None:
+    world = [
+        dict(hostname="node-a", boot_id=BOOT_A, available_bytes=900, l1_indexer_blocks=8),
+        dict(hostname="node-a", boot_id=BOOT_A, available_bytes=900, l1_indexer_blocks=8),
+        dict(hostname="node-a", boot_id=BOOT_A, available_bytes=1200, l1_indexer_blocks=8),
+        dict(hostname="node-b", boot_id=BOOT_B, available_bytes=2000, l1_indexer_blocks=8),
+    ]
+    budgets = [_run_multi_node_rank(monkeypatch, rank, world) for rank in range(4)]
+
+    assert budgets[0].per_dp_quota_bytes == 300  # min(900, 900, 1200) // 3
+    assert budgets[3].per_dp_quota_bytes == 2000  # the only rank on node B
+
+
+def test_multi_node_dp_rejects_together_when_any_node_misses_its_minimum(monkeypatch) -> None:
+    world = [
+        dict(hostname="node-a", boot_id=BOOT_A, available_bytes=1000, l1_indexer_blocks=8),
+        dict(hostname="node-b", boot_id=BOOT_B, available_bytes=40, l1_indexer_blocks=8),
+    ]
+    # node B quota 40 < (8 + 1) * 4 * 2 = 72; every rank must fail,
+    # including the healthy node A, so no partial world starts.
+    for rank in range(2):
+        with pytest.raises(RuntimeError, match="host-memory budgeting failed"):
+            _run_multi_node_rank(monkeypatch, rank, world)
+
+
+def test_multi_node_dp_still_enforces_global_signature_consistency(monkeypatch) -> None:
+    world = [
+        dict(hostname="node-a", boot_id=BOOT_A, available_bytes=1000, l1_indexer_blocks=8),
+        dict(hostname="node-b", boot_id=BOOT_B, available_bytes=1000, l1_indexer_blocks=8, signature="sig-b"),
+    ]
+    with pytest.raises(RuntimeError, match="configuration signatures"):
+        _run_multi_node_rank(monkeypatch, 0, world)
 
 
 def test_dp_budget_requires_the_engine_core_group() -> None:

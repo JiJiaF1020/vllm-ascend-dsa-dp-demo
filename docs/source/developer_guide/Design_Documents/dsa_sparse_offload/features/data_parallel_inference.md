@@ -1,6 +1,6 @@
 # 数据并行推理：基线机制与DSA集成
 
-> 基线：v0.23。第一部分是逐层、逐token的教学说明；第二部分是已确认并适配的DSA单机合同。跨机仍是草案。
+> 基线：v0.23。第一部分是逐层、逐token的教学说明；第二部分是已确认并适配的DSA DP合同（含单机与按节点分组的跨机预算）。
 
 先分清DP请求副本、域内TP和跨域EP，再读资源预算和管理协议。下面的基线混合prefill/decode示例不是DSA本地phase barrier的实现规则。源码行号仅供定位，实际以符号和固定版本为准。
 
@@ -1434,7 +1434,7 @@ Scheduler 可选择先 preempt running requests 再 reset，但 DSA 当前明确
 
 DSA在multi-plane coordinator中检查并清理全部适用的HBM/L2 prefix pools；跨DP external reset使用统一epoch派生namespace。它们不等于物理删除后端对象，具体管理协议见本文第二部分。
 
-## 二、已确认的DSA单机集成
+## 二、已确认的DSA DP集成（单机与跨机）
 
 ### 6. DSA选择的适配方式
 
@@ -1447,15 +1447,21 @@ DSA在multi-plane coordinator中检查并清理全部适用的HBM/L2 prefix pool
 
 #### 6.1 支持范围与所有权
 
-已验证正常主路径的范围是 A5 单机八卡、DP2/TP4/EP8、GLM-5.2 W4A4C8，
+已验证正常主路径的单机范围是 A5 单机八卡、DP2/TP4/EP8、GLM-5.2 W4A4C8，
 在线 internal-LB 和离线 SPMD，eager/target FULL decode Graph、chunked prefill、
 Local prefix、Mooncake Store-owned TCP 共享 L3，以及固定 MTP3、greedy、同 TP 的
 eager proposer。Proposer 的 BF16 full-HBM cache 保持全上下文常驻，不能把这里的
 “eager proposer”理解为关闭 MTP。当前 MTP 算子合同是七输出、2304 宽度；旧研究中的
 2176/动态 query 不是本页部署规则，详见[推测解码](speculative_decoding.md)。
 
+跨机（多节点）DP 已按参考实现适配：L2 预算按 host 节点分组各自协调（见第 7 节），
+数据面与单机 DP 共用同一套协商/dummy 协议，目标拓扑为双机离线 SPMD 的
+DP16TP1EP16 与 DP4TP2EP8。跨机部署沿用基线逐节点启动方式（全局 DP 数、
+每节点本地 DP 数与起始 rank、共同地址/端口），跨机 MC2 使用默认通信算法，
+不强制 hierarchy。跨机共享 L3 的内容 key 语义不在本轮范围。
+
 不同时开放 async scheduling、PP/PCP/DCP、DSA-CP、动态 MTP、parallel/unpadded
-drafting、非 greedy、proposer Graph、跨机、请求迁移或 preemption；也不把 TCP
+drafting、非 greedy、proposer Graph、请求迁移或 preemption；也不把 TCP
 通过扩大为 direct-HBM、layerwise async、MemCache 已通过。DP 正常功能已适配，
 不意味着每一种模型、拓扑和开关组合都完成了端到端验收。
 
@@ -1511,11 +1517,11 @@ Proposer idle 保持 NONE/eager、`num_actual_tokens=0`、无 attention metadata
 
 普通internal-DP多进程路径中，每个EngineCore按自己的worker集合统一HBM容量，典型为本域TP最小值；基线不再将DP0/DP1的容量做全局最小归一。两域容量可以不同。显式容量覆盖或external-launcher的其他world-group路径不能反推普通internal-DP也全局统一。
 
-DSA L2分两阶段处理：arena分配前观测可用主机内存，L1 spec/块数确定后计算bundle布局。EngineCore DP group汇总boot ID、观测、签名及容量；同host取保守的`min(observations)`，除以DP size形成字节配额，再扣该域L3 client pool预留。
+DSA L2分两阶段处理：arena分配前观测可用主机内存，L1 spec/块数确定后计算bundle布局。EngineCore DP group汇总boot ID、观测、签名及容量；按 boot ID 把各域分组为共享 host DRAM 的节点范围，每个节点取范围内保守的`min(observations)`，除以该节点内 DP 数形成字节配额，再扣该域L3 client pool预留。跨节点时各节点独立预算，互不占额度。
 
 配额必须足够完整镜像各TP的所需数据；按真实bundle字节、TP数和null块预留检查。最终L2块数还跟随本域L1与`hot_cpu_block_multiple`，**字节上限一致不等于块数强制一致**，也不是动态向别域借额度。
 
-Host身份使用boot ID而不是hostname；多个host范围当前拒绝，不能拿单机SPMD的local-DP配置误当跨机支持。
+Host身份使用boot ID而不是hostname；多个host范围按 boot ID 分组为独立的节点预算域，不再整体拒绝。每个节点内部仍是“共同观测、等分配额”的单机语义，不能把跨机的全局 DP size 直接当作任一节点的除数。
 
 #### 7.1 观测时序与参与者校验
 
@@ -1530,26 +1536,31 @@ arena 尚未分配，利用已有 EngineCore stateless CPU/Gloo DP group 做一�
 
 1. 本进程上下文的 rank/size 与 VllmConfig 相同，使用已建立的 group，不另建通信组。
 2. 返回不是空值或旧版本对象；rank 排序后必须恰为 `0..D-1`，本域返回样本须等于原样本。
-3. Boot ID 来自 `/proc/sys/kernel/random/boot_id`，是合法非零 UUID，且全体属于同一宿主内核。
+3. Boot ID 来自 `/proc/sys/kernel/random/boot_id`，是合法非零 UUID；相同 boot ID
+   的域属于同一宿主节点范围，不同 boot ID 构成各自独立的预算域。
 4. Boot ID 读取失败先作为 `probe_error` 参加同一次汇总，再由各域共同拒绝。
    不使用 hostname/machine-id 回退绕开保护；容器屏蔽或虚拟化该文件时需修正部署视图。
 5. 可用字节、L1 块数均为正，TP 数和完整 bundle 字节数一致，compatibility signature 一致。
 
-同宿主异 hostname 可以通过，同名异 boot ID 必须拒绝。单机离线 SPMD 的每进程
-`local-DP=1/global-DP=2` 也可能合法，不能仅用 local==global 判断物理单机。
-Boot ID 只验证共同宿主范围，**不是**任意多容器 cgroup 配额合并协议。DP1 保留
-原容量路径，不新增 boot ID 读取或共享 L3 seed 要求。
+同宿主异 hostname 可以通过并按同一节点预算，同名异 boot ID 属于不同节点。
+单机离线 SPMD 的每进程 `local-DP=1/global-DP=2` 也可能合法，不能仅用
+local==global 判断物理单机。Boot ID 只划分共享宿主内存的节点范围，
+**不是**任意多容器 cgroup 配额合并协议。DP1 保留原容量路径，不新增
+boot ID 读取或共享 L3 seed 要求。
 
-容量结果保留 `node_scope_id`、`snapshot_id`、signature、各域 observations/L1 块数、
-`node_available_bytes`、`per_dp_quota_bytes`、最低镜像需求，随后固化进容量计划。
-这些是初始化信息，不进入每轮 SchedulerOutput。Snapshot 是共同观测的标识，
-不是主机内存已经被本服务锁定的证明。
+容量结果保留 `node_scope_id`、`snapshot_id`、signature、本节点各域
+observations/L1 块数、`node_available_bytes`、`per_dp_quota_bytes`、最低镜像
+需求，随后固化进容量计划。多节点时这些节点域字段只覆盖本 rank 所在节点，
+`data_parallel_rank`/`data_parallel_size` 仍描述全局拓扑。这些是初始化信息，
+不进入每轮 SchedulerOutput。Snapshot 是共同观测的标识，不是主机内存已经被
+本服务锁定的证明。
 
 #### 7.2 字节配额、完整块与预留的计算
 
-设同一宿主上有 D 个 DP，每域 T 个 TP worker；各域观测为 O_i，域 i 的 L1
+设同一宿主节点范围上有 D 个 DP，每域 T 个 TP worker；各域观测为 O_i，域 i 的 L1
 Indexer 容量为 I_i，每 logical block 的完整 bundle 为 C 字节，目标倍数为 m。
-当前同构协议要求 T/C 相同，但不要求 I_i 相同。Host 观测取 MemAvailable 与
+当前同构协议要求 T/C 相同，但不要求 I_i 相同；跨节点时 D/O_i/I_i 均按各节点
+范围独立取值，公式逐节点适用。Host 观测取 MemAvailable 与
 可读到的 cgroup 剩余额度的较小值。
 
 ```text
@@ -1569,11 +1580,13 @@ actual_dp_i  = T * (usable_i + 1) * C
 凑容量。C 包含真实 Indexer/MLA planes 和启用 durable MTP 时的 BF16 component；
 不是只取一个 tensor 的名义 dtype 字节数。空闲 quota 不强行填满，也不动态借给别域。
 
-当前全域先检查 `Q_dp >= (max(I_i)+1)*C*T`，然后每域扣 R_dp 并执行最终容量检查。
-**后一检查不是再次全域投票**：极限容量下较大 I_i 的域可能拒绝，而另一域已经
-继续初始化。最终容量上限仍受检查保护，但单侧失败的全域清理需要独立验证，不能
-把前一个检查写成已证明所有启动失败同步发生。Pin/UVA 注册、NUMA/容器限制和
-观测后其他进程占用内存也仍可能导致实际分配失败。
+配额检查按节点逐域计算、全域共同拒绝：每个 rank 基于同一份汇总观测验证**所有**
+节点的 `Q_dp >= (max(I_i)+1)*C*T`，任一节点不满足时全体以同一错误拒绝，不会
+出现健康节点继续启动而不满足的最小配额节点单独退出的半启动状态。随后每域扣
+R_dp 并执行最终容量检查。**后一检查不是再次全域投票**：极限容量下较大 I_i 的
+域可能拒绝，而另一域已经继续初始化。最终容量上限仍受检查保护，但单侧失败的
+全域清理需要独立验证，不能把前一个检查写成已证明所有启动失败同步发生。
+Pin/UVA 注册、NUMA/容器限制和观测后其他进程占用内存也仍可能导致实际分配失败。
 
 两个便于复核口径的例子：
 
