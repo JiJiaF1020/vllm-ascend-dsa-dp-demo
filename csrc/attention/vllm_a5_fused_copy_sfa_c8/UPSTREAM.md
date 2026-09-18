@@ -8,6 +8,6 @@
 
 大 copy-count 阶段使用两个 672-byte UB buffer 和显式 MTE2/MTE3 事件；排空读写并释放事件后，所有 AIC/AIV 执行 `SyncAll<false>()` 再初始化 SFA。两侧预留相同的 1344-byte UB 前缀并保留至 kernel 结束，确保后续 Fixpipe 缓冲区地址一致；不执行 `TPipe.Reset()`，避免重置随后 SFA 依赖的事件分配状态。
 
-框架集成来源：`ops_lidu_scattercopy_sfa_a5` 提交 `19e5615`。`op_host` 的 C++ 与全部 `op_kernel` 文件保持源码一致；新增 framework CMake、`_C_ascend` caller-owned 适配及局部 workspace cache。保留预取默认开启、512 fallback 阈值、miss pair 合并写回。eager workspace 按 device/stream 复用；capture 使用独立图池，不复用 eager cache。
+框架集成来源：`ops_lidu_scattercopy_sfa_a5` 提交 `19e5615`。`op_host` 的 C++ 与全部 `op_kernel` 文件保持源码一致；新增 framework CMake、`_C_ascend` caller-owned 适配及局部 workspace cache。保留预取默认开启、miss pair 合并写回；内部回退阈值后与源仓同步由 512 调整为 1024。eager workspace 按 device/stream 复用；capture 使用独立图池，不复用 eager cache。
 
-本次同步单算子仓 `6732a649a36e4829994aa6cbdbd7ad6616333180` 的全可见域 TopK2048 版本：host C++ 和 kernel 与源仓一致；配对输入改为 `topk_slots/topk_index[T,1,2048]`，不再追加 tail，等价于 COPY + 官方 QSFA `sparse_mode=0`。保留 >512 内部回退与现有流水。框架 CMake、Torch 适配和 workspace cache 保留，仍在 `_C_ascend` 注册；默认不开启融合。MTP 的 L3 Attention 语义指纹同步升级，但不改块分配和缓存生命周期。必须连同新版 LIM、CANN so、Torch binding 和 Python 一起部署，重新 capture graph。目标 A5 验证入口见 `examples/dsa_demo/README.md`，单算子通过不等于框架编译和整网验收。
+本次同步单算子仓 `6732a649a36e4829994aa6cbdbd7ad6616333180` 的全可见域 TopK2048 版本：host C++ 和 kernel 与源仓一致；配对输入改为 `topk_slots/topk_index[T,1,2048]`，不再追加 tail，等价于 COPY + 官方 QSFA `sparse_mode=0`。保留 >1024 内部回退与现有流水。框架 CMake、Torch 适配和 workspace cache 保留，仍在 `_C_ascend` 注册；默认不开启融合。MTP 的 L3 Attention 语义指纹同步升级，但不改块分配和缓存生命周期。必须连同新版 LIM、CANN so、Torch binding 和 Python 一起部署，重新 capture graph。目标 A5 验证入口见 `examples/dsa_demo/README.md`，单算子通过不等于框架编译和整网验收。

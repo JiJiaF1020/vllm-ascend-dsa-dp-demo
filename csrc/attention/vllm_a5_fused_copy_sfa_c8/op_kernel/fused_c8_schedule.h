@@ -7,7 +7,7 @@
 #define FUSED_C8_INLINE constexpr
 #endif
 namespace fused_c8 {
-constexpr int32_t UNION_COPY_THRESHOLD = 512;
+constexpr int32_t UNION_COPY_THRESHOLD = 1024;
 // Request-level union count, not per-query misses or the sum over the batch.
 FUSED_C8_INLINE bool NeedsUnionCopy(int32_t unionCount)
 {
