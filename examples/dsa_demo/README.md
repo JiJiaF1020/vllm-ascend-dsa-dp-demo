@@ -40,8 +40,11 @@ custom 的 MTP durable dump step（prefix/L3）继续走 eager，任何 DP rank
 
 四层 IndexShare KV 交错存储的独立实验路径见
 [Grouped C8 KV 说明](../../docs/source/developer_guide/Design_Documents/dsa_sparse_offload/features/grouped_c8_kv.md)。
-`simple_dp_prompt_test.py` 的 `ENABLE_GROUPED_C8_KV` 默认 `False`；初版仅 MTP3 + split，
-不支持 prefix cache/L3。需要重新编译新增的 Group4C8 copy 算子后单独验收。
+`simple_dp_prompt_test.py` 的 `ENABLE_GROUPED_C8_KV` 默认 `False`，仅 MTP3，
+不支持 prefix cache/L3。同时开启 `ENABLE_FUSED_COPYSFA=True` 后，每个四层组的 owner
+调用新的 Group4 CopySFA（搬四层 + 本层 SFA），后三层仅 SFA；独立层保持原逐层路径。
+需重编译新增的 Group4C8 算子和 Torch 扩展后验收。首版是 copy 后同步再 SFA，非流水重叠，
+性能要与 grouped split 实测对比，验收命令见上述说明。
 
 在现有 `additional_config["dsa_sparse_config"]` 内添加
 `"enable_fused_copy_sfa": True` 开启融合；省略或设为 `False` 时保持
@@ -50,7 +53,8 @@ copy + SFA 分离路径。不要用此字段覆盖其它 DSA 配置。
 目前仅支持 A5 packed-C8 + DSA offload + MTP 的 TopK2048 接口，
 不满足条件时显式报错。只改变 target 稀疏 attention 的 copy/SFA 调用，
 不改变 LIM、prefix/L3 或 MTP durable cache 生命周期。
-算子内部保留大 copy-count 回退路径；开启不代表每种形状都获得加速。
+原逐层 CopySFA 内部保留大 copy-count 回退路径；Group4 版本始终先搬完整四层 union。
+开启融合不代表每种形状都获得加速。
 
 首次使用需在昇腾环境重新编译安装本仓库的 CANN 算子和 Torch 扩展。
 单卡 eager/graph 对照测试：

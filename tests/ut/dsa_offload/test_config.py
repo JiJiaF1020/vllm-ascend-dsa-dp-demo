@@ -586,20 +586,26 @@ def test_compromise_mtp3_contract_is_accepted() -> None:
 
 
 @pytest.mark.parametrize("prefix", [False, True])
-def test_grouped_c8_config_is_opt_in_and_rejects_prefix(prefix):
+@pytest.mark.parametrize("fused", [False, True])
+def test_grouped_c8_config_is_opt_in_and_rejects_prefix(prefix, fused):
     assert not DSAOffloadConfig.from_dict({}).enable_grouped_c8_kv
     vconfig = _vllm_config(speculative_config=_mtp_config(), enable_prefix_caching=prefix)
     vconfig.model_config.hf_text_config.indexer_types = ("full", "full", "full", "shared", "shared", "shared")
     vconfig.model_config.hf_text_config.num_hidden_layers = 6
-    raw = {"enabled": True, "enable_grouped_c8_kv": True, "sparse_activation_tokens": 8192,
-           "resident_budget_tokens": [8192, 12288, 12288]}
+    raw = {
+        "enabled": True,
+        "enable_grouped_c8_kv": True,
+        "enable_fused_copy_sfa": fused,
+        "sparse_activation_tokens": 8192,
+        "resident_budget_tokens": [8192, 12288, 12288],
+    }
     if prefix:
         with pytest.raises(ValueError, match="prefix caching"):
             DSAOffloadConfig.from_dict(raw, vllm_config=vconfig)
     else:
         assert DSAOffloadConfig.from_dict(raw, vllm_config=vconfig).enable_grouped_c8_kv
-    with pytest.raises(ValueError, match="split copy"):
-        DSAOffloadConfig.from_dict(dict(raw, enable_fused_copy_sfa=True))
+    with pytest.raises(ValueError, match="requires DSA offload"):
+        DSAOffloadConfig.from_dict(dict(raw, enabled=False))
     with pytest.raises(TypeError):
         DSAOffloadConfig.from_dict(dict(raw, enable_grouped_c8_kv="true"))
 

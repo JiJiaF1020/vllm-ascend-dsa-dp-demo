@@ -1,14 +1,21 @@
 # 四层 IndexShare Grouped C8 KV（实验路径）
 
-默认关闭。仅 A5 packed-C8、DSA offload、MTP3、copy + SFA 分离路径，
+默认关闭。仅 A5 packed-C8、DSA offload、MTP3，支持 copy + SFA 分离及 Group4 CopySFA 融合路径，
 PP/PCP/DCP=1。DP/TP 数量不参与分组；每个 worker 独立按模型 `indexer_types` 分组。
-初版拒绝 prefix caching、KV transfer/L3 和 CopySFA 融合；不改变 baseline、非 MTP 或旧算子的 ABI。
+仍拒绝 prefix caching、KV transfer/L3；不改变 baseline、非 MTP 或旧算子的 ABI。
 
 ## 开关
 
 在已有 `additional_config["dsa_sparse_config"]` 中加
 `"enable_grouped_c8_kv": True`。省略或设为 `False` 走原来的逐层存储路径。
-不要覆盖其它 DSA 配置，`"enable_fused_copy_sfa"` 保持 `False`。
+不要覆盖其它 DSA 配置；`"enable_fused_copy_sfa"` 独立选择是否融合。
+
+| enable_grouped_c8_kv | enable_fused_copy_sfa | target 稀疏路径 |
+| --- | --- | --- |
+| False | False | 原逐层 copy + SFA |
+| False | True | 原逐层 CopySFA |
+| True | False | owner 一次 Group4 copy，再逐层 SFA |
+| True | True | owner 一次 Group4 CopySFA，后三层仅 SFA |
 
 `simple_dp_prompt_test.py` 可直接设置：
 
@@ -29,6 +36,7 @@ ENABLE_PROFILE = False
 其它单机/双机入口使用同一 `additional_config` 字段，不需要按 DP/TP 组合另建实现。
 先保持原来已通过精度验证的 prompt、budget、采样和并行配置，**只改变此开关**做 A/B。
 首次先用 eager，再用 target `FULL_DECODE_ONLY` + MTP 三轮合并图。
+分离路径验证后，只将 `ENABLE_FUSED_COPYSFA` 改为 `True` 即可测试 Group4 融合。
 
 ## 存储及调用
 
@@ -38,6 +46,7 @@ ENABLE_PROFILE = False
 | 分组边界 | full 开始，紧随其后的 shared 跟随；只接受独立层或 full+3 shared。典型 GLM 为 0、1 独立，2–5 为首个四层组 |
 | LIM | 原算子、原状态、原 block table。owner 做一次选择，三层复用；不改变 hash、淘汰、topK 或 tail 规则 |
 | copy | 新 `VllmA5KvcacheScatterCopyGroup4C8`，owner 一次搬运四层；每个 `DataCopyPad` 搬 2624B，shared 不再 copy |
+| CopySFA（两开关同时开启） | 独立 `VllmA5FusedCopySfaGroup4C8` 在 owner 完成四层 copy + owner SFA，后三层继续原生 SFA，不再 copy |
 | Prolog / KV 写入 | 零拷贝 PA view `[4B,128,1,656]`，仅 KV 写入地址转换为 `4*slot+lane`；Indexer 的 slot 不变 |
 | SFA | 复用原生 QSFA，对 sparse slot 和 block table 做等价地址转换；每层只读取自己的 lane |
 | 满块 dump | 复用原有通用 `kv_cache_full_block_dump_bytes`，每个块搬运 `128*2624` 字节 |
@@ -57,6 +66,19 @@ decode 的 dump 在 owner 写入任何新 KV **之前**完成全组旧满块搬�
 prefill 的 dump 在组内最后一层写完 **之后**完成，不能在 owner 写完就把其余三层旧数据卸载。
 因此 owner 的单次分组 copy 可以访问完整的四层 DRAM 数据，不依赖后续层再补 dump。
 
+## Group4 CopySFA 的融合边界
+
+新算子是**同一个 MIX kernel 内的两阶段融合**：四层完整 union copy → 全核同步 → owner SFA。
+每次搬运 2624B，owner SFA 通过虚拟 PA 寻址只读取自己的 656B；复用原 CopySFA 的
+SCFA/MLA 数学实现，不复制改写反量化和 softmax。新算子始终写回全部 union，包括小 miss
+和 ENTER 首次填充中未出现在 owner TopK 的条目，不能只搬本层 attention 用到的 KV。
+query/KV 有效长度不乘四，原始逻辑 copy 表和虚拟 SFA 表分别传入，PAD 保留负数索引。
+
+当前版本**不做 DRAM copy 与 SFA 的流水重叠**，减少一次 kernel 下发但有全核同步；
+不保证一定比 grouped split 快，必须实测。原逐层 CopySFA 内核及其预取策略保持不变。
+第 0、1 层仍是独立层，开启融合时走原逐层 CopySFA；典型 78 层 GLM 的 19 个四层组
+各调用一次新算子，并保留 57 次 follower SFA（统计仅指走该路径的 target 稀疏 forward）。
+
 ## 编译与验证
 
 需要在 A5 环境重新编译安装本仓库的 **CANN 自定义算子和 Torch 扩展**；只更新 Python 不够。
@@ -64,6 +86,12 @@ prefill 的 dump 在组内最后一层写完 **之后**完成，不能在 owner 
 
 ```bash
 python -c 'from vllm_ascend.utils import load_custom_op_library; import torch; load_custom_op_library(); print(torch.ops._C_ascend.npu_dsa_a5_kvcache_scatter_copy_group4_c8_out.default._schema)'
+```
+
+两开关同时开启还需要新融合入口（17 个参数，含 `attention_slots`、`attention_block_table`）：
+
+```bash
+python -c 'from vllm_ascend.utils import load_custom_op_library; import torch; load_custom_op_library(); print(torch.ops._C_ascend.npu_dsa_a5_fused_copy_sfa_group4_c8_out.default._schema)'
 ```
 
 单卡算子验收（不加载模型）：
@@ -75,6 +103,17 @@ ASCEND_RT_VISIBLE_DEVICES=0 ASCEND_VISIBLE_DEVICES=0 python -m pytest -sv tests/
 覆盖 grouped dump/copy、无效行、跨 128-token 边界、四个 lane 的 QSFA 与旧布局逐元素对照、
 eager/图重放、变化的索引和 block table，并打印 2048-token copy 微基准。
 不对耗时设硬阈值：DRAM 链路负载与 host 下发开销会影响测量，不能把 copy 提速直接等同于 ITL 提速。
+
+Group4 CopySFA 的独立单卡验收：
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 ASCEND_VISIBLE_DEVICES=0 python -m pytest -sv tests/e2e/nightly/single_node/ops/singlecard_ops/test_dsa_grouped_copysfa_ops.py
+```
+
+比较真实 swapped DRAM 搬运后的完整四层 HBM（含未被 attention 选中的数据）、独立 FP32
+attention golden、split/native SFA 输出；覆盖 PAD、0/小 miss/1024 边界/8192 与 16000 首次填充、
+四种 query 数、不同 heads、BF16/FP16、跨 128 边界、变化元数据的图重放，并打印
+grouped split/fused 的 eager/graph 微基准。不修改旧图；更新二进制后须重启并重新 capture。
 
 整网必须再验证：短 prompt → 超过 activation 的长 prompt → 跨 tail 边界生成至少 256 token →
 BS1/BS8、DP idle/padding、不同 TP、eager/graph。关闭 profile 做逐 token 对照，再单独采性能。

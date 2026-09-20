@@ -38,7 +38,7 @@ def test_copysfa_is_required_only_when_enabled(monkeypatch) -> None:
         dsa_ops.require_dsa_offload_ops(packed_c8=True, mtp=True, grouped_c8_kv=True)
     with pytest.raises(ValueError, match="Grouped C8"):
         dsa_ops.require_dsa_offload_ops(packed_c8=True, grouped_c8_kv=True)
-    with pytest.raises(ValueError, match="Grouped C8"):
+    with pytest.raises(RuntimeError, match="npu_dsa_a5_fused_copy_sfa_group4_c8_out"):
         dsa_ops.require_dsa_offload_ops(packed_c8=True, mtp=True, grouped_c8_kv=True, fused_copy_sfa=True)
     monkeypatch.setattr(
         torch.ops._C_ascend, "npu_dsa_a5_kvcache_scatter_copy_group4_c8_out", SimpleNamespace(), raising=False
@@ -62,6 +62,15 @@ def test_copysfa_is_required_only_when_enabled(monkeypatch) -> None:
                 dsa_ops.require_dsa_offload_ops(packed_c8=True, mtp=True, fused_copy_sfa=True)
         else:
             dsa_ops.require_dsa_offload_ops(packed_c8=True, mtp=True, fused_copy_sfa=True)
+            group_args = fused_args[:13] + ["Tensor attention_slots", "Tensor attention_block_table"] + fused_args[13:]
+            grouped_op = SimpleNamespace(default=SimpleNamespace(_schema=torch._C.parse_schema(
+                f"group4_copysfa({', '.join(group_args)}) -> ()")))
+            monkeypatch.setattr(torch.ops._C_ascend, "npu_dsa_a5_fused_copy_sfa_group4_c8_out",
+                                grouped_op, raising=False)
+            dsa_ops.require_dsa_offload_ops(packed_c8=True, mtp=True, fused_copy_sfa=True, grouped_c8_kv=True)
+            grouped_op.default._schema = fused_op.default._schema
+            with pytest.raises(RuntimeError, match="virtual-PA ABI"):
+                dsa_ops.require_dsa_offload_ops(packed_c8=True, mtp=True, fused_copy_sfa=True, grouped_c8_kv=True)
 
 
 def test_copysfa_wrapper_preserves_metadata_and_caller_owned_outputs(monkeypatch) -> None:

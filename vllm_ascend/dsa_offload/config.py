@@ -327,9 +327,8 @@ class DSAOffloadConfig:
         return config
 
     def _validate_static_contract(self) -> None:
-        if self.enable_grouped_c8_kv:
-            if not self.enabled or self.enable_fused_copy_sfa:
-                raise ValueError("enable_grouped_c8_kv requires DSA offload with split copy + SFA")
+        if self.enable_grouped_c8_kv and not self.enabled:
+            raise ValueError("enable_grouped_c8_kv requires DSA offload")
         if self.enable_fused_copy_sfa and not self.enabled:
             raise ValueError("enable_fused_copy_sfa requires DSA offload")
         thresholds = self.prompt_budget_thresholds

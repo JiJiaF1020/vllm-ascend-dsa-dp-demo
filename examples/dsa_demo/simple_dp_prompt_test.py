@@ -86,7 +86,7 @@ DP_MASTER_PORT = 0  # 0自动选择空闲端口；需要指定时填写未占用
 # =============================================================================
 ENABLE_DSA_OFFLOAD = True  # False为基线DP对照；此时必须同时关闭DSA L3开关
 ENABLE_FUSED_COPYSFA = False
-ENABLE_GROUPED_C8_KV = False  # 实验路径：四层IndexShare KV交错，MTP3+split；prefix/L3必须关闭
+ENABLE_GROUPED_C8_KV = False  # 四层IndexShare KV交错，MTP3；可叠加FUSED_COPYSFA，prefix/L3必须关闭
 DSA_SPARSE_ACTIVATION_TOKENS = 6144  # 非MTP下超过该长度才进入稀疏路径
 DSA_PROMPT_BUDGET_THRESHOLDS = [32768, 65536]
 DSA_RESIDENT_BUDGET_TOKENS = [6144, 10240, 12288]  # 非MTP三个长度档的HBM驻留预算
@@ -238,10 +238,10 @@ def _validate(c):
         )
     if c.get("ENABLE_GROUPED_C8_KV", False) and (
         not c["ENABLE_DSA_OFFLOAD"] or not c["ENABLE_MTP"] or not c["ENABLE_A5_PACKED_C8_DSA"]
-        or c.get("ENABLE_FUSED_COPYSFA", False) or c["ENABLE_PREFIX_CACHING"]
+        or c["ENABLE_PREFIX_CACHING"]
         or c["ENABLE_L3_WRITE_BEHIND"] or c["ENABLE_L3_PREFIX_LOADBACK"]
     ):
-        raise ValueError("Grouped C8 KV requires packed-C8 DSA + MTP3 + split; disable prefix caching and L3")
+        raise ValueError("Grouped C8 KV requires packed-C8 DSA + MTP3; disable prefix caching and L3")
     if c["ENABLE_DSA_OFFLOAD"]:
         thresholds = c["DSA_PROMPT_BUDGET_THRESHOLDS"]
         budget_key = "DSA_MTP_RESIDENT_BUDGET_TOKENS" if c["ENABLE_MTP"] else "DSA_RESIDENT_BUDGET_TOKENS"
@@ -321,7 +321,7 @@ def _build_kwargs(c):
     if c["ENABLE_DSA_OFFLOAD"]:
         additional["dsa_sparse_config"] = {
             "enabled": True,
-            "enable_fused_copy_sfa": ENABLE_FUSED_COPYSFA,
+            "enable_fused_copy_sfa": c["ENABLE_FUSED_COPYSFA"],
             "enable_grouped_c8_kv": c.get("ENABLE_GROUPED_C8_KV", False),
             "split_indexer_cache": True,
             "indexer_mla_block_ratio": c["DSA_INDEXER_MLA_BLOCK_RATIO"],
@@ -605,6 +605,7 @@ _SUMMARY_SETTINGS = (
     "MAX_NUM_BATCHED_TOKENS",
     "ENABLE_CHUNKED_PREFILL",
     "ENABLE_DSA_OFFLOAD",
+    "ENABLE_FUSED_COPYSFA",
     "ENABLE_GROUPED_C8_KV",
     "ENABLE_A5_PACKED_C8_DSA",
     "ENABLE_MTP",

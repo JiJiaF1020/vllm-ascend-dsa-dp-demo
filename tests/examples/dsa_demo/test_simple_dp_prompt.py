@@ -35,20 +35,21 @@ def demo(monkeypatch):
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_grouped_c8_switch_is_forwarded_without_changing_other_dsa_settings(demo, enabled):
+@pytest.mark.parametrize("fused", [False, True])
+def test_grouped_c8_switch_is_forwarded_without_changing_other_dsa_settings(demo, enabled, fused):
     c = demo._settings()
     c.update(ENABLE_GROUPED_C8_KV=enabled, ENABLE_DSA_OFFLOAD=True, ENABLE_A5_PACKED_C8_DSA=True,
-             ENABLE_MTP=True, ENABLE_FUSED_COPYSFA=False, ENABLE_PREFIX_CACHING=False,
+             ENABLE_MTP=True, ENABLE_FUSED_COPYSFA=fused, ENABLE_PREFIX_CACHING=False,
              ENABLE_L3_WRITE_BEHIND=False, ENABLE_L3_PREFIX_LOADBACK=False, REPLAY_ROUNDS=1,
              RESET_LOCAL_CACHE_BEFORE_LAST_REPLAY=False, SWAP_DP_ON_LAST_REPLAY=False)
     demo._validate(c)
     kwargs = demo._build_kwargs(c)
     dsa = kwargs["additional_config"]["dsa_sparse_config"]
     assert dsa["enable_grouped_c8_kv"] is enabled
-    assert not dsa["enable_fused_copy_sfa"]
+    assert dsa["enable_fused_copy_sfa"] is fused
     assert dsa["resident_budget_tokens"] == c["DSA_MTP_RESIDENT_BUDGET_TOKENS"]
     if enabled:
-        for conflict in ({"ENABLE_PREFIX_CACHING": True}, {"ENABLE_FUSED_COPYSFA": True},
+        for conflict in ({"ENABLE_PREFIX_CACHING": True},
                          {"ENABLE_MTP": False}, {"ENABLE_DSA_OFFLOAD": False}):
             with pytest.raises(ValueError, match="Grouped C8 KV"):
                 demo._validate(dict(c, **conflict))

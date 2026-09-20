@@ -92,8 +92,8 @@ def require_dsa_offload_ops(
 
     if fused_copy_sfa and not (packed_c8 and mtp):
         raise ValueError("CopySFA requires the A5 packed-C8 MTP path")
-    if grouped_c8_kv and (not packed_c8 or not mtp or fused_copy_sfa):
-        raise ValueError("Grouped C8 KV requires A5 MTP and split copy + SFA")
+    if grouped_c8_kv and not (packed_c8 and mtp):
+        raise ValueError("Grouped C8 KV requires A5 packed-C8 MTP")
     if packed_c8 and not load_custom_op_library():
         raise RuntimeError(
             "DSA A5 packed-C8 custom operator library failed to load; "
@@ -114,6 +114,8 @@ def require_dsa_offload_ops(
         required_ops = (*required_ops, "npu_dsa_a5_fused_copy_sfa_c8_out")
     if grouped_c8_kv:
         required_ops = (*required_ops, "npu_dsa_a5_kvcache_scatter_copy_group4_c8_out")
+        if fused_copy_sfa:
+            required_ops = (*required_ops, "npu_dsa_a5_fused_copy_sfa_group4_c8_out")
     missing = [op_name for op_name in required_ops if not hasattr(torch.ops._C_ascend, op_name)]
     if missing:
         raise RuntimeError(f"DSA sparse offload custom operators are not installed: {tuple(missing)}")
@@ -145,6 +147,13 @@ def require_dsa_offload_ops(
             "topk_index",
         ):
             raise RuntimeError("DSA A5 CopySFA requires the TopK2048 ABI; rebuild the CANN operators and vllm_ascend_C")
+        if grouped_c8_kv:
+            schema = torch.ops._C_ascend.npu_dsa_a5_fused_copy_sfa_group4_c8_out.default._schema
+            if len(schema.arguments) != 17 or tuple(arg.name for arg in schema.arguments[13:15]) != (
+                "attention_slots",
+                "attention_block_table",
+            ):
+                raise RuntimeError("DSA Group4 CopySFA requires the virtual-PA ABI; rebuild CANN and vllm_ascend_C")
 
 
 def _packed_byte_view(cache: torch.Tensor, *, name: str) -> torch.Tensor:

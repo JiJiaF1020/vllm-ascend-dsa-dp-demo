@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import torch
 
 from vllm_ascend.dsa_offload.grouped_layout import GroupedResidentCache, expanded_block_table, lane_slots
-from vllm_ascend.dsa_offload.ops import dump_full_cache_plane_bytes
+from vllm_ascend.dsa_offload.ops import DSAFusedCopyPlan, dump_full_cache_plane_bytes
 from vllm_ascend.dsa_offload.runtime import DSALayerOffloadContext
 
 
@@ -33,6 +33,14 @@ class DSAGroupedLayerOffloadContext(DSALayerOffloadContext):
         # 2624B/token copy precedes attention for all four layers. Never replay
         # it on a follower: that would overwrite newly written follower KV.
         if self.lane == 0:
+            if self.runtime.fused_copy_sfa:
+                return DSAFusedCopyPlan(
+                    dram_packed_arena=self.group_dram,
+                    dram_block_table=dram_block_table,
+                    attention_src_ids=self.runtime._a5_attention_src_ids[:num_query_rows],
+                    per_query_miss_counts=self.runtime._a5_per_query_miss_counts[:num_query_rows],
+                    outputs=outputs,
+                )
             torch.ops._C_ascend.npu_dsa_a5_kvcache_scatter_copy_group4_c8_out(
                 self.group.packed.view(torch.int8),
                 self.group_dram,
@@ -95,8 +103,38 @@ class DSAGroupedLayerOffloadContext(DSALayerOffloadContext):
         actual_seq_lengths_kv,
         query_rope,
     ):
-        if selection.fused_copy_plan is not None or selection.resident_seq_lengths is None:
-            raise RuntimeError("Grouped C8 KV requires split MTP LIM selection")
+        if selection.resident_seq_lengths is None:
+            raise RuntimeError("Grouped C8 KV requires MTP LIM selection")
+        plan = selection.fused_copy_plan
+        if plan is not None:
+            if self.lane != 0 or not self.runtime.fused_copy_sfa:
+                raise RuntimeError("Only the grouped owner may consume a fused copy plan")
+            packed_query = torch.cat([query, query_rope], dim=-1).contiguous()
+            output = self.runtime.get_fused_attention_output(packed_query)
+            # Copy addresses stay logical. Only the owner's SFA sees the
+            # virtual PA view; query/valid-entry lengths are NOT multiplied.
+            torch.ops._C_ascend.npu_dsa_a5_fused_copy_sfa_group4_c8_out(
+                packed_query,
+                self.group.packed.view(torch.int8),
+                plan.dram_packed_arena,
+                resident_block_table.contiguous(),
+                plan.dram_block_table.contiguous(),
+                selection.sparse_indices.contiguous(),
+                plan.attention_src_ids.contiguous(),
+                plan.per_query_miss_counts.contiguous(),
+                actual_seq_lengths_query.contiguous(),
+                selection.resident_seq_lengths.contiguous(),
+                plan.outputs.topk_index.contiguous(),
+                plan.outputs.topk_slots.contiguous(),
+                plan.outputs.miss_count.contiguous(),
+                lane_slots(selection.sparse_indices, 0).contiguous(),
+                expanded_block_table(resident_block_table),
+                float(scale_value),
+                output,
+            )
+            return output
+        if self.lane == 0 and self.runtime.fused_copy_sfa:
+            raise RuntimeError("Grouped owner is missing its deferred copy plan")
         return self.execute_paged_attention(
             query=query,
             query_rope=query_rope,

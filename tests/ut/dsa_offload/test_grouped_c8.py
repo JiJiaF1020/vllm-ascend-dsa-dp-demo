@@ -18,6 +18,7 @@ from vllm_ascend.dsa_offload.grouped_layout import (
     lane_slots,
 )
 from vllm_ascend.dsa_offload.grouped_runtime import DSAGroupedLayerOffloadContext
+from vllm_ascend.dsa_offload.ops import DSAOffloadSelectionOutput
 from vllm_ascend.dsa_offload.worker_dram_store import DSAWorkerDRAMStore
 
 
@@ -95,6 +96,7 @@ def _contexts():
         return True
 
     runtime = SimpleNamespace(
+        fused_copy_sfa=False,
         dram_store=store,
         dump_before_cache_write=True,
         dump_launch_count=2,
@@ -175,6 +177,68 @@ def test_one_copy_per_group_not_one_copy_per_layer(monkeypatch):
     assert len(calls) == 1
     assert calls[0][0].shape[-1] == 2624
     assert calls[0][0].data_ptr() == group.packed.data_ptr()
+
+
+def test_grouped_fusion_defers_only_owner_and_followers_use_sfa(monkeypatch):
+    group, dram, runtime, contexts = _contexts()
+    runtime.fused_copy_sfa = True
+    runtime._a5_attention_src_ids = torch.full((4, 1, 2048), -1, dtype=torch.int32)
+    runtime._a5_per_query_miss_counts = torch.zeros(4, dtype=torch.int32)
+    output = torch.empty(4, 8, 512, dtype=torch.bfloat16)
+    runtime.get_fused_attention_output = lambda query: output
+    copies, fused, sfa = [], [], []
+    monkeypatch.setattr(torch.ops._C_ascend, "npu_dsa_a5_kvcache_scatter_copy_group4_c8_out",
+                        lambda *args: copies.append(args), raising=False)
+    monkeypatch.setattr(torch.ops._C_ascend, "npu_dsa_a5_fused_copy_sfa_group4_c8_out",
+                        lambda *args: fused.append(args), raising=False)
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(
+        npu_kv_quant_sparse_flash_attention=lambda **kwargs: sfa.append(kwargs) or output))
+    table = torch.tensor([[2, 1, 0]], dtype=torch.int32)
+    ids = torch.tensor([[[126, 127, 128, 129, -1]]], dtype=torch.int32).expand(4, 1, 5).contiguous()
+    lengths = torch.tensor([4], dtype=torch.int32)
+    outputs = SimpleNamespace(topk_index=ids[:1], topk_slots=ids[:1], miss_count=lengths, tail_info=None)
+    plans = []
+    for lane, context in enumerate(contexts):
+        plan = context._copy_or_defer_c8(
+            resident_packed_cache=group.pa_view, dram_packed_arena=dram,
+            resident_block_table=table, dram_block_table=table, outputs=outputs, num_query_rows=4,
+        )
+        plans.append(plan)
+        selection = DSAOffloadSelectionOutput(ids, None, lengths, plan)
+        result = context.execute_sparse_attention(
+            query=torch.zeros(4, 8, 512, dtype=torch.bfloat16),
+            query_rope=torch.zeros(4, 8, 64, dtype=torch.bfloat16),
+            resident_cache=(group.pa_view,), selection=selection, scale_value=0.1,
+            resident_block_table=table, actual_seq_lengths_query=lengths, actual_seq_lengths_kv=lengths,
+        )
+        assert result is output
+        assert len(fused) == 1 and len(sfa) == lane
+        if lane:
+            assert torch.equal(sfa[-1]["sparse_indices"], lane_slots(ids, lane))
+    assert not copies
+    assert plans[0] is not None and plans[1:] == [None, None, None]
+    args = fused[0]
+    assert len(args) == 17 and args[-1] is output
+    assert args[1].shape[-1] == args[2].shape[-1] == 2624
+    assert args[1].data_ptr() == group.packed.data_ptr() and args[2].data_ptr() == dram.data_ptr()
+    assert args[3] is table and args[4] is table and args[5] is ids
+    assert args[8] is lengths and args[9] is lengths
+    assert torch.equal(args[13], lane_slots(ids, 0))
+    assert torch.equal(args[14], expanded_block_table(table))
+    bad_selection = DSAOffloadSelectionOutput(ids, None, lengths, plans[0])
+    with pytest.raises(RuntimeError, match="Only the grouped owner"):
+        contexts[1].execute_sparse_attention(
+            query=None, query_rope=None, resident_cache=None, selection=bad_selection,
+            scale_value=0.1, resident_block_table=table,
+            actual_seq_lengths_query=lengths, actual_seq_lengths_kv=lengths,
+        )
+    missing_plan = DSAOffloadSelectionOutput(ids, None, lengths, None)
+    with pytest.raises(RuntimeError, match="missing its deferred copy plan"):
+        contexts[0].execute_sparse_attention(
+            query=None, query_rope=None, resident_cache=None, selection=missing_plan,
+            scale_value=0.1, resident_block_table=table,
+            actual_seq_lengths_query=lengths, actual_seq_lengths_kv=lengths,
+        )
 
 
 @pytest.mark.parametrize("sparse_mode", [0, 3])
