@@ -8,7 +8,7 @@
 
 namespace vllm_ascend {
 
-inline void npu_dsa_a5_kvcache_scatter_copy_c8_out(
+inline void npu_dsa_a5_kvcache_scatter_copy_group4_c8_out(
     at::Tensor hbm_kv_bytes,
     const at::Tensor& dram_kv_bytes,
     const at::Tensor& hbm_block_table,
