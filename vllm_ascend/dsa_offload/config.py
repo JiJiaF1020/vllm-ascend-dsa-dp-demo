@@ -51,6 +51,7 @@ _PUBLIC_CONFIG_KEYS = frozenset(
         "hot_cpu_block_multiple",
         "enable_row_mode_decode_graph",
         "enable_fused_copy_sfa",
+        "enable_grouped_c8_kv",
         "trace_points",
     }
 )
@@ -170,6 +171,7 @@ class DSAOffloadConfig:
     hot_cpu_block_multiple: float = 3.0
     enable_row_mode_decode_graph: bool = False
     enable_fused_copy_sfa: bool = False
+    enable_grouped_c8_kv: bool = False
     trace_points: DSAOffloadTraceConfig = field(default_factory=DSAOffloadTraceConfig)
     model_capabilities: DSAOffloadModelCapabilities | None = field(
         default=None,
@@ -302,6 +304,10 @@ class DSAOffloadConfig:
                 raw_config.get("enable_fused_copy_sfa", False),
                 field_name="enable_fused_copy_sfa",
             ),
+            enable_grouped_c8_kv=_strict_bool(
+                raw_config.get("enable_grouped_c8_kv", False),
+                field_name="enable_grouped_c8_kv",
+            ),
         )
         config._validate_static_contract()
         if config.enabled and vllm_config is not None:
@@ -321,6 +327,9 @@ class DSAOffloadConfig:
         return config
 
     def _validate_static_contract(self) -> None:
+        if self.enable_grouped_c8_kv:
+            if not self.enabled or self.enable_fused_copy_sfa:
+                raise ValueError("enable_grouped_c8_kv requires DSA offload with split copy + SFA")
         if self.enable_fused_copy_sfa and not self.enabled:
             raise ValueError("enable_fused_copy_sfa requires DSA offload")
         thresholds = self.prompt_budget_thresholds
@@ -599,6 +608,14 @@ class DSAOffloadConfig:
             )
         if self.enable_row_mode_decode_graph and bool(vllm_config.model_config.enforce_eager):
             raise ValueError("enable_row_mode_decode_graph requires enforce_eager=False")
+        if self.enable_grouped_c8_kv:
+            from vllm_ascend.dsa_offload.grouped_layout import indexshare_groups
+
+            indexshare_groups(capabilities.indexer_types)
+            if mtp_num_speculative_tokens != 3:
+                raise ValueError("Grouped C8 KV initially supports MTP3 only")
+            if vllm_config.cache_config.enable_prefix_caching or kv_transfer_config is not None:
+                raise ValueError("Grouped C8 KV initially requires prefix caching and KV transfer/L3 disabled")
         return (
             capabilities,
             mtp_num_speculative_tokens,

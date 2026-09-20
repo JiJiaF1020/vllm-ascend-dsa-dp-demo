@@ -38,6 +38,11 @@ custom 的 MTP durable dump step（prefix/L3）继续走 eager，任何 DP rank
 
 ## CopySFA 融合开关（默认关闭）
 
+四层 IndexShare KV 交错存储的独立实验路径见
+[Grouped C8 KV 说明](../../docs/source/developer_guide/Design_Documents/dsa_sparse_offload/features/grouped_c8_kv.md)。
+`simple_dp_prompt_test.py` 的 `ENABLE_GROUPED_C8_KV` 默认 `False`；初版仅 MTP3 + split，
+不支持 prefix cache/L3。需要重新编译新增的 Group4C8 copy 算子后单独验收。
+
 在现有 `additional_config["dsa_sparse_config"]` 内添加
 `"enable_fused_copy_sfa": True` 开启融合；省略或设为 `False` 时保持
 copy + SFA 分离路径。不要用此字段覆盖其它 DSA 配置。

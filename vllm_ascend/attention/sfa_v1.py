@@ -42,6 +42,7 @@ from vllm_ascend.attention.utils import (
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.mxfp_compat import FLOAT8_E8M0FNU_DTYPE
 from vllm_ascend.distributed.utils import all_gather_async
+from vllm_ascend.dsa_offload.grouped_runtime import DSAGroupedLayerOffloadContext
 from vllm_ascend.dsa_offload.ops import (
     DSAOffloadSelectionOutput,
     quant_lightning_indexer_topk,
@@ -1877,6 +1878,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                 actual_seq_lengths_kv=actual_seq_lengths_key,
                 query_rope=q_pe,
             )
+        if isinstance(self.dsa_offload_context, DSAGroupedLayerOffloadContext):
+            # Prefill/native-indexer path: keep its causal mode, translating
+            # only addresses into the group's equivalent native PA view.
+            return self.dsa_offload_context.execute_paged_attention(
+                query=ql_nope, query_rope=q_pe, resident_cache=kv_cache,
+                sparse_indices=topk_indices, scale_value=self.scale,
+                block_table=attn_metadata.block_table,
+                actual_seq_lengths_query=actual_seq_lengths_query,
+                actual_seq_lengths_kv=actual_seq_lengths_key, sparse_mode=3,
+            )
         return DeviceOperator.execute_sparse_flash_attention_process(
             self,
             ql_nope,
@@ -1961,6 +1972,12 @@ class AscendSFAImpl(MLAAttentionImpl):
         }
 
         dsa_context = self.dsa_offload_context
+        kv_write_slot_mapping = slot_mapping
+        if isinstance(dsa_context, DSAGroupedLayerOffloadContext):
+            # Indexer remains dense/per-owner and must retain the ORIGINAL
+            # slot_mapping. Translate only Prolog/packed-KV scatter writes.
+            kv_write_slot_mapping = dsa_context.map_cache_slots(slot_mapping)
+            slot_mapping_sfa = kv_write_slot_mapping
         if dsa_context is not None:
             if kv_cache is None:
                 raise RuntimeError(
@@ -2011,7 +2028,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 kv_cache=kv_cache,
                 cos=cos,
                 sin=sin,
-                slot_mapping=slot_mapping,
+                slot_mapping=kv_write_slot_mapping,
                 cache_mode="PA_BSND",
             )
         # run mlapo ops when dsa-cp is disabled, and ensure that num_tokens satisfies the count limitation
@@ -2026,7 +2043,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 kv_cache=kv_cache,
                 cos=cos,
                 sin=sin,
-                slot_mapping=slot_mapping,
+                slot_mapping=kv_write_slot_mapping,
                 num_input_tokens=num_input_tokens,
             )
             if self.has_indexer:

@@ -34,6 +34,16 @@ def test_copysfa_is_required_only_when_enabled(monkeypatch) -> None:
         SimpleNamespace(npu_dsa_a5_li_manage_c8_out=SimpleNamespace(default=SimpleNamespace(_schema=schema))),
     )
     dsa_ops.require_dsa_offload_ops(packed_c8=True, mtp=True)
+    with pytest.raises(RuntimeError, match="npu_dsa_a5_kvcache_scatter_copy_group4_c8_out"):
+        dsa_ops.require_dsa_offload_ops(packed_c8=True, mtp=True, grouped_c8_kv=True)
+    with pytest.raises(ValueError, match="Grouped C8"):
+        dsa_ops.require_dsa_offload_ops(packed_c8=True, grouped_c8_kv=True)
+    with pytest.raises(ValueError, match="Grouped C8"):
+        dsa_ops.require_dsa_offload_ops(packed_c8=True, mtp=True, grouped_c8_kv=True, fused_copy_sfa=True)
+    monkeypatch.setattr(
+        torch.ops._C_ascend, "npu_dsa_a5_kvcache_scatter_copy_group4_c8_out", SimpleNamespace(), raising=False
+    )
+    dsa_ops.require_dsa_offload_ops(packed_c8=True, mtp=True, grouped_c8_kv=True)
     with pytest.raises(RuntimeError, match="npu_dsa_a5_fused_copy_sfa_c8_out"):
         dsa_ops.require_dsa_offload_ops(packed_c8=True, mtp=True, fused_copy_sfa=True)
     with pytest.raises(ValueError, match="MTP"):

@@ -47,6 +47,7 @@
 #include "attention/vllm_a5_li_manage_nomtp_c8/vllm_a5_li_manage_nomtp_c8_torch_adpt.h"
 #include "attention/vllm_a5_li_manage_c8/vllm_a5_li_manage_c8_torch_adpt.h"
 #include "attention/vllm_a5_kvcache_scatter_copy_c8/vllm_a5_kvcache_scatter_copy_c8_torch_adpt.h"
+#include "attention/vllm_a5_kvcache_scatter_copy_group4_c8/vllm_a5_kvcache_scatter_copy_group4_c8_torch_adpt.h"
 #include "attention/vllm_a5_fused_copy_sfa_c8/vllm_a5_fused_copy_sfa_c8_torch_adpt.h"
 #include "mc2/matmul_allreduce_add_rmsnorm/matmul_allreduce_add_rmsnorm_torch_adpt.h"
 #include "moe/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
@@ -2478,6 +2479,16 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.impl("npu_dsa_a5_kvcache_scatter_copy_c8_out",
              torch::kPrivateUse1,
              &vllm_ascend::npu_dsa_a5_kvcache_scatter_copy_c8_out);
+
+    ops.def(
+        "npu_dsa_a5_kvcache_scatter_copy_group4_c8_out("
+        "Tensor(a!) hbm_kv_bytes, Tensor dram_kv_bytes, "
+        "Tensor hbm_block_table, Tensor dram_block_table, "
+        "Tensor source_token_ids, Tensor destination_slots, "
+        "Tensor copy_counts) -> ()");
+    ops.impl("npu_dsa_a5_kvcache_scatter_copy_group4_c8_out",
+             torch::kPrivateUse1,
+             &vllm_ascend::npu_dsa_a5_kvcache_scatter_copy_group4_c8_out);
 
     ops.def(
         "npu_dsa_a5_fused_copy_sfa_c8_out("

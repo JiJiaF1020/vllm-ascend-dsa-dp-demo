@@ -297,6 +297,59 @@ class DSAWorkerDRAMStore:
             * resident_packed_cache.element_size()
         )
 
+    def add_grouped_packed_layers(
+        self,
+        *,
+        layer_ids: tuple[int, ...],
+        resident_packed_cache: torch.Tensor,
+        indexer_cache: tuple[torch.Tensor, ...],
+    ) -> torch.Tensor:
+        """Register four lanes with one physical allocation and one byte budget.
+
+        Only the full-Indexer owner carries the group's byte planes. The three
+        shared layers have empty byte-plane lists, preventing double accounting
+        or copying. Their packed aliases exist for the common LIM selection API.
+        """
+        from vllm_ascend.dsa_offload.grouped_layout import GROUP_SIZE
+
+        if len(layer_ids) != GROUP_SIZE or len(set(layer_ids)) != GROUP_SIZE:
+            raise ValueError("Grouped C8 arena requires four distinct layers")
+        if any(layer in self._layer_arenas for layer in layer_ids):
+            raise RuntimeError(f"Grouped C8 DRAM layers already initialized: {layer_ids}")
+        if (
+            resident_packed_cache.ndim != 4
+            or resident_packed_cache.shape[0] <= 0
+            or tuple(resident_packed_cache.shape[1:]) != (128, 1, GROUP_SIZE * DSA_A5_PACKED_KV_ROW_BYTES)
+            or resident_packed_cache.dtype not in (torch.int8, torch.float8_e4m3fn)
+            or not resident_packed_cache.is_contiguous()
+        ):
+            raise ValueError("Grouped C8 arena requires contiguous byte storage [blocks,128,1,2624]")
+        packed = self._allocate_payload_arena(
+            block_shape=tuple(resident_packed_cache.shape[1:]),
+            dtype=torch.int8,
+            payload_name=f"resident_grouped_c8[layers={layer_ids}]",
+        )
+        if (
+            tuple(packed.shape) != (self.arena_capacity, *resident_packed_cache.shape[1:])
+            or packed.dtype != torch.int8
+            or not packed.is_contiguous()
+        ):
+            raise RuntimeError("Grouped C8 DRAM arena factory returned an invalid layout")
+        packed[DSA_DRAM_NULL_BLOCK_ID].zero_()
+        source_bytes = cache_block_byte_view(resident_packed_cache, name="grouped_resident")
+        dram_bytes = cache_block_byte_view(packed, name="grouped_dram")
+        for lane, layer_id in enumerate(layer_ids):
+            self._layer_arenas[layer_id] = DSALayerDRAMArenas(
+                packed=packed.view(-1, 128, 1, DSA_A5_PACKED_KV_ROW_BYTES),
+                resident_source_bytes=(source_bytes,) if lane == 0 else (),
+                resident_dram_bytes=(dram_bytes,) if lane == 0 else (),
+                **self._create_indexer_byte_arenas(
+                    layer_id=layer_id, indexer_planes=indexer_cache if lane == 0 else ()
+                ),
+            )
+        self._registered_bytes_per_logical_block += int(source_bytes.shape[1])
+        return packed
+
     def _create_indexer_byte_arenas(
         self,
         *,

@@ -86,11 +86,14 @@ def require_dsa_offload_ops(
     packed_c8: bool = False,
     mtp: bool = False,
     fused_copy_sfa: bool = False,
+    grouped_c8_kv: bool = False,
 ) -> None:
     """在 worker 初始化期确认当前 cache 模式所需设备算子均已部署。"""
 
     if fused_copy_sfa and not (packed_c8 and mtp):
         raise ValueError("CopySFA requires the A5 packed-C8 MTP path")
+    if grouped_c8_kv and (not packed_c8 or not mtp or fused_copy_sfa):
+        raise ValueError("Grouped C8 KV requires A5 MTP and split copy + SFA")
     if packed_c8 and not load_custom_op_library():
         raise RuntimeError(
             "DSA A5 packed-C8 custom operator library failed to load; "
@@ -109,6 +112,8 @@ def require_dsa_offload_ops(
         required_ops = (*required_ops, *_REQUIRED_A5_MTP_OPS)
     if fused_copy_sfa:
         required_ops = (*required_ops, "npu_dsa_a5_fused_copy_sfa_c8_out")
+    if grouped_c8_kv:
+        required_ops = (*required_ops, "npu_dsa_a5_kvcache_scatter_copy_group4_c8_out")
     missing = [op_name for op_name in required_ops if not hasattr(torch.ops._C_ascend, op_name)]
     if missing:
         raise RuntimeError(f"DSA sparse offload custom operators are not installed: {tuple(missing)}")

@@ -200,6 +200,8 @@ from vllm_ascend.dsa_offload.graph_gate import (
     DSARowModeGraphDecision,
     evaluate_dsa_row_mode_decode_graph,
 )
+from vllm_ascend.dsa_offload.grouped_layout import allocate_grouped_caches
+from vllm_ascend.dsa_offload.grouped_runtime import DSAGroupedLayerOffloadContext
 from vllm_ascend.dsa_offload.input_batch import (
     apply_dsa_cache_layout_projection,
     apply_dsa_dram_assignments,
@@ -406,6 +408,9 @@ class NPUModelRunner(GPUModelRunner):
                     "itself keeps its native BF16 full cache"
                 )
         self.dsa_kv_cache_group_ids: DSAKVCacheGroupIds | None = None
+        self.dsa_grouped_caches = {}
+        if dsa_config.enable_grouped_c8_kv and not self.dsa_offload_packed_c8:
+            raise RuntimeError("Grouped C8 KV requires A5 packed-C8 DSA offload")
         if dsa_config.enable_fused_copy_sfa and not (
             self.dsa_offload_packed_c8 and dsa_config.mtp_enabled
         ):
@@ -4863,6 +4868,7 @@ class NPUModelRunner(GPUModelRunner):
             packed_c8=self.dsa_offload_packed_c8,
             mtp=self.ascend_config.dsa_offload_config.mtp_enabled,
             fused_copy_sfa=self.ascend_config.dsa_offload_config.enable_fused_copy_sfa,
+            grouped_c8_kv=self.ascend_config.dsa_offload_config.enable_grouped_c8_kv,
         )
         binding_order = get_dsa_kv_cache_binding_order(kv_cache_config)
         expected_dsa_layers = set(binding_order)
@@ -5161,7 +5167,33 @@ class NPUModelRunner(GPUModelRunner):
                     )
                 selection_source_layer_id = last_full_runtime_layer_id
 
-            if self.dsa_offload_packed_c8:
+            grouped_cache = self.dsa_grouped_caches.get(resident_name)
+            context_class = DSALayerOffloadContext
+            context_kwargs = {}
+            if grouped_cache is not None:
+                if runtime_layer_id != layer_index:
+                    raise RuntimeError("Grouped C8 KV requires unpartitioned target layer numbering")
+                lane = grouped_cache.layer_ids.index(layer_index)
+                if lane == 0:
+                    store.add_grouped_packed_layers(
+                        layer_ids=grouped_cache.layer_ids,
+                        resident_packed_cache=grouped_cache.packed,
+                        indexer_cache=indexer_cache,
+                    )
+                    logger.info(
+                        "[DSA grouped C8 KV] layers=%s shape=%s (one 2624B copy per token)",
+                        grouped_cache.layer_ids,
+                        tuple(grouped_cache.packed.shape),
+                    )
+                context_class = DSAGroupedLayerOffloadContext
+                context_kwargs = dict(
+                    group=grouped_cache,
+                    lane=lane,
+                    group_dram=store.get_layer_arenas(runtime_layer_id).packed.view(
+                        -1, *grouped_cache.packed.shape[1:]
+                    ),
+                )
+            elif self.dsa_offload_packed_c8:
                 store.add_packed_layer(
                     layer_id=runtime_layer_id,
                     resident_packed_cache=resident_cache[0],
@@ -5175,13 +5207,14 @@ class NPUModelRunner(GPUModelRunner):
                     indexer_cache=indexer_cache,
                 )
             resident_impl.bind_dsa_offload_context(
-                DSALayerOffloadContext(
+                context_class(
                     layer_id=runtime_layer_id,
                     indexer_cache=indexer_cache,
                     runtime=runtime,
                     selection_state_id=selection_state_id,
                     selection_source_layer_id=selection_source_layer_id,
                     packed_c8=self.dsa_offload_packed_c8,
+                    **context_kwargs,
                 )
             )
             if runtime.fused_copy_sfa:
@@ -5403,9 +5436,21 @@ class NPUModelRunner(GPUModelRunner):
             str,
             torch.Tensor | tuple[torch.Tensor, ...],
         ] = {}
+        self.dsa_grouped_caches = {}
         # prefill disaggregation need the addr of cache tensor be aligned with 2M
         alignment = 2 * 1024 * 1024
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
+        dsa_config = getattr(getattr(self, "ascend_config", None), "dsa_offload_config", None)
+        if getattr(dsa_config, "enable_grouped_c8_kv", False) is True:
+            if self.shared_kv_cache_layers:
+                raise ValueError("Grouped C8 KV cannot be combined with cross-layer KV aliasing")
+            self.dsa_grouped_caches = allocate_grouped_caches(
+                kv_cache_config,
+                layer_kv_cache_spec,
+                dsa_config.model_capabilities.indexer_types,
+                self._allocate_int8_cache_tensor,
+            )
+            kv_cache_raw_tensors.update({name: (cache.pa_view,) for name, cache in self.dsa_grouped_caches.items()})
         # If some tensors are shared by linear layers and attention layers,
         # the same tensor format must be maintained even if some layers
         # have only linear or attention layers, for example, the mtp layer.
@@ -5421,6 +5466,8 @@ class NPUModelRunner(GPUModelRunner):
             for idx in range(len(kv_cache_tensor.shared_by)):
                 layer_name = kv_cache_tensor.shared_by[idx]
                 current_layer_spec = layer_kv_cache_spec[layer_name]
+                if layer_name in self.dsa_grouped_caches:
+                    continue
                 if isinstance(current_layer_spec, DSAIndexerKVSpec):
                     if layer_name not in kv_cache_raw_tensors:
                         if current_layer_spec.cache_sparse_li_c8:
@@ -5736,6 +5783,7 @@ class NPUModelRunner(GPUModelRunner):
         """
         kv_caches: dict[str, torch.Tensor | tuple[torch.Tensor, ...]] = {}
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
+        grouped_caches = getattr(self, "dsa_grouped_caches", {})
 
         # Indexer plane 只是一张独立的 dense cache，没有自己的 attention
         # backend/metadata builder。按 spec 直接恢复算子消费的标准 4D
@@ -5794,6 +5842,10 @@ class NPUModelRunner(GPUModelRunner):
             current_kv_cache_spec = group.kv_cache_spec
             for layer_name in group.layer_names:
                 if layer_name in self.runner_only_attn_layers:
+                    continue
+
+                if layer_name in grouped_caches:
+                    kv_caches[layer_name] = (grouped_caches[layer_name].pa_view,)
                     continue
 
                 current_kv_cache_spec = layer_kv_cache_spec[layer_name]
