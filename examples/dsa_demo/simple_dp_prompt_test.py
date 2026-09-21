@@ -76,6 +76,10 @@ GRAPH_CAPTURE_ROW_SIZES = [1, 2, 4, 8,11]  # 请求行数，自动过滤大于MA
 DATA_PARALLEL_SIZE = 2  # 可设1作无L3的单域对照；同时调整TP或可见卡数。DP1+L3沿用simple_prompt_test.py
 TENSOR_PARALLEL_SIZE = 4
 VISIBLE_DEVICES = "0,1,2,3,4,5,6,7"  # 卡数必须等于DP*TP，脚本统一设置两种可见卡变量
+NUMA_NODES_PER_DP = ""  # 空串不绑核；如 "3,1"：每DP一个NUMA节点，个数必须等于DATA_PARALLEL_SIZE
+# 绑核在每个DP客户端进程内完成（ctypes调libnuma），其spawn出的TP子进程随fork/exec继承mempolicy。
+# 绑定串必须按本机拓扑查询（npu-smi info -t topo + numactl --hardware），不能跨机照抄；
+# 鲲鹏950八卡DP2*TP4已验证映射为"3,1"（NPU0-3亲和node3，NPU4-7亲和node1）。
 PROMPT_DISTRIBUTION = "round_robin"  # 第i个输入交给DP(i%DPsize)
 # replicate：每个DP都跑整份PROMPTS，可用于单个长prompt在不同域的对照。
 # round_robin要求输入条数>=DPsize，不偷偷添加placeholder请求。
@@ -194,6 +198,13 @@ def _validate(c):
         or not all(x.isdecimal() for x in devices)
     ):
         raise ValueError("VISIBLE_DEVICES must contain DP*TP distinct numeric device IDs")
+    if c["NUMA_NODES_PER_DP"]:
+        nodes = _parse_numa_nodes(c["NUMA_NODES_PER_DP"])
+        if nodes is None or len(nodes) != c["DATA_PARALLEL_SIZE"]:
+            raise ValueError(
+                "NUMA_NODES_PER_DP must be a comma-separated list of one non-negative node id per DP "
+                f"({c['DATA_PARALLEL_SIZE']} values), got {c['NUMA_NODES_PER_DP']!r}"
+            )
     if c["RUN_MODE"] not in ("eager", "graph") or c["PROMPT_DISTRIBUTION"] not in ("round_robin", "replicate"):
         raise ValueError("RUN_MODE=eager/graph; PROMPT_DISTRIBUTION=round_robin/replicate")
     if not 0 < c["GPU_MEMORY_UTILIZATION"] <= 1 or not 0 < c["DSA_HOT_CPU_BLOCK_MULTIPLE"] < float("inf"):
@@ -429,7 +440,52 @@ def _round_phase(c, round_index):
     return f"local-replay-{round_index}" if c["ENABLE_PREFIX_CACHING"] else f"recompute-{round_index}"
 
 
+def _parse_numa_nodes(raw):
+    try:
+        nodes = [int(item) for item in raw.split(",")]
+    except ValueError:
+        return None
+    return nodes if all(node >= 0 for node in nodes) else None
+
+
+def _bind_numa_node(node, rank):
+    # 进程内绑核：spawn的DP/TP子进程没有shell命令行可套numactl，且mempolicy随fork/exec继承，
+    # 在DP客户端绑定后其TP子进程同样生效。numa_run_on_node≈--cpunodebind，numa_set_membind≈--membind；
+    # 内存策略只影响后续分配的页，必须在LLM创建（主机内存池分配）之前调用。
+    import ctypes
+
+    lib = None
+    for name in ("libnuma.so.1", "libnuma.so"):
+        try:
+            lib = ctypes.CDLL(name)
+            lib.numa_available.restype = ctypes.c_int
+            if lib.numa_available() >= 0:
+                break
+            lib = None
+        except OSError:
+            lib = None
+    if lib is None:
+        print(f"[simple-dp] NUMA WARNING: libnuma unavailable, DP {rank} not bound (install numactl/libnuma)", flush=True)
+        return False
+    if lib.numa_run_on_node(ctypes.c_int(node)) != 0:
+        print(f"[simple-dp] NUMA WARNING: numa_run_on_node({node}) failed for DP {rank}", flush=True)
+        return False
+    mask = lib.numa_allocate_nodemask()
+    if not mask:
+        print(f"[simple-dp] NUMA WARNING: numa_allocate_nodemask failed for DP {rank}", flush=True)
+        return False
+    try:
+        lib.numa_bitmask_setbit(ctypes.c_void_p(mask), ctypes.c_uint(node))
+        lib.numa_set_membind(ctypes.c_void_p(mask))
+    finally:
+        lib.numa_bitmask_free(ctypes.c_void_p(mask))
+    print(f"[simple-dp] NUMA: DP {rank} bound to node {node}", flush=True)
+    return True
+
+
 def _worker(rank, c, prompts, port, barrier, run_dir):
+    if c["NUMA_NODES_PER_DP"]:
+        _bind_numa_node(_parse_numa_nodes(c["NUMA_NODES_PER_DP"])[rank], rank)
     os.environ.update({str(key): str(value) for key, value in c["NATIVE_RUNTIME_ENV"].items()})
     os.environ.update(
         {
