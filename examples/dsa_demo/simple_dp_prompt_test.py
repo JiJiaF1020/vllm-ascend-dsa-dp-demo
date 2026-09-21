@@ -76,10 +76,10 @@ GRAPH_CAPTURE_ROW_SIZES = [1, 2, 4, 8,11]  # 请求行数，自动过滤大于MA
 DATA_PARALLEL_SIZE = 2  # 可设1作无L3的单域对照；同时调整TP或可见卡数。DP1+L3沿用simple_prompt_test.py
 TENSOR_PARALLEL_SIZE = 4
 VISIBLE_DEVICES = "0,1,2,3,4,5,6,7"  # 卡数必须等于DP*TP，脚本统一设置两种可见卡变量
-NUMA_NODES_PER_DP = ""  # 空串不绑核；如 "3,1"：每DP一个NUMA节点，个数必须等于DATA_PARALLEL_SIZE
+NUMA_NODES_PER_DP = "auto"  # "auto"按本机PCI亲和自动检测（推荐，换机不用改）；""关闭绑核；或显式"3,1"（每DP一个节点号）
 # 绑核在每个DP客户端进程内完成（ctypes调libnuma），其spawn出的TP子进程随fork/exec继承mempolicy。
-# 绑定串必须按本机拓扑查询（npu-smi info -t topo + numactl --hardware），不能跨机照抄；
-# 鲲鹏950八卡DP2*TP4已验证映射为"3,1"（NPU0-3亲和node3，NPU4-7亲和node1）。
+# 自动检测来源：/sys/class/davinci/davinci<N>/device/numa_node（内核PCI亲和信息，天然正确）；
+# 检测失败时告警并跳过绑核，不影响推理。显式串仅用于自动检测不符合预期时的人工覆盖。
 PROMPT_DISTRIBUTION = "round_robin"  # 第i个输入交给DP(i%DPsize)
 # replicate：每个DP都跑整份PROMPTS，可用于单个长prompt在不同域的对照。
 # round_robin要求输入条数>=DPsize，不偷偷添加placeholder请求。
@@ -198,11 +198,11 @@ def _validate(c):
         or not all(x.isdecimal() for x in devices)
     ):
         raise ValueError("VISIBLE_DEVICES must contain DP*TP distinct numeric device IDs")
-    if c["NUMA_NODES_PER_DP"]:
+    if c["NUMA_NODES_PER_DP"] and c["NUMA_NODES_PER_DP"] != "auto":
         nodes = _parse_numa_nodes(c["NUMA_NODES_PER_DP"])
         if nodes is None or len(nodes) != c["DATA_PARALLEL_SIZE"]:
             raise ValueError(
-                "NUMA_NODES_PER_DP must be a comma-separated list of one non-negative node id per DP "
+                "NUMA_NODES_PER_DP must be \"auto\", \"\", or a comma-separated list of one non-negative node id per DP "
                 f"({c['DATA_PARALLEL_SIZE']} values), got {c['NUMA_NODES_PER_DP']!r}"
             )
     if c["RUN_MODE"] not in ("eager", "graph") or c["PROMPT_DISTRIBUTION"] not in ("round_robin", "replicate"):
@@ -448,6 +448,40 @@ def _parse_numa_nodes(raw):
     return nodes if all(node >= 0 for node in nodes) else None
 
 
+def _numa_node_of_device(dev_id):
+    # 内核 PCI 亲和信息；-1 表示无亲和（按检测失败处理）
+    try:
+        node = int(Path(f"/sys/class/davinci/davinci{dev_id}/device/numa_node").read_text().strip())
+    except (OSError, ValueError):
+        return None
+    return node if node >= 0 else None
+
+
+def _resolve_numa_nodes(c):
+    # 返回每 DP 一个节点号的列表；关闭或检测失败返回 None（不绑核）
+    raw = c["NUMA_NODES_PER_DP"]
+    if not raw:
+        return None
+    if raw != "auto":
+        return _parse_numa_nodes(raw)
+    devices = c["VISIBLE_DEVICES"].split(",")
+    tp = c["TENSOR_PARALLEL_SIZE"]
+    nodes = []
+    for rank in range(c["DATA_PARALLEL_SIZE"]):
+        group = devices[rank * tp : (rank + 1) * tp]
+        group_nodes = {_numa_node_of_device(int(dev)) for dev in group}
+        group_nodes.discard(None)
+        if len(group_nodes) != 1:
+            print(
+                f"[simple-dp] NUMA WARNING: auto detect failed for DP {rank} "
+                f"(devices {group} -> nodes {sorted(group_nodes)}); binding skipped",
+                flush=True,
+            )
+            return None
+        nodes.append(group_nodes.pop())
+    return nodes
+
+
 def _bind_numa_node(node, rank):
     # 进程内绑核：spawn的DP/TP子进程没有shell命令行可套numactl，且mempolicy随fork/exec继承，
     # 在DP客户端绑定后其TP子进程同样生效。numa_run_on_node≈--cpunodebind，numa_set_membind≈--membind；
@@ -484,8 +518,9 @@ def _bind_numa_node(node, rank):
 
 
 def _worker(rank, c, prompts, port, barrier, run_dir):
-    if c["NUMA_NODES_PER_DP"]:
-        _bind_numa_node(_parse_numa_nodes(c["NUMA_NODES_PER_DP"])[rank], rank)
+    numa_nodes = _resolve_numa_nodes(c)
+    if numa_nodes is not None:
+        _bind_numa_node(numa_nodes[rank], rank)
     os.environ.update({str(key): str(value) for key, value in c["NATIVE_RUNTIME_ENV"].items()})
     os.environ.update(
         {
@@ -1081,6 +1116,8 @@ def main():
         f"rounds={c['REPLAY_ROUNDS']} distribution={c['PROMPT_DISTRIBUTION']} results={run_dir}",
         flush=True,
     )
+    if c["NUMA_NODES_PER_DP"]:
+        print(f"[simple-dp] NUMA plan: {_resolve_numa_nodes(c)}", flush=True)
     if c["CHECK_ONLY"]:
         print("[simple-dp] CONFIG CHECK COMPLETED; no model loaded", flush=True)
         return
